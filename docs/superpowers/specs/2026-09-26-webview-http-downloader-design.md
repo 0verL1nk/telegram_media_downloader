@@ -4,6 +4,7 @@
 - 状态: 待用户审阅
 - 范围: 把桌面客户端下载核心从 MTProto 切到 Telegram Web HTTP API(基于 WebView cookie + 注入脚本送 URL)。同时精简桌面客户端,**删除**上传/转发/rclone/Bot/MTProto Session。
 - 锚定参考: [Greasy Fork #446342](https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader)(Neet-Nestor)。本 spec 的设计目标是**沿用脚本的下载机制**+ 叠加桌面客户端的任务管理、断点续传、分块并发、状态反馈。脚本有的能力本 spec 必须达到;脚本不做的能力(协议层操作、上传/转发)本 spec 不做。
+- **架构分工**:浏览器侧(Telegram Web + 注入脚本)**只负责**抓文件 URL — 这部分是"参考浏览器怎么下载"的复制;下载执行、任务管理、状态反馈、断点续传、分块并发、文件校验**全部由 Rust 客户端承担**。注入脚本是桥梁,不下载;Rust 是核心,不直接接触 Telegram Web DOM。
 
 ## 1. 摘要
 
