@@ -24,6 +24,9 @@ eggs/
 lib/
 lib64/
 logs/
+# 例外:桌面端日志页组件是源码,不是运行期日志目录
+!desktop/src/components/logs/
+!desktop/src/components/logs/**
 parts/
 sdist/
 share/
