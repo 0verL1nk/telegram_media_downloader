@@ -46,8 +46,10 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
 tempfile = "3"
 
 [profile.release]
-codegen-units = 1
-lto = true
+# CI 发布构建速度优先:thin LTO + 4 个代码生成单元,换取每次发布快 3-5 分钟,
+# 运行时/体积代价约 1-3%(下载客户端不敏感)。
+codegen-units = 4
+lto = "thin"
 opt-level = 3
 strip = true
 panic = "abort"
