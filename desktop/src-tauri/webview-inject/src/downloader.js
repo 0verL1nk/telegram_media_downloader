@@ -33,12 +33,15 @@ async function fetchWithTimeout(url, range, timeoutSeconds, outerSignal) {
 }
 
 export async function probeTotal(url, signal) {
+  const startedAt = performance.now();
   const res = await fetchWithTimeout(url, 'bytes=0-0', PROBE_TIMEOUT_SECONDS, signal);
+  // 响应头到达耗时 ≈ RTT;Rust 端用它做 BDP 分块估算(单路速率 × RTT)。
+  const probeRttMs = Math.max(1, Math.round(performance.now() - startedAt));
   if (res.status === 200) {
     // 服务器忽略 Range:立刻取消响应体,用 Content-Length 当总大小
     res.body?.cancel?.().catch?.(() => {});
     const len = Number(res.headers.get('Content-Length'));
-    if (Number.isSafeInteger(len) && len > 0) return len;
+    if (Number.isSafeInteger(len) && len > 0) return { totalBytes: len, probeRttMs };
     throw new Error('服务器未返回文件大小');
   }
   if (res.status !== 206) {
@@ -57,7 +60,7 @@ export async function probeTotal(url, signal) {
   if (!Number.isSafeInteger(total) || total <= 0) {
     throw new Error('服务器返回的文件大小无效');
   }
-  return total;
+  return { totalBytes: total, probeRttMs };
 }
 
 async function fetchChunk(url, offset, length, opts) {
@@ -181,9 +184,13 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
   const controller = new AbortController();
   controllers.set(taskId, controller);
   try {
-    const totalBytes = await probeTotal(url, controller.signal);
-    diag(`pipeline: total=${totalBytes}`);
-    const plan = await window.__TAURI__.core.invoke('plan_chunks', { taskId, totalBytes });
+    const { totalBytes, probeRttMs } = await probeTotal(url, controller.signal);
+    diag(`pipeline: total=${totalBytes} rtt=${probeRttMs}ms`);
+    const plan = await window.__TAURI__.core.invoke('plan_chunks', {
+      taskId,
+      totalBytes,
+      probeRttMs,
+    });
     const missingCount = plan.missing ? plan.missing.length : 0;
     diag(`pipeline: missing=${missingCount} concurrency=${plan.concurrency}/${plan.maxConcurrency}`);
 

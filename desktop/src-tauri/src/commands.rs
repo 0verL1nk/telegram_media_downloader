@@ -100,6 +100,11 @@ pub async fn save_settings(
     let mut current_settings = state.shared.settings.write().await;
     settings.data_root = storage::display_path(&layout.root);
     normalize_and_validate_settings(&mut settings)?;
+    // 学习值是下载器的测量结果,不受设置表单回传影响(表单可能是几分钟前加载的),
+    // 否则一次"保存设置"就会把刚学到的链路数据抹掉。
+    settings.concurrency.learned_per_stream_bytes_per_second = current_settings
+        .concurrency
+        .learned_per_stream_bytes_per_second;
     storage::save_settings(&layout, &settings).map_err(command_error)?;
     *current_settings = settings;
     drop(current_settings);
@@ -458,18 +463,20 @@ pub async fn start_webview_download(
 }
 
 /// 页面探明文件大小后排定分块计划;幂等,可重复调用以续传。
+/// `probe_rtt_ms` 是页面探测请求的首字节时间(≈RTT),用于 BDP 分块估算。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn plan_chunks(
     webview: Webview<Wry>,
     state: State<'_, AppState>,
     task_id: String,
     total_bytes: u64,
+    probe_rtt_ms: Option<u64>,
 ) -> Result<PlanInfo, String> {
     ensure_trusted_telegram_webview(&webview)?;
     validate_task_id(&task_id)?;
     state
         .downloads
-        .plan(&task_id, total_bytes)
+        .plan(&task_id, total_bytes, probe_rtt_ms)
         .await
         .map_err(command_error)
 }

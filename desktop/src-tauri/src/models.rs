@@ -72,6 +72,9 @@ pub struct ConcurrencySettings {
     pub request_timeout_seconds: u64,
     pub retries: u32,
     pub max_bandwidth_kib: u64,
+    /// 后端学习值:实测单路峰值速率(字节/秒),用于 BDP 分块估算。0 表示尚无数据。
+    /// 只由下载器写入,设置表单回传时不覆盖(见 commands::save_settings)。
+    pub learned_per_stream_bytes_per_second: u64,
 }
 
 impl Default for ConcurrencySettings {
@@ -84,6 +87,7 @@ impl Default for ConcurrencySettings {
             request_timeout_seconds: 45,
             retries: 5,
             max_bandwidth_kib: 0,
+            learned_per_stream_bytes_per_second: 0,
         }
     }
 }

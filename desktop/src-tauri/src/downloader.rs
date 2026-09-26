@@ -17,6 +17,7 @@ use crate::{
     app_state::SharedState,
     chunk_writer::{self, IncomingChunk},
     models::TaskRecord,
+    storage,
     task_store::TaskStore,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,7 +25,10 @@ use serde::Serialize;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tauri::Emitter;
@@ -66,6 +70,12 @@ const INITIAL_CONCURRENCY: usize = 4;
 const MIN_ADAPTIVE_CONCURRENCY: usize = 2;
 /// 自适应并发的投递率采样间隔。
 const ADAPT_SAMPLE: Duration = Duration::from_secs(2);
+/// 全局页面抓取流预算:多文件并行时避免 3×16=48 条流触发 CDN 侧限流。
+const GLOBAL_MAX_STREAMS: usize = 24;
+/// BDP 分块的档位上下限(KiB):下限摊薄请求开销,上限兼顾页面内存、IPC 拷贝
+/// 与末段进度粒度。
+const MIN_ADAPTIVE_CHUNK_KIB: usize = 256;
+const MAX_ADAPTIVE_CHUNK_KIB: usize = 1024;
 /// 请求超时(秒),随计划返回给页面 JS。
 const MIN_TIMEOUT_SECONDS: u64 = 5;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
@@ -100,6 +110,96 @@ pub struct PlanInfo {
     pub missing: Vec<ChunkRange>,
 }
 
+/// 全局页面抓取流预算(所有任务在途分块流的总和上限)。
+///
+/// 每个文件的自适应控制器只看得见自己:三个文件各自爬满 16 路就是 48 条流,
+/// 足以触发服务端限流,之后再集体退避来回震荡。这里做一个进程内的总闸,
+/// 增长申请超预算时不放行(控制器会在下一轮无增益采样里自行撤回探测)。
+struct StreamBudget {
+    cap: usize,
+    used: AtomicUsize,
+}
+
+impl StreamBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    /// 最多占用 `n` 条流,返回实际占用数(可能少于请求,甚至为 0)。
+    fn acquire_up_to(&self, n: usize) -> usize {
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let take = n.min(self.cap.saturating_sub(current));
+            if take == 0 {
+                return 0;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + take,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return take,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, n: usize) {
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(n);
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// 进度监视器使用的自适应运行时:控制器 + 全局流预算 + 本任务已占用的流数。
+struct AdaptiveRuntime {
+    controller: AdaptiveConcurrency,
+    budget: Arc<StreamBudget>,
+    reserved: usize,
+}
+
+impl AdaptiveRuntime {
+    /// 应用控制器给出的新宽度:增长需向全局预算申请额度,退避即释放。
+    /// 申请不到时不放行(控制器会在下一轮无增益采样里自行撤回探测)。
+    fn apply(&mut self, width: usize) -> Option<usize> {
+        if width > self.reserved {
+            let granted = self.budget.acquire_up_to(width - self.reserved);
+            if granted == 0 {
+                return None;
+            }
+            self.reserved += granted;
+            Some(self.reserved)
+        } else if width < self.reserved {
+            let freed = self.reserved - width;
+            self.budget.release(freed);
+            self.reserved = width;
+            Some(width)
+        } else {
+            Some(width)
+        }
+    }
+
+    /// 任务结束(完成/暂停/失败):把占用的流额度还给全局预算。
+    fn release_all(&mut self) {
+        self.budget.release(self.reserved);
+        self.reserved = 0;
+    }
+}
+
 /// 一个正在下载中的任务:分块入队通道、writer/进度监视句柄、活动时间与占用的文件槽位。
 struct ActiveDownload {
     sender: mpsc::Sender<IncomingChunk>,
@@ -116,6 +216,7 @@ pub struct DownloadManager {
     shared: Arc<SharedState>,
     slots: Arc<Semaphore>,
     active: Arc<AsyncMutex<HashMap<String, ActiveDownload>>>,
+    budget: Arc<StreamBudget>,
 }
 
 impl DownloadManager {
@@ -129,6 +230,7 @@ impl DownloadManager {
             shared,
             slots: Arc::new(Semaphore::new(limit)),
             active: Arc::new(AsyncMutex::new(HashMap::new())),
+            budget: Arc::new(StreamBudget::new(GLOBAL_MAX_STREAMS)),
         };
         manager.spawn_watchdog();
         Ok(manager)
@@ -194,7 +296,12 @@ impl DownloadManager {
     /// 页面探明文件大小后排定分块计划:占文件槽位、配置分块表、启动 writer,返回缺块清单。
     ///
     /// 幂等:任务已在下载中时只返回当前缺块清单,不重复占槽位或启动 writer。
-    pub async fn plan(&self, task_id: &str, total_bytes: u64) -> Result<PlanInfo> {
+    pub async fn plan(
+        &self,
+        task_id: &str,
+        total_bytes: u64,
+        probe_rtt_ms: Option<u64>,
+    ) -> Result<PlanInfo> {
         if total_bytes == 0 {
             bail!("文件大小无效,无法规划分块下载");
         }
@@ -204,8 +311,23 @@ impl DownloadManager {
         }
         ensure_total_matches(record.total_bytes, total_bytes)?;
         let settings = self.shared.settings.read().await.clone();
-        let chunk_size_bytes =
-            (supported_chunk_size_kib(settings.concurrency.chunk_size_kib) as u64) * 1024;
+        // 分块大小:自适应模式按 BDP(单路峰值速率 × 探测 RTT)选档,无学习数据时
+        // 退回设置值;固定模式始终用设置值。分块小于单路 BDP 时,一条流会在
+        // "等下一块"的空档里丢掉带宽。
+        let adaptive_chunk_kib = if settings.concurrency.adaptive {
+            bdp_chunk_size_kib(
+                settings.concurrency.learned_per_stream_bytes_per_second,
+                probe_rtt_ms.unwrap_or(0),
+            )
+        } else {
+            0
+        };
+        let chunk_size_kib = if adaptive_chunk_kib > 0 {
+            adaptive_chunk_kib
+        } else {
+            supported_chunk_size_kib(settings.concurrency.chunk_size_kib)
+        };
+        let chunk_size_bytes = chunk_size_kib as u64 * 1024;
         let max_concurrency = settings
             .concurrency
             .per_file_chunks
@@ -330,14 +452,24 @@ impl DownloadManager {
             )
             .await
         });
+        // 全局流预算:按占用到的额度决定页面初始宽度(至少 1 路,避免任务卡死)。
+        let reserved_streams = self.budget.acquire_up_to(concurrency);
+        let initial_width = reserved_streams.max(1);
+        let adaptive_runtime = adaptive_enabled.then(|| AdaptiveRuntime {
+            controller: AdaptiveConcurrency::new(
+                MIN_ADAPTIVE_CONCURRENCY,
+                initial_width,
+                max_concurrency,
+            ),
+            budget: Arc::clone(&self.budget),
+            reserved: reserved_streams,
+        });
         let watcher = spawn_progress_watcher(
             Arc::clone(&self.shared),
             task_id.to_owned(),
             total_bytes,
             progress_receiver,
-            adaptive_enabled.then(|| {
-                AdaptiveConcurrency::new(MIN_ADAPTIVE_CONCURRENCY, concurrency, max_concurrency)
-            }),
+            adaptive_runtime,
         );
         active.insert(
             task_id.to_owned(),
@@ -358,12 +490,13 @@ impl DownloadManager {
                 "info",
                 DOWNLOAD_LOG_TARGET,
                 format!(
-                    "任务 {task_id} 开始分块下载,共 {total_bytes} 字节,缺 {missing_len} 块",
+                    "任务 {task_id} 开始分块下载,共 {total_bytes} 字节,缺 {missing_len} 块;分块 {chunk_size_kib} KiB × 并发 {initial_width}(上限 {max_concurrency})",
                     missing_len = missing.len()
                 ),
             )
             .await;
         Ok(PlanInfo {
+            concurrency: initial_width,
             missing,
             ..parameters
         })
@@ -744,7 +877,7 @@ fn spawn_progress_watcher(
     task_id: String,
     total_bytes: u64,
     mut progress_events: broadcast::Receiver<()>,
-    mut adaptive: Option<AdaptiveConcurrency>,
+    mut adaptive: Option<AdaptiveRuntime>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dirty = false;
@@ -758,6 +891,9 @@ fn spawn_progress_watcher(
             .flatten()
             .map(|record| record.downloaded_bytes)
             .unwrap_or(0);
+        let mut active_width = adaptive.as_ref().map(|rt| rt.reserved.max(1)).unwrap_or(0);
+        // 单路峰值速率:峰值的 per-stream 投递率,作为下一个任务 BDP 分块的输入。
+        let mut peak_per_stream = 0.0_f64;
         loop {
             tokio::select! {
                 event = progress_events.recv() => match event {
@@ -769,20 +905,26 @@ fn spawn_progress_watcher(
                         dirty = false;
                         publish_progress(&shared, &task_id, total_bytes).await;
                     }
-                    if adaptive.is_some() && sample_started.elapsed() >= ADAPT_SAMPLE {
-                        let elapsed = sample_started.elapsed();
-                        sample_started = Instant::now();
-                        if let Ok(Some(record)) = shared.store.get(&task_id).await {
-                            let delta = record.downloaded_bytes.saturating_sub(sample_bytes);
-                            sample_bytes = record.downloaded_bytes;
-                            let rate = delta as f64 / elapsed.as_secs_f64();
-                            if let Some(controller) = adaptive.as_mut() {
-                                if let Some(width) = controller.sample(Instant::now(), rate) {
+                    if let Some(runtime) = adaptive.as_mut() {
+                        if sample_started.elapsed() >= ADAPT_SAMPLE {
+                            let elapsed = sample_started.elapsed();
+                            sample_started = Instant::now();
+                            if let Ok(Some(record)) = shared.store.get(&task_id).await {
+                                let delta = record.downloaded_bytes.saturating_sub(sample_bytes);
+                                sample_bytes = record.downloaded_bytes;
+                                let rate = delta as f64 / elapsed.as_secs_f64();
+                                if rate > 0.0 && active_width > 0 {
+                                    peak_per_stream = peak_per_stream.max(rate / active_width as f64);
+                                }
+                                if let Some(width) = runtime.controller.sample(Instant::now(), rate)
+                                    && let Some(applied) = runtime.apply(width)
+                                {
+                                    active_width = applied;
                                     let _ = shared.app.emit(
                                         "webview-task-concurrency",
                                         serde_json::json!({
                                             "taskId": task_id,
-                                            "concurrency": width,
+                                            "concurrency": applied,
                                         }),
                                     );
                                     shared
@@ -790,7 +932,7 @@ fn spawn_progress_watcher(
                                             "info",
                                             DOWNLOAD_LOG_TARGET,
                                             format!(
-                                                "任务 {task_id} 自适应并发调整为 {width} 路(窗口速率 {:.1} MB/s)",
+                                                "任务 {task_id} 自适应并发调整为 {applied} 路(窗口速率 {:.1} MB/s)",
                                                 rate / 1_048_576.0
                                             ),
                                         )
@@ -802,11 +944,30 @@ fn spawn_progress_watcher(
                 },
             }
         }
+        if let Some(runtime) = adaptive.as_mut() {
+            runtime.release_all();
+            if peak_per_stream > 0.0 {
+                persist_learned_rate(&shared, peak_per_stream as u64).await;
+            }
+        }
         if let Ok(Some(record)) = shared.store.get(&task_id).await {
             let progress = progress_ratio(record.downloaded_bytes, total_bytes);
             emit_webview_progress(&shared, &task_id, progress).await;
         }
     })
+}
+
+/// 把实测的单路峰值速率写回设置,作为下一个任务 BDP 分块的输入。
+async fn persist_learned_rate(shared: &Arc<SharedState>, bytes_per_second: u64) {
+    let mut settings = shared.settings.write().await;
+    if settings.concurrency.learned_per_stream_bytes_per_second == bytes_per_second {
+        return;
+    }
+    settings.concurrency.learned_per_stream_bytes_per_second = bytes_per_second;
+    let layout = shared.layout.read().await.clone();
+    if let Err(error) = storage::save_settings(&layout, &settings) {
+        tracing::warn!(target: "desktop::download", "学习速率持久化失败:{error:#}");
+    }
 }
 
 async fn publish_progress(shared: &SharedState, task_id: &str, total_bytes: u64) {
@@ -1073,6 +1234,18 @@ fn supported_chunk_size_kib(requested: usize) -> usize {
         .unwrap_or(512)
 }
 
+/// 由 BDP(单路峰值速率 × 探测 RTT)估算下个任务的分块大小,并就近对齐到受支持档位。
+///
+/// 分块应不小于单路 BDP,否则一条流会在"等下一块"的空档里丢掉带宽;上限 1 MiB
+/// 兼顾页面内存、IPC 拷贝开销与末段进度粒度。返回 0 表示没有学习数据可用。
+fn bdp_chunk_size_kib(per_stream_bytes_per_second: u64, rtt_ms: u64) -> usize {
+    if per_stream_bytes_per_second == 0 || rtt_ms == 0 {
+        return 0;
+    }
+    let bdp_kib = (per_stream_bytes_per_second as f64 * rtt_ms as f64 / 1000.0 / 1024.0) as usize;
+    supported_chunk_size_kib(bdp_kib.clamp(MIN_ADAPTIVE_CHUNK_KIB, MAX_ADAPTIVE_CHUNK_KIB))
+}
+
 fn safe_error(value: &str) -> String {
     value
         .chars()
@@ -1190,6 +1363,21 @@ mod tests {
         assert_eq!(supported_chunk_size_kib(4096), 1024);
         assert_eq!(supported_chunk_size_kib(300), 256);
         assert_eq!(supported_chunk_size_kib(192), 128);
+    }
+
+    #[test]
+    fn bdp_chunk_size_tracks_rate_times_rtt() {
+        // 无学习数据 → 交给调用方回退设置值
+        assert_eq!(bdp_chunk_size_kib(0, 120), 0);
+        assert_eq!(bdp_chunk_size_kib(1_048_576, 0), 0);
+        // 1 MB/s × 200 ms ≈ 205 KiB → 抬到下限 256
+        assert_eq!(bdp_chunk_size_kib(1_048_576, 200), 256);
+        // 3 MB/s × 100 ms ≈ 300 KiB → 就近 256
+        assert_eq!(bdp_chunk_size_kib(3 * 1_048_576, 100), 256);
+        // 3 MB/s × 300 ms ≈ 900 KiB → 就近 1024
+        assert_eq!(bdp_chunk_size_kib(3 * 1_048_576, 300), 1024);
+        // 20 MB/s × 400 ms ≈ 8 MiB → 封顶 1024
+        assert_eq!(bdp_chunk_size_kib(20 * 1_048_576, 400), 1024);
     }
 
     #[test]

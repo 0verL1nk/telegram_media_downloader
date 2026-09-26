@@ -14,6 +14,8 @@ export interface ConcurrencySettings {
   requestTimeoutSeconds: number;
   retries: number;
   maxBandwidthKib: number;
+  /** 后端学习值:实测单路峰值速率(B/s),用于 BDP 分块估算;表单回传不覆盖。 */
+  learnedPerStreamBytesPerSecond: number;
 }
 
 /** Mirrors `Settings` in the Rust backend: local paths, naming rules and queue limits only. */
