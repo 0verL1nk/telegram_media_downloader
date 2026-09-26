@@ -90,7 +90,7 @@ function detectStoryWebz(wz) {
   const root = document.querySelector(wz.storyRoot);
   if (!root) return null;
   const container = document.querySelector(wz.storyHeader)
-    || (wz.storyHeaderFallback && document.querySelector(wz.storyHeaderFallback)?.parentElement);
+    || (wz.storyHeaderFallback && root.querySelector(wz.storyHeaderFallback)?.parentElement);
   if (!container) return null;
 
   const video = root.querySelector('video');
@@ -115,7 +115,8 @@ export function detectPinnedAudio(version, cfg) {
   const wk = cfg.webk;
   const pinned = document.querySelector(wk.pinnedAudio);
   if (!pinned) return null;
-  const audio = pinned.querySelector('audio');
+  const audioEl = pinned.querySelector('audio-element') || document.querySelector('audio-element');
+  const audio = (audioEl && audioEl.querySelector('.audio')) || pinned.querySelector('audio');
   if (!(audio instanceof HTMLAudioElement)) return null;
   const container = document.querySelector(wk.pinnedAudioUtils) || pinned;
   return { kind: 'voice', element: audio, container, source: 'pinned-audio' };
