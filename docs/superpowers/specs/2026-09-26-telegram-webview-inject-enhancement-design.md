@@ -64,7 +64,7 @@ Telegram Web 子 WebView (web.telegram.org/k 或 /a)
 | 置顶音频(pinned audio) | ✅ | webk 专属,唯一带 `data-mid` 的场景 |
 | 语音消息(查看器内) | ✅ | audio 元素 |
 | 聊天列表内联按钮 | ❌ | 技术不可行(缩略图) |
-| 批量下载 | ❌ | 查看器一次只显示一个媒体 |
+| 批量下载 | ❌ v1 | 方向已确认(消息菜单:仅视频/全部),暂缓,见 §10 |
 
 ## 3. Selector 表(逐条来自验证脚本)
 
@@ -346,7 +346,23 @@ window.__TAURI__.core.invoke('webview_query_task_state', { fileName })
 - [ ] 已下载文件重新打开查看器时按钮显示 ✓
 - [ ] Rust 端零 MTProto 依赖(见 HTTP 下载器 spec)
 
-## 10. 参考
+## 10. 后续(v1 之后,暂缓)— 消息上的批量下载
+
+用户已确认的方向,**本批不实现**:
+
+- 聊天列表的多媒体消息(相册)上显示"下载"菜单:
+  - `仅下载视频 (N)` — 遍历消息内 `<video>` 元素抓真文件 URL
+  - `下载全部 (N)` — 视频直接抓;图片必须走查看器自动遍历(列表内是缩略图)
+- 入队方式:JS 循环调 `submit_download_from_webview`,Rust 侧无需改动
+- 选择状态需存脚本内存(聊天列表虚拟滚动会回收 DOM,滚回时恢复勾选)
+
+**实现前必须真机验证的两个假设**:
+
+1. 聊天列表视频元素的 `src`:未播放时是否已挂载(懒加载?)→ 决定是否需要先触发加载
+2. `src` 是否等于原文件(而非降质预览流)→ 比对同一视频"列表抓取"与"查看器抓取"的文件大小
+3. 查看器导航(上一张/下一张)与位置指示的 selector → 自动遍历用
+
+## 11. 参考
 
 - 验证脚本源码: https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader/code
 - 下载执行与任务管理: `docs/superpowers/specs/2026-09-26-webview-http-downloader-design.md`
