@@ -1,27 +1,32 @@
 {
-  "observerDebounceMs": 50,
-  "observerAttributeFilter": [
-    "data-mid",
-    "data-peer-id",
-    "data-protected",
-    "class",
-    "aria-disabled"
-  ],
-  "messageSelectors": [
-    ".message[data-mid]",
-    ".Message[data-mid]",
-    "[data-mid][data-peer-id]"
-  ],
-  "storySelectors": [
-    "[data-story-viewer]",
-    ".StoryViewer"
-  ],
-  "duplicateWindowBytes": 5120,
+  "refreshDelayMs": 500,
   "dedupeCacheTtlMs": 5000,
-  "batchMaxSize": 32,
-  "buttonStackPosition": "top-right",
-  "iconSize": 16,
-  "spinnerSize": 12,
-  "visibleMinWidth": 100,
-  "protectedAncestorDepth": 5
+  "trustedOrigins": ["https://web.telegram.org", "https://webk.telegram.org", "https://webz.telegram.org"],
+  "webk": {
+    "viewerRoot": ".media-viewer-whole",
+    "mediaAspecter": ".media-viewer-movers .media-viewer-aspecter",
+    "viewerButtons": ".media-viewer-topbar .media-viewer-buttons",
+    "videoControlsRight": ".bottom-controls .right-controls",
+    "imgSelector": "img.thumbnail",
+    "storyRoot": "#stories-viewer",
+    "storyHeader": "[class^='_ViewerStoryHeaderRight']",
+    "storyFooter": "[class^='_ViewerStoryFooterRight']",
+    "storyVideo": "video.media-video",
+    "storyImage": "img.media-photo",
+    "pinnedAudio": ".pinned-audio",
+    "pinnedAudioUtils": ".pinned-container-wrapper-utils",
+    "buttonClass": "btn-icon tgico-download tel-download"
+  },
+  "webz": {
+    "viewerRoot": "#MediaViewer",
+    "activeSlide": ".MediaViewerSlide--active",
+    "viewerActions": ".MediaViewerActions",
+    "videoPlayer": ".MediaViewerContent > .VideoPlayer",
+    "imgSelector": ".MediaViewerContent > div > img",
+    "videoControls": ".VideoPlayerControls .buttons",
+    "storyRoot": "#StoryViewer",
+    "storyHeader": ".GrsJNw3y",
+    "storyImage": "img.PVZ8TOWS",
+    "buttonClass": "Button smaller translucent-white round tel-download"
+  }
 }
