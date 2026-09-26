@@ -1,611 +1,307 @@
-# Telegram WebView 注入脚本增强 — 设计规范
+# Telegram WebView 注入脚本(查看器方案) — 设计规范
 
-- 日期: 2026-09-26
-- 状态: 待用户审阅
-- 范围: 单人完整版,约 2 周。不含拖拽下载、不含设置页 UI、不含 i18n、不含批量选择面板、不含 CDN。
-- 下载后端:由 `webview-http-downloader-design.md` 定义(HTTP API,不依赖 MTProto)。
-- 功能要求:禁保存媒体可正常下载。实现细节见 HTTP 下载器 spec。
+- 日期: 2026-09-26(2026-09-26 修订:由"聊天列表消息按钮"改为"媒体查看器工具栏按钮")
+- 状态: 待实现
+- 锚定实现: [Greasy Fork #446342](https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader) — 本规范的所有 selector、检测方式、URL 提取逻辑均来自该脚本的验证过的实现,不自行发明。
 
-## 1. 摘要
+## 0. 为什么是查看器方案
 
-把现有 `Telegram Web` 子 WebView 中的 137 行内联 init script 重构为独立 JS 模块集,提供:
+聊天列表里的图片是**缩略图预览**(`img.thumbnail`),原始文件 URL 只在**媒体查看器加载时**才出现在 DOM。因此:
 
-- 图标化按钮 + hover 高亮 + 视觉融入 Telegram Web
-- 单消息识别全部可见媒体(photo / video / audio / voice / sticker / animation / document / story)
-- 多文件消息渲染 1 个主按钮 + N 个子按钮
-- 点击后状态实时反馈(提交中 / 已入队 / 进行中 / 完成 / 失败重试)
-- 本地已下载文件标记。匹配键:`chat_id + message_id`(`file_size` 不参与匹配,仅取自同一消息最近一次已完成下载用于显示「✓ 已下载 · 3.4 MB」)
-- 下载后端由 HTTP 下载器 spec 定义(注入脚本只负责提交,下载执行走 HTTP API)
-- 禁保存(`noforwards`)媒体开放下载,见 §10
+- 聊天列表按钮只能下到糊图 — 技术上不可行
+- 查看器打开时,`<video>.currentSrc` / `img.src` / `audio.src` 就是原始文件 URL
+- 验证过的脚本(downloader #446342,23.9 万安装)全程只做查看器路径
 
-桥接只增加 3 个新 Tauri 命令。现有 `submit_download_from_webview` 行为不变,仅事件名升级。
+本方案照做。
 
-## 2. 现状摘要
-
-- `desktop/src-tauri/src/webview_bridge.rs:147` 嵌 137 行 `TELEGRAM_WEBVIEW_INIT_SCRIPT`,单按钮、文本样式
-- `desktop/src-tauri/src/commands.rs:1115` `submit_download_from_webview` 接 `{chatId, messageId, mediaType}`,走 `create_message_task` → MTProto 任务系统
-- 已发出 `webview-download-submitted` 事件但前端未监听
-- 任务系统(`downloader.rs` + `task_store.rs`)能力完整:分块、断点续传、多线程、并发、文件校验
-- 安全:`is_trusted_telegram_webview` 校验 label + URL;init script 不读 URL/cookie/storage
-
-## 3. 目标
-
-1. 按钮视觉与 Telegram Web 融合(图标 + hover + 紧凑)
-2. 单消息识别全部可见媒体,主按钮 + 子按钮呈现
-3. 5 状态实时反馈(ready / submitting / queued / downloading / completed / failed)
-4. 已下载文件标记,点击强制重下
-5. Story 支持(走 MTProto 任务)
-6. 失败可重试(主流程)
-
-## 4. 非目标
-
-- 拖拽下载
-- 批量选择 UI(消息内多文件 OK,跨消息批量不提供)
-- i18n(仅中文)
-- 设置页 UI(配置以编译期常量形式存在于 `config.js`,改配置 = 改 Rust 重 build)
-- 多账号切换
-- 插件化媒体检测
-- CDN 传输(独立 spec)
-
-## 5. 架构
-
-### 5.1 模块布局
+## 1. 架构
 
 ```
-desktop/src-tauri/
-├── webview-inject/
-│   ├── src/
-│   │   ├── observer.js   MutationObserver 与消息生命周期
-│   │   ├── media.js      媒体识别(7 类 + story)
-│   │   ├── button.js     按钮渲染与状态机
-│   │   ├── state.js      任务事件订阅与按钮同步
-│   │   ├── dedupe.js     已下载检测查询与缓存
-│   │   ├── story.js      Story overlay 观察器
-│   │   ├── icons.js      内联 SVG 字符串集合
-│   │   └── config.json   编译期常量(JSON 文件,build.mjs 读后内联)
-│   ├── build.mjs         简易打包(concat + minify)
-│   ├── dist/
-│   │   └── inject.js     最终嵌入文件(进 .gitignore)
-│   ├── test/             vitest + happy-dom 测试
-│   └── README.md
-├── src/
-│   ├── webview_bridge.rs 改用 include_str!("../webview-inject/dist/inject.js")
-│   ├── commands.rs       新增 3 个命令
-│   └── task_store.rs     新增 dedupe 查询
-└── build.rs              调 node build.mjs 重新生成 dist/inject.js
+Telegram Web 子 WebView (web.telegram.org/k 或 /a)
+┌────────────────────────────────────────────────────┐
+│ inject.js(注入脚本)                                 │
+│  ├─ boot.js     入口:origin 校验 + 启动 watcher      │
+│  ├─ watcher.js  500ms 轮询:查看器/Story/置顶音频出现? │
+│  ├─ detect.js   在打开的查看器里找到媒体元素与类型     │
+│  ├─ button.js   向查看器工具栏注入按钮 + 5 状态机      │
+│  ├─ extract.js  从媒体元素读 URL;从 URL 解析文件名     │
+│  ├─ dedupe.js   已下载查询(按文件名)+ TTL 缓存       │
+│  ├─ state.js    Tauri 事件订阅 → 按钮状态             │
+│  ├─ icons.js    内联 SVG(已完成)                    │
+│  └─ config.json webk/webz 两套 selector + 参数        │
+└────────────────┬───────────────────────────────────┘
+                 │ window.__TAURI__.core.invoke
+                 │ ('submit_download_from_webview', {request:{mediaUrl, fileName, fileType, source}})
+                 ▼
+        Rust 客户端(见 webview-http-downloader-design.md)
+        下载执行 / 任务管理 / 断点续传 / 全部由 Rust 承担
 ```
 
-### 5.2 嵌入方式
+## 2. 支持范围
 
-```rust
-// webview_bridge.rs
-pub const TELEGRAM_WEBVIEW_INIT_SCRIPT: &str =
-    include_str!("../webview-inject/dist/inject.js");
-```
+| 场景 | 支持 | 说明 |
+|---|---|---|
+| 媒体查看器(图片/视频/GIF) | ✅ | 主路径,webk + webz |
+| Story(故事) | ✅ | 独立查看器 |
+| 置顶音频(pinned audio) | ✅ | webk 专属,唯一带 `data-mid` 的场景 |
+| 语音消息(查看器内) | ✅ | audio 元素 |
+| 聊天列表内联按钮 | ❌ | 技术不可行(缩略图) |
+| 批量下载 | ❌ | 查看器一次只显示一个媒体 |
 
-`build.rs` 在 `cargo build` 之前用 `std::process::Command::new("node")` 调 `build.mjs`,若 `src/` 任一文件 `mtime` > `dist/inject.js` 则重新打包。`build.mjs` 读 `config.json`,序列化为顶层 `const CONFIG = {...}` 字面量,再 concat `observer.js` 等模块 + minify 输出单文件 `dist/inject.js`。
+## 3. Selector 表(逐条来自验证脚本)
 
-无 Node 时打包脚本 `no-op`(发警告,不阻断)。Rust 端不强制 Node 依赖,改注入脚本的人自己装 Node 跑一次。
+### 3.1 webk(`web.telegram.org/k/`)
 
-### 5.3 运行时结构
+| 目标 | Selector |
+|---|---|
+| 媒体查看器容器 | `.media-viewer-whole` |
+| 媒体元素容器 | `.media-viewer-movers .media-viewer-aspecter` |
+| 查看器按钮栏 | `.media-viewer-topbar .media-viewer-buttons` |
+| 视频元素 | `.media-viewer-aspecter` 内 `video` |
+| 图片元素 | `img.thumbnail` |
+| 视频控制条 | `.default__controls.ckin__controls`,右侧 `.bottom-controls .right-controls` |
+| Story 容器 | `#stories-viewer` |
+| Story 头部按钮区 | `[class^='_ViewerStoryHeaderRight']` |
+| Story 底部按钮区 | `[class^='_ViewerStoryFooterRight']` |
+| Story 视频 | `video.media-video` |
+| Story 图片 | `img.media-photo` |
+| 置顶音频容器 | `.pinned-audio` |
+| 置顶音频工具区 | `.pinned-container-wrapper-utils` |
+| 音频元素(全局) | `audio-element`(自定义元素),内部 `.audio`(HTMLAudioElement) |
 
-```
-Telegram Web (child WebView)
-│
-├── inject.js
-│   ├── boot()         解析 config, 校验 origin + top frame
-│   ├── observer       单一 MutationObserver, 50ms 防抖
-│   ├── messageHandlers
-│   │   ├── detectMessage(msg) → MediaDetection | null
-│   │   ├── attachButtons(msg, det)
-│   │   └── removeButtons(msg)
-│   ├── storyHandlers
-│   │   ├── observeStoryViewer()
-│   │   └── cleanupStory()
-│   ├── dedupeCache    Map<chatId+messageId, {downloaded, fileSize, fetchedAt}>
-│   └── eventBridge
-│       ├── submit({chatId, messageId, mediaType})
-│       ├── submitBatch([...])
-│       ├── queryDownloaded({chatId, messageId})
-│       └── action({taskId, action})
-└── (DOM 渲染按钮堆栈,绝对定位)
-       │
-       │ invoke('submit_*' | 'webview_*')
-       ▼
-Tauri commands.rs → task_store / downloader
-       │
-       │ emit('webview-task-*')
-       ▼
-state.js → listen() → 更新按钮状态
-```
+### 3.2 webz(`web.telegram.org/a/`)
 
-## 6. 组件设计
+| 目标 | Selector |
+|---|---|
+| 媒体查看器 | `#MediaViewer .MediaViewerSlide--active` |
+| 查看器按钮栏 | `#MediaViewer .MediaViewerActions` |
+| 视频容器 | `.MediaViewerContent > .VideoPlayer`,内部 `video` |
+| 图片 | `.MediaViewerContent > div > img` |
+| 视频控制条 | `.VideoPlayerControls .buttons`(在 `.spacer` 前插入) |
+| Story 容器 | `#StoryViewer` |
+| Story 头部 | `.GrsJNw3y`(找不到时用 `.DropdownMenu` 的父节点) |
+| Story 视频 | 容器内 `video` |
+| Story 图片 | 容器内最后一个 `img.PVZ8TOWS` |
 
-### 6.1 observer.js
+**版本判定**:脚本用 URL 路径区分(`location.pathname.startsWith('/k/')` vs `/a/`,或 hostname `webk.telegram.org` / `webz.telegram.org`)。两套 selector 互不混用。
 
-单一 `MutationObserver`,挂在 `document` 上:
+## 4. 模块设计
 
-- `subtree: true, childList: true`
-- `attributes: true, attributeFilter: ['data-mid', 'data-peer-id', 'data-protected', 'class', 'aria-disabled']`
+### 4.1 boot.js
 
-回调入 `records` 数组,50ms 防抖后批处理:
+- 校验 `window.top === window` 且 origin 为 `https://web.telegram.org`(含 webk/webz 子域)
+- 解析版本:`webk` | `webz`
+- 启动 `watcher.js` 轮询
+- 启动 `state.js` 事件订阅
 
-```
-records.flatMap(r => collectAddedElements(r))
-       .filter(uniqueMessageElements)
-       .forEach(detectAndAttach)
-```
+### 4.2 watcher.js
 
-`collectAddedElements` 处理三种情况:`childList` 的 `addedNodes`、属性变更节点自身、属性变更节点的最近消息祖先。
+- `setInterval(500ms)`(验证脚本的 `REFRESH_DELAY`)
+- 每轮依次检查(按优先级):
+  1. Story 查看器是否打开 → 有则确保 Story 按钮存在
+  2. 媒体查看器是否打开 → 有则确保查看器按钮存在
+  3. 置顶音频是否存在 → 有则确保置顶按钮存在
+- 检查"按钮是否已存在":容器内 `querySelector('.tel-download')` 为空才注入
+- 查看器关闭后按钮自然随 DOM 移除,无需清理逻辑
 
-### 6.2 media.js
+防抖细节:同一个查看器内媒体切换(左右滑动)时,容器不变、媒体元素变。按钮保留,点击时**实时读取**当前媒体元素(不缓存 URL)。
 
-`detectMessage(messageEl)` 返回 `null | MediaDetection`:
+### 4.3 detect.js
 
 ```ts
-type MediaType =
-  | 'photo' | 'video' | 'audio' | 'voice'
-  | 'sticker' | 'animation' | 'document' | 'story';
+type MediaKind = 'photo' | 'video' | 'animation' | 'audio' | 'voice' | 'story';
 
-interface MediaItem {
-  type: MediaType;
-  // 仅内部 element 引用,不传出
-}
-
-interface MediaDetection {
-  chatId: string;
-  messageId: number;
-  protected: boolean;
-  media: MediaItem[];
+interface Detected {
+  kind: MediaKind;
+  element: Element;   // video/img/audio 元素本身
+  container: Element; // 按钮注入目标
+  source: 'viewer' | 'story' | 'pinned-audio';
 }
 ```
 
-识别规则(按优先级,先匹配先返回):
+- `detectViewer(version, config)` → `Detected | null`
+- `detectStory(version, config)` → `Detected | null`
+- `detectPinnedAudio(version, config)` → `Detected | null`
+- animation 判定:`<video>` 无 `controls` 或容器带 GIF 特征(看验证脚本:未加载的视频走 `video` 路径,不细分;我们的 `animation` 类型主要用于图标选择,判定用 `video.loop && video.muted`)
 
-| 类型 | 命中条件 |
+### 4.4 extract.js
+
+**URL 提取**(逐条对应验证脚本):
+
+| 场景 | 读法 |
 |---|---|
-| `story` | 元素在 `[data-story-viewer]` / `.StoryViewer` 子树 |
-| `photo` | `IMG`,非 `avatar` class,`getBoundingClientRect().width > 100` |
-| `video` | `VIDEO`,非 `[loop][muted][autoplay]`(否则降级 animation) |
-| `animation` | `VIDEO[loop][muted][autoplay]`,或 `<video class*="animation">` |
-| `voice` | `AUDIO` 且 class 含 `voice-note` / `bubble-audio`,或最近祖先含 `voice` |
-| `audio` | `AUDIO`(非 voice) |
-| `sticker` | class 含 `sticker`,或最近祖先 `[data-sticker]` |
-| `document` | `[data-media-type="document"]`,或 `.document-icon`,或 `<a href*="api.tlgr" download>`(仅读 tagName + class,不读 href) |
+| webk 视频 | `mediaAspecter.querySelector('video').src` |
+| webz 视频 | `videoPlayer.querySelector('video').currentSrc` |
+| webk 图片 | `img.thumbnail.src` |
+| webz 图片 | `img.src` |
+| Story 视频 | `video.src \|\| video.currentSrc \|\| video.querySelector('source')?.src` |
+| 音频 | `audioEl.getAttribute('src')` |
 
-`protected`:自身或 5 层祖先内含 `data-protected` 属性、`aria-disabled="true"`,或 class 含 `protected`(大小写不敏感)。
+**文件名解析**(验证脚本的做法):
 
-多文件消息:同一 message 节点下识别多个不同元素,顺序按 DOM 顺序。
+1. 从 URL 尾部 JSON 解析:Telegram 文件 URL 的最后一段常为 URL-encoded JSON
+   ```js
+   const metadata = JSON.parse(decodeURIComponent(url.split('/').pop()));
+   if (metadata.fileName) fileName = metadata.fileName;
+   ```
+   解析失败静默跳过(URL 形状随版本变化)
+2. 兜底:`hashCode(url).toString(36) + '.' + ext`(ext 从 MIME/类型推断)
+3. URL 读取为**允许行为**(HTTP 下载器 spec §7 已定);仍不读 cookie/storage
 
-### 6.3 button.js
+### 4.5 button.js
 
-`attachButtons(messageEl, detection)`:
+**按钮样式 — 融入原生 UI**(验证脚本的做法):
 
-- 主按钮:浮在消息节点右上角(`position: absolute; top: 8px; right: 8px; z-index: 2`)
-- 子按钮:每个媒体对应一个,浮在对应媒体元素右上角
-- 主按钮显示当前媒体类型图标 + 数字徽标(若 N > 1)
+- webk:元素 `<button class="btn-icon tgico-download tel-download">`,内嵌 `<span class="tgico">` 图标;插入 `.media-viewer-buttons` 最前(prepend)
+- webz:元素 `<button class="Button smaller translucent-white round tel-download">`,内嵌 `<i class="icon icon-download">`;`prepend` 进 `.MediaViewerActions`,视频时插到 `.VideoPlayerControls .buttons` 内 `.spacer` 之后
+- Story:同风格,插头部按钮区
+- 置顶音频:webk `btn-icon tgico-download _tel_download_button_pinned`
 
-DOM 结构:
-
-```html
-<div class="tmd-stack" data-tmd-chat-id={chatId} data-tmd-message-id={messageId}>
-  <button class="tmd-btn tmd-primary" data-tmd-state="ready" aria-label="下载此消息的媒体">
-    <svg class="tmd-icon">{primaryIcon}</svg>
-    <span class="tmd-count" hidden>{N}</span>
-  </button>
-  <button class="tmd-btn tmd-file" data-tmd-media-index="0" data-tmd-state="ready" aria-label="下载此文件">
-    <svg class="tmd-icon">{fileIcon}</svg>
-  </button>
-  ...
-</div>
-```
-
-状态机(主按钮聚合状态,子按钮独立):
+**状态机**(我们的增强,验证脚本只有浏览器原生进度条):
 
 ```
-            submit           submit success
-   ready ───────────► submitting ──────────► queued
-    ▲                                           │
-    │ retry                                     │ progress event
-    │                                           ▼
-   failed ◄──────────── failed event ◄── downloading
-    │                                           │
-    │                                           │ complete event
-    └─────────────────────────────────────────► completed (✓)
+ready → submitting → queued → downloading → completed
+                                          ↘ failed → (点击重试)
 ```
 
-视觉:
+- 状态在按钮的 `data-tel-state` 属性上;`downloading` 时按钮内嵌小圆环进度
+- 状态由 `state.js` 按 `taskId` 更新
+- 点击时实时 `extract` 当前媒体 → `invoke` → 记录 `taskId → button` 映射
+- 重复点击(ready 时)= 强制重下,由 Rust 端 `duplicatePolicy` 决定落地行为
 
-- `ready`:实色背景(#3390ec),白色图标
-- `submitting`:同 ready,opacity 0.7,内嵌 spinner SVG
-- `queued`:同 ready,文字 "已加入"
-- `downloading`:蓝底 + 内嵌 progress bar
-- `completed`:绿底(#4dcd5e)+ ✓
-- `failed`:红底(#e53935)+ 重试图标
+### 4.6 dedupe.js
 
-子按钮在 `downloading` 时同步显示该文件进度。
+- 查看器路径拿不到 messageId,去重键 = **文件名**(`extract` 解析出的 `metadata.fileName`)
+- 文件名拿不到时跳过去重(按钮直接 ready)
+- `invoke('webview_query_downloaded', {fileName})` → 5s TTL 缓存
+- 命中的按钮初始状态显示 ✓(已完成样式)
 
-### 6.4 state.js
+### 4.7 state.js
 
-`bindEvents()` 启动后调用一次,订阅 Tauri 事件:
+- `listen('webview-task-submitted' | 'updated' | 'completed' | 'failed')`
+- 事件 payload 均带 `taskId`;按 `taskId → button` 映射更新
+- 无需 chatId/messageId 匹配(查看器方案下不存在)
 
-| 事件 | payload | 处理 |
+### 4.8 config.json(编译期内联)
+
+```json
+{
+  "refreshDelayMs": 500,
+  "dedupeCacheTtlMs": 5000,
+  "trustedOrigins": ["https://web.telegram.org", "https://webk.telegram.org", "https://webz.telegram.org"],
+  "webk": {
+    "viewerRoot": ".media-viewer-whole",
+    "mediaAspecter": ".media-viewer-movers .media-viewer-aspecter",
+    "viewerButtons": ".media-viewer-topbar .media-viewer-buttons",
+    "videoControlsRight": ".bottom-controls .right-controls",
+    "imgSelector": "img.thumbnail",
+    "storyRoot": "#stories-viewer",
+    "storyHeader": "[class^='_ViewerStoryHeaderRight']",
+    "storyFooter": "[class^='_ViewerStoryFooterRight']",
+    "storyVideo": "video.media-video",
+    "storyImage": "img.media-photo",
+    "pinnedAudio": ".pinned-audio",
+    "pinnedAudioUtils": ".pinned-container-wrapper-utils",
+    "buttonClass": "btn-icon tgico-download tel-download"
+  },
+  "webz": {
+    "viewerRoot": "#MediaViewer",
+    "activeSlide": ".MediaViewerSlide--active",
+    "viewerActions": ".MediaViewerActions",
+    "videoPlayer": ".MediaViewerContent > .VideoPlayer",
+    "imgSelector": ".MediaViewerContent > div > img",
+    "videoControls": ".VideoPlayerControls .buttons",
+    "storyRoot": "#StoryViewer",
+    "storyHeader": ".GrsJNw3y",
+    "storyImage": "img.PVZ8TOWS",
+    "buttonClass": "Button smaller translucent-white round tel-download"
+  }
+}
+```
+
+## 5. Tauri 接口
+
+### 5.1 提交下载
+
+```ts
+window.__TAURI__.core.invoke('submit_download_from_webview', {
+  request: {
+    mediaUrl: string,        // 核心字段
+    fileName: string | null, // extract 解析结果,可空
+    fileType: 'photo' | 'video' | 'animation' | 'audio' | 'voice' | 'story',
+    source: 'viewer' | 'story' | 'pinned-audio',
+  }
+})
+→ 返回 TaskRecord(含 taskId)
+```
+
+### 5.2 查询已下载
+
+```ts
+window.__TAURI__.core.invoke('webview_query_downloaded', { fileName })
+→ DownloadedMatch | null
+```
+
+### 5.3 任务事件(反向)
+
+| 事件 | payload | 触发 |
 |---|---|---|
-| `webview-task-submitted` | `{taskId, chatId, messageId, mediaIndex?}` | 找到对应按钮,状态 `submitting` → `queued` |
-| `webview-task-updated` | `{taskId, progress}` | `downloading` + 显示百分比 |
-| `webview-task-completed` | `{taskId, outputPath}` | `completed` + ✓ |
-| `webview-task-failed` | `{taskId, error}` | `failed` + 错误提示 |
+| `webview-task-submitted` | `{taskId}` | 任务创建后 |
+| `webview-task-updated` | `{taskId, progress}` | 下载中(节流) |
+| `webview-task-completed` | `{taskId, outputPath}` | 完成 |
+| `webview-task-failed` | `{taskId, error}` | 失败 |
 
-内部 `taskToButtonIndex = Map<taskId, {chatId, messageId, mediaIndex}>`,由 submit 阶段填,事件回调时查。
+## 6. 安全边界
 
-按钮 ↔ 任务映射:`chatId + messageId + mediaIndex` 唯一确定。
-- `mediaIndex` = 子按钮序号(0..N-1)
-- 主按钮对应所有子按钮的聚合状态,无需单独 taskId
+**允许**(HTTP 下载器 spec §7 已定):
 
-### 6.5 dedupe.js
+- 读媒体元素 `src` / `currentSrc`(URL 为签名短期有效,转交 Rust 不泄露会话)
+- 读 URL 尾部 JSON 解析文件名
 
-`isAlreadyDownloaded(chatId, messageId)`:
+**永不**:
 
-- 查 `dedupeCache: Map<chatKey, {downloaded, fileSize, fetchedAt}>`(chatKey = `${chatId}:${messageId}`)
-- 命中且 `now - fetchedAt < TTL`(默认 5s):返回缓存
-- 未命中或过期:调 `invoke('webview_query_downloaded', {chatId, messageId})`
-- 写入缓存,返回结果
-
-按钮初始渲染 `ready` 状态;`isAlreadyDownloaded` 返回 true 时改 `ready (downloaded)`,显示 ✓ + 文件大小(如 "✓ 3.4 MB")。**多文件消息**:只要任一子文件已 completed 即视为"已下载"——显示最近一次完成的 file_size。点击仍可强制重下,走 `submit_batch_download_from_webview`,由 `duplicatePolicy`(`skip`/`rename`/`overwrite`)决定落地行为。
-
-### 6.6 story.js
-
-独立 observer,启动时机:`document.body` 出现 `[data-story-viewer]` 或 `.StoryViewer` 子树时。
-
-- `attachStoryButtons(storyRoot)` 同消息处理,但 chatId 用特殊标记 `-story`
-- `cleanupStory()`:`storyRoot` 从 DOM 移除时清按钮
-
-Story 提交走普通 `submit_download_from_webview`,`mediaType='story'`,Rust 侧 `create_message_task` 接受并交给 MTProto(`message_by_id` 拉 Story)。
-
-### 6.7 icons.js
-
-9 个内联 SVG 字符串,每个 ~150-250 字节:
-
-| 名称 | 用途 |
-|---|---|
-| `download` | ready 状态 |
-| `spinner` | submitting |
-| `progress` | downloading |
-| `check` | completed / downloaded |
-| `retry` | failed |
-| `image` | photo |
-| `film` | video / animation |
-| `music` | audio / voice |
-| `sticker` | sticker |
-| `file` | document |
-| `story` | story |
-
-## 7. Rust 侧改动
-
-### 7.1 commands.rs 新增
-
-```rust
-#[tauri::command(rename_all = "camelCase")]
-pub async fn submit_batch_download_from_webview(
-    webview: Webview<Wry>,
-    state: State<'_, AppState>,
-    requests: Vec<WebviewDownloadRequest>,
-) -> Result<Vec<TaskRecord>, String> {
-    if !webview_bridge::is_trusted_telegram_webview(&webview) {
-        return Err("批量请求必须来自受信任的 Telegram WebView 页面".into());
-    }
-    if requests.is_empty() || requests.len() > 32 {
-        return Err("批量请求数必须在 1-32 之间".into());
-    }
-    let mut out = Vec::with_capacity(requests.len());
-    for req in requests {
-        let chat_id = validate_chat_id(&req.chat_id)?;
-        validate_message_id(req.message_id)?;
-        validate_media_type(&req.media_type)?;
-        let task = create_message_task(&state, &chat_id, req.message_id, &req.media_type).await?;
-        out.push(task);
-    }
-    Ok(out)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn webview_query_downloaded(
-    state: State<'_, AppState>,
-    chat_id: String,
-    message_id: i64,
-) -> Result<Option<DownloadedMatch>, String> {
-    let chat_id = validate_chat_id(&chat_id)?;
-    validate_message_id(message_id)?;
-    state.shared.store
-        .find_completed_for_dedupe(&chat_id, message_id)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn webview_task_action(
-    webview: Webview<Wry>,
-    state: State<'_, AppState>,
-    task_id: String,
-    action: String,
-) -> Result<TaskRecord, String> {
-    if !webview_bridge::is_trusted_telegram_webview(&webview) {
-        return Err("任务操作必须来自受信任的 Telegram WebView 页面".into());
-    }
-    if !["cancel", "retry", "open"].contains(&action.as_str()) {
-        return Err("不支持的 webview 任务操作".into());
-    }
-    state.downloads.action(&task_id, &action).await.map_err(command_error)
-}
-```
-
-### 7.2 数据模型
-
-```rust
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DownloadedMatch {
-    task_id: String,
-    file_size: Option<u64>,
-    completed_at: Option<String>, // RFC3339
-    output_path: Option<String>,
-}
-```
-
-`WebviewDownloadRequest`(已有):`{chat_id: String, message_id: i64, media_type: String}`
-
-### 7.3 task_store.rs 新增查询
-
-```rust
-pub async fn find_completed_for_dedupe(
-    &self,
-    chat_id: &str,
-    message_id: i64,
-) -> Result<Option<DownloadedMatch>> {
-    // SELECT task_id, file_size, completed_at, output_path
-    //   FROM tasks
-    //  WHERE chat_id = ? AND message_id = ? AND status = 'completed'
-    //  ORDER BY completed_at DESC LIMIT 1
-}
-```
-
-### 7.4 事件协议升级
-
-替换 `webview-download-submitted`(单条)为统一事件命名:
-
-| 旧 | 新 |
-|---|---|
-| `webview-download-submitted` (single, payload = TaskRecord) | `webview-task-submitted` (payload = `{taskId, chatId, messageId, mediaIndex?}`) |
-| — | `webview-task-updated` (payload = `{taskId, progress}`) |
-| — | `webview-task-completed` (payload = `{taskId, outputPath}`) |
-| — | `webview-task-failed` (payload = `{taskId, error}`) |
-
-事件发出点:`downloader.rs` 中任务状态变更处。`mediaIndex` 由 `create_message_task` 在批量创建时填。
-
-### 7.5 build.rs
-
-```rust
-fn main() {
-    tauri_build::AppManifest::new()
-        .commands(&[
-            "submit_download_from_webview",
-            "submit_batch_download_from_webview",
-            "webview_query_downloaded",
-            "webview_task_action",
-        ])
-        .build();
-
-    let dist = Path::new("webview-inject/dist/inject.js");
-    let src_dir = Path::new("webview-inject/src");
-    let needs_build = if !dist.exists() { true }
-        else {
-            let dist_mtime = fs::metadata(dist).and_then(|m| m.modified()).ok();
-            fs::read_dir(src_dir).ok()
-                .map(|entries| entries.flatten()
-                    .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
-                    .any(|t| dist_mtime.map_or(true, |d| t > d)))
-                .unwrap_or(false)
-        };
-    if needs_build {
-        if Command::new("node").args(["webview-inject/build.mjs"]).status().is_ok() {
-            println!("cargo:rerun-if-changed=webview-inject/src");
-        } else {
-            println!("cargo:warning=node not found or build failed; using stale inject.js");
-        }
-    }
-}
-```
-
-## 8. 数据流
-
-### 8.1 初次加载
-
-1. 子 WebView 打开 `https://web.telegram.org/`
-2. inject.js 启动:解析 `config`,校验 `location.origin === 'https://web.telegram.org' && window.top === window`
-3. 校验失败立即返回(`return`)
-4. observer 启动 MutationObserver
-5. 已存在的消息:`document.querySelectorAll(MESSAGE_SELECTOR).forEach(detectAndAttach)`
-6. 每条命中消息异步调 `dedupe.isAlreadyDownloaded` → 按钮初始 `ready` 或 `ready (downloaded)`
-
-### 8.2 用户点子按钮(单文件)
-
-1. button.js 拦截 click → `invoke('submit_download_from_webview', request)`
-2. Rust:校验 webview + 参数 → `create_message_task` → 返回 TaskRecord
-3. Rust:在任务创建时 `emit('webview-task-submitted', {taskId, chatId, messageId, mediaIndex})`
-4. inject.js `state.js` 收到事件 → 找到子按钮 → 状态 `submitting` → `queued`
-5. 下载进行中 `webview-task-updated` → 状态 `downloading` + 进度
-6. 完成 `webview-task-completed` → `completed` + ✓
-
-### 8.3 用户点主按钮(多文件)
-
-1. button.js → `invoke('submit_batch_download_from_webview', [r1, r2, ...])`
-2. Rust 循环创建 N 个任务,逐个 emit `webview-task-submitted`
-3. 主按钮聚合状态:任一失败 → `failed`,全部完成 → `completed`,部分完成 → `downloading` + 数字徽标显示完成数
-
-### 8.4 失败重试
-
-1. 用户点 `failed` 按钮
-2. button.js → `invoke('webview_task_action', {taskId, action: 'retry'})`
-3. Rust → `downloader.action(taskId, 'retry')` → 任务重新入队
-4. emit `webview-task-submitted`(新一轮)
-5. state.js 重置按钮状态
-
-### 8.5 Story
-
-1. 用户打开 Story
-2. story.js 检测 `[data-story-viewer]` 出现 → 调 media.js 识别媒体
-3. attachStoryButtons 在 Story overlay 内渲染按钮
-4. 点击 → 普通 submit 流程,mediaType='story'
-5. Rust 端 `message_by_id(chat_id='-story', message_id)` 拉取 Story,MTProto 走相同路径
-6. Story 关闭:observer 检测 DOM 移除 → cleanupStory 清按钮
-
-## 9. 安全边界
-
-注入脚本**仅读**:
-
-- `data-mid` / `data-peer-id` / `data-protected` 属性
-- `aria-disabled` 属性
-- 元素 `className`(仅匹配,不上传)
-- 元素 `tagName`
-- `getBoundingClientRect()` + `getComputedStyle().display/visibility/opacity`
-
-注入脚本**永不读**:
-
-- `src` / `href` / `currentSrc` / `poster` / `srcset`
 - `cookie` / `localStorage` / `sessionStorage` / `indexedDB`
 - `window.__TAURI_INTERNALS__`
-- 任何 clipboard / keyboard / mouse 事件(不订阅 `keydown` / `keyup` / `paste` / `copy` / `beforeunload` / `visibilitychange`)
+- `<a href>` 属性
+- 订阅 `keydown` / `paste` / `copy` / `beforeunload`
+- 任何到非 `web.telegram.org` 域的数据外发
 
-Rust 侧命令**永不接收**:路径、URL、文件名、token、cookie、session 字符串、`__TAURI__` payload 内部字段。仅 `chat_id`(整数 ID 字符串)、`message_id`(整数)、`media_type`(白名单字符串)。
+**Rust 侧**:URL 过白名单(`*.telegram.org` / `*.cdn-telegram.org`)+ 拒私有 IP + 仅 https。
 
-每条命令入口**重做** `is_trusted_telegram_webview` 校验。
+## 7. 验证方式(不做单元测试)
 
-## 10. 禁保存媒体
+合成 DOM fixture 无法代表真实 Telegram Web(虚拟列表、canvas、版本相关类名),**本方案不做单测**。验证 = 真机:
 
-### 10.1 能力要求
+1. `npx tauri dev`,WebView 内登录真实账号
+2. 依次打开:图片、视频、GIF、语音、Story、置顶音频
+3. 确认按钮出现在查看器工具栏、样式与原生融合
+4. 点击 → Rust 任务创建 → 下载完成 → 文件可播放/可打开
+5. 禁保存频道的内容同样验证
+6. 大文件(>10MB)验证 HTTP Range 路径
+7. 杀掉客户端重启,未完成任务断点续传
 
-禁保存媒体(频道主设置的"禁止保存内容")的下载按钮正常出现,点击后能成功下载至本地磁盘。
-
-### 10.2 实现位置
-
-下载能力由 `webview-http-downloader-design.md` 定义。本 spec 不规定协议层细节,只在 UI 层要求:注入脚本对所有可识别的可见媒体元素(含禁保存媒体)都渲染下载按钮,点击后能成功提交并完成。
-
-### 10.3 自毁消息
-
-`ttl_period > 0` 的自毁/限时消息**不**显示下载按钮 — 这类消息不下载会消失,不提供入口。
-
-### 10.4 用户告知
-
-前端不为禁保存媒体单独加视觉标记(单人使用,频道名自证)。如后续多人产品化需加"下载后请尊重原作者"水印,另起 spec。
-
-### 10.5 验收
-
-- [ ] 频道中设置了禁保存的消息,聊天列表正常出现下载按钮
-- [ ] 实际下载成功,任务状态 `completed`
-- [ ] 自毁/限时消息不出现下载按钮
-
----
-
-## 11. 测试
-
-### 11.1 Rust 单元/集成
-
-`cargo test --locked` 新增:
-
-- `submit_batch_download_from_webview` 接受 1-32 条;拒绝 0 / >32;非 trusted webview 拒绝
-- `webview_query_downloaded` 命中已 completed、未命中返回 None;chat_id/message_id 非法返回错误
-- `webview_task_action` 三种 action 路由正确;非法 action 拒绝
-- 事件 payload schema:序列化后字段名 camelCase,字段类型正确
-
-### 11.2 Init script 单元(webview-inject/test/)
-
-vitest + happy-dom:
-
-- fixture:HTML 字符串模拟 Telegram Web DOM(消息、群图、Story overlay 各一份)
-- mock `window.__TAURI__.core.invoke` 返回预设值
-- 用例:
-  - observer 在 mutation 后调用 attach
-  - media.js 识别 photo/video/voice/sticker/animation/document/story
-  - dedupe.js 缓存命中不重复 invoke,TTL 过期重新 invoke
-  - button.js 状态机正确转移(5 状态)
-  - 多文件消息渲染 1 + N 按钮,主按钮徽标数字正确
-  - Story 关闭清理按钮
-  - origin 不匹配 / 非顶层 frame 时 boot 提前返回
-
-### 11.3 手工(开发模式)
-
-`npx tauri dev` 登录真实账号:
-
-- 普通消息 / 群图 / 文档 / voice / sticker / animation / Story 各下载一次
-- 重复点击强制重下
-- 关闭客户端重启,已下载标记是否保留
-- 主按钮 / 子按钮视觉与 Telegram Web 融合度
-
-### 11.4 Lint
-
-- ESLint (vanilla config) 作用于 `webview-inject/src/`
-- `cargo clippy --locked --all-targets`
-
-## 12. 配置(`config.json`,编译期内联到 `inject.js` 顶部)
-
-```js
-{
-  observerDebounceMs: 50,
-  observerAttributeFilter: [
-    'data-mid', 'data-peer-id', 'data-protected', 'class', 'aria-disabled'
-  ],
-  messageSelectors: [
-    '.message[data-mid]',
-    '.Message[data-mid]',
-    '[data-mid][data-peer-id]'
-  ],
-  storySelectors: [
-    '[data-story-viewer]',
-    '.StoryViewer'
-  ],
-  duplicateWindowBytes: 5120,
-  dedupeCacheTtlMs: 5000,
-  batchMaxSize: 32,
-  buttonStackPosition: 'top-right',
-  iconSize: 16,
-  spinnerSize: 12,
-  visibleMinWidth: 100,
-  protectedAncestorDepth: 5
-}
-```
-
-## 13. 风险与缓解
+## 8. 风险与缓解
 
 | 风险 | 缓解 |
 |---|---|
-| Telegram Web DOM 结构变化,selector 失效 | happy-dom fixture 覆盖已知 DOM 版本;真机回归;selector 集中于 `config.js`,快速调整 |
-| Grammers `0.10.0` Story API 支持不全 | 实施首日先做 Story MTProto 端到端冒烟;失败则 Story 降级为"快捷入口"(打开/复制链接),不进任务系统 |
-| 长聊天列表 MutationObserver 触发频繁 | 50ms 防抖 + 属性白名单 + 内部 ID 缓存避免重复处理 |
-| dedupe 缓存 5s 内不感知新完成任务 | 用户重新滚动触发新 mutation 时自然更新;首次进入页面无影响 |
-| 多文件识别歧义(同消息 document + img) | document 优先(体积更大,通常更值得下载);可在 `config.js` 调优先级 |
-| Node 不可用导致打包失败 | build.rs 警告不阻断;dist 已存在则跳过;CI 单独验证 |
+| Telegram Web DOM 结构变化,selector 失效 | selector 集中于 `config.json`,改一处;验证脚本社区会先发现变化 |
+| webk/webz 结构差异大 | 两套 selector 独立维护,照验证脚本 |
+| 查看器内切换媒体时按钮残留 | 按钮不缓存 URL,点击时实时 extract |
+| Story 头部 class 是 hash(`.GrsJNw3y`) | 提供多个 fallback(`.DropdownMenu` 父节点);失效时真机快速定位 |
+| 文件名解析失败 | 静默兜底到 hash 文件名;不影响下载 |
 
-## 14. 验收标准
+## 9. 验收标准
 
-- [ ] `cargo test --locked` 全部通过
-- [ ] `cd desktop && npm run check && npm run build` 通过
-- [ ] `cd desktop/src-tauri && cargo clippy --locked --all-targets` 无 warning
-- [ ] `webview-inject/test/` vitest 通过,行覆盖率 ≥ 80%
-- [ ] `npx tauri dev` 真实账号登录,7 类媒体 + Story 全部能识别并入队
-- [ ] 主按钮 + 子按钮视觉与 Telegram Web 融合(肉眼无明显违和)
-- [ ] 状态机 5 状态正确切换(录屏或日志验证)
-- [ ] 多文件消息渲染 1 + N 按钮,数字徽标正确
-- [ ] 已下载消息显示 ✓ + 文件大小;点击后走 `duplicatePolicy='rename'`
-- [ ] 失败按钮显示错误原因,点击走 retry
-- [ ] 安全审计脚本不读 `src`/`cookie`/`localStorage`,不订阅敏感事件
-- [ ] Story overlay 关闭后按钮自动清理
-- [ ] 中文 UI 文案一致,每条 ≤ 8 字
+- [ ] 图片 / 视频 / GIF / 语音 / Story / 置顶音频 六类,按钮全部出现
+- [ ] 按钮样式与 Telegram Web 原生按钮视觉一致
+- [ ] 5 状态切换正确(提交中/已加入/下载中/已完成/失败)
+- [ ] 点击下载,文件完整、可播放
+- [ ] 禁保存频道内容可下载
+- [ ] 已下载文件重新打开查看器时按钮显示 ✓
+- [ ] Rust 端零 MTProto 依赖(见 HTTP 下载器 spec)
 
-## 15. 参考
+## 10. 参考
 
-- 现有 init script: `desktop/src-tauri/src/webview_bridge.rs:147`
-- 现有命令: `desktop/src-tauri/src/commands.rs:1115`
-- 任务系统: `desktop/src-tauri/src/downloader.rs`、`task_store.rs`
-- Tauri 事件订阅: `@tauri-apps/api/event::listen`
-- Greasy Fork 同类产品: [#446342](https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader)
-- 项目文档: `docs/FEATURE_MIGRATION_ZH.md`、`docs/TELEGRAM_CDN_ZH.md`
+- 验证脚本源码: https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader/code
+- 下载执行与任务管理: `docs/superpowers/specs/2026-09-26-webview-http-downloader-design.md`
+- 本方案替代旧文 `telegram-webview-inject-enhancement-design.md` 的"聊天列表按钮"部分(已验证不可行:聊天列表只有缩略图)

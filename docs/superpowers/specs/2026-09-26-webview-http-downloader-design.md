@@ -33,10 +33,10 @@
 - 并发/续传/分块:脚本没有,本 spec 加
 - 状态反馈:脚本只有浏览器原生进度条,本 spec 加 5 状态按钮(就绪/提交/排队/下载/完成/失败)
 - 已下载标记:脚本没有,本 spec 加 ✓
-- Story 支持:脚本支持,本 spec 支持(对齐)
-- 多文件消息:脚本支持(部分),本 spec 支持主 + 子按钮(更明确)
 
-**本 spec 不做的(脚本也不做)**:Telegram 上传、消息转发、rclone 云上传、Bot 能力、跨设备同步、多账号。
+**对齐脚本**(不自创):媒体查看器路径(非聊天列表)、webk/webz 双 selector、轮询检测、URL 提取方式。详见 `telegram-webview-inject-enhancement-design.md`。
+
+**本 spec 不做的(脚本也不做)**:Telegram 上传、消息转发、rclone 云上传、Bot 能力、跨设备同步、多账号、聊天列表内联按钮(技术不可行:列表只有缩略图)。
 
 ## 2. 现状摘要
 
@@ -78,15 +78,20 @@
 desktop/src-tauri/src/
 ├── commands.rs           重构:删除所有 *_upload*/forward/bot/cloud/transfers 命令
 ├── http_downloader.rs    新:HttpDownloadManager + ChunkedFetcher + UrlValidator
-├── task_store.rs         保留(查 + 写 task 记录)
+├── task_store.rs         保留(查 + 写 task 记录;新增 media_url / file_name 字段)
 ├── chunk_writer.rs       保留(乱序写入、BLAKE3 校验、缺块检测)
 ├── atomic_file.rs        保留
 ├── webview_bridge.rs     保留(注入脚本位置不变)
-├── webview-inject/
+├── webview-inject/       按查看器方案重写(见 telegram-webview-inject-enhancement-design.md)
 │   ├── src/
-│   │   ├── inject.js          修改:点击按钮时读 src/currentSrc
-│   │   ├── button.js          修改:URL 提取 + payload 扩展
-│   │   └── ... (其他模块不变)
+│   │   ├── inject.js     重写:查看器轮询 + 工具栏按钮
+│   │   ├── watcher.js    新:查看器检测轮询
+│   │   ├── detect.js     新:查看器内媒体检测
+│   │   ├── extract.js    新:URL 提取 + 文件名解析
+│   │   ├── button.js     重写:原生风格按钮 + 状态机
+│   │   ├── state.js      保留:事件订阅
+│   │   ├── dedupe.js     重写:按文件名去重
+│   │   └── icons.js      保留
 │   └── ...
 ├── app_state.rs          调整:删除 telegram() 字段
 └── ...
@@ -110,19 +115,20 @@ Cargo.toml:
 ### 5.2 数据流(端到端)
 
 ```
-用户在 WebView 看消息
-        ↓ 点下载按钮
-inject.js button.click
-        ↓ 读 mediaEl.src / currentSrc
-        ↓ 调 invoke('submit_download_from_webview', { request: {chatId, messageId, mediaType, mediaUrl, fileName, fileSize} })
+用户在 Telegram Web 点开媒体(查看器打开)
+        ↓ watcher.js 500ms 轮询检测到查看器 / Story / 置顶音频
+        ↓ detect.js 找到媒体元素 + 注入按钮到原生工具栏
+用户点我们的下载按钮
+        ↓ extract.js 读媒体元素 src / currentSrc,解析文件名
+        ↓ invoke('submit_download_from_webview', { request: {mediaUrl, fileName, fileType, source} })
         ▼
 Rust commands.rs
-        ↓ validate URL (https + 域名白名单 + 大小写敏感)
+        ↓ validate URL (https + 域名白名单 + 拒私有 IP)
         ↓ create_http_task(...)
         ▼
 http_downloader.rs::HttpDownloadManager
         ↓ 入队 + 创建 task_store 记录
-        ↓ emit('webview-task-submitted', {taskId, chatId, messageId, mediaIndex})
+        ↓ emit('webview-task-submitted', {taskId})
         ▼
 ChunkedFetcher
         ↓ HEAD 检查 URL 有效性 + 拿 Content-Length
@@ -179,27 +185,34 @@ emit('webview-task-completed', {taskId, outputPath})
 
 ```typescript
 interface SubmitDownloadRequest {
-  chatId: string | number;        // 现有,DOM data-peer-id
-  messageId: number;              // 现有,DOM data-mid
-  mediaType: 'photo' | 'video' | 'audio' | 'voice' | 'sticker' | 'animation' | 'document' | 'story';
-  mediaUrl: string;               // 新增,从 mediaEl.src / currentSrc 读取
-  fileName?: string | null;       // 新增,可选,优先 <a download> 属性 / data-name
-  fileSize?: number | null;       // 新增,可选,HEAD 请求之前由 Rust 校验
+  mediaUrl: string;               // 核心字段:查看器内媒体元素的 src / currentSrc
+  fileName: string | null;        // 从 URL 尾部 JSON 解析(metadata.fileName),可空
+  fileType: 'photo' | 'video' | 'animation' | 'audio' | 'voice' | 'story';
+  source: 'viewer' | 'story' | 'pinned-audio';
 }
 
 invoke('submit_download_from_webview', { request: SubmitDownloadRequest });
+→ 返回 TaskRecord(含 taskId)
 ```
+
+**无 chatId / messageId**:查看器路径不提供消息上下文(与验证脚本 #446342 一致);唯一例外是置顶音频的 `data-mid`,但本 spec 不依赖它做任务标识。
 
 ### 6.2 Rust 命令
 
-`submit_download_from_webview` / `submit_batch_download_from_webview` / `webview_task_action` / `webview_query_downloaded` 全部保留(命名不变),payload 一律增 `mediaUrl` / `fileName` / `fileSize` 字段。
+| 命令 | 状态 |
+|---|---|
+| `submit_download_from_webview` | 保留,payload 改为上表 |
+| `webview_query_downloaded` | 保留,查询键由 `chatId+messageId` 改为 `fileName` |
+| `webview_task_action` | 保留(cancel / retry / open) |
+| `submit_batch_download_from_webview` | **删除** — 查看器一次只显示一个媒体,无批量来源 |
 
-事件 schema 不变(`webview-task-submitted` / `updated` / `completed` / `failed`)。
+事件 schema 不变(`webview-task-submitted` / `updated` / `completed` / `failed`,均带 `taskId`)。
 
 ### 6.3 删除的命令
 
 以下 Tauri 命令整条删除 + 从 `tauri::generate_handler!` 移除 + 从 `build.rs` AppManifest 移除:
 
+- `submit_batch_download_from_webview`
 - `upload_completed_download`
 - `forward_telegram_message`
 - `list_telegram_transfers`
@@ -214,12 +227,11 @@ invoke('submit_download_from_webview', { request: SubmitDownloadRequest });
 
 | 操作 | 现状 | 本 spec |
 |---|---|---|
-| `data-mid` / `data-peer-id` / `data-protected` | ✅ 读 | ✅ 读(保留)|
-| `aria-disabled` | ✅ 读 | ✅ 读(保留)|
-| `tagName` / `className` | ✅ 读 | ✅ 读(保留)|
-| `getBoundingClientRect` / `getComputedStyle` | ✅ 读 | ✅ 读(保留)|
-| **媒体元素 `src` / `currentSrc`** | ❌ **永不许** | ✅ **允许**(限 `<video>`/`<audio>`/`<img>`/`<a download>`) |
-| `<a>` 元素的 `download` / `href` | ❌ 永不许 | ⚠️ **仅读 `download` 属性**(用于 fileName);`href` 永不许 |
+| `data-mid` / `data-peer-id` / `data-protected` | ✅ 读 | ⚠️ 仅置顶音频场景读 `data-mid`;其余不再需要 |
+| `aria-disabled` / `tagName` / `className` | ✅ 读 | ✅ 读(保留)|
+| **媒体元素 `src` / `currentSrc`** | ❌ **永不许** | ✅ **允许**(查看器内的 `<video>`/`<audio>`/`<img>`) |
+| URL 尾部 JSON 解析(取 fileName) | ❌ 永不许 | ✅ **允许** |
+| `<a>` 元素的 `href` | ❌ 永不许 | ❌ 永不许(不变)|
 | `cookie` / `localStorage` / `sessionStorage` / `indexedDB` | ❌ 永不许 | ❌ 永不许(不变)|
 | `window.__TAURI_INTERNALS__` | ❌ 永不许 | ❌ 永不许(不变)|
 | `keydown` / `paste` / `copy` / `beforeunload` | ❌ 不订阅 | ❌ 不订阅(不变)|
@@ -258,9 +270,15 @@ Telegram Web 文件 URL 通常 1 小时内有效(基于内部签名 + token)。�
 
 ## 9. 数据模型
 
-`task_store.rs` 的 `tasks` 表 `file_size` 字段在创建时**未**知(URL HEAD 未发),下载过程中由 `Content-Length` 头填入并 update 任务记录。`started_at` 用下载开始时间,`completed_at` 用原子提交成功时间。
+`task_store.rs` 的 `tasks` 表:
 
-新增 `media_url: String` 字段存任务的源 URL(用于排查 + 重新触发)。`media_token` / `cdn_dc_id` 等 MTProto 字段删除。
+- `file_size` 创建时未知(URL HEAD 未发),下载中由 `Content-Length` 头填入并 update 任务记录
+- 新增 `media_url: String` — 源 URL(排查 + 重新触发)
+- 新增 `file_name: Option<String>` — 从 URL 元数据解析的文件名(去重键)
+- `started_at` 用下载开始时间,`completed_at` 用原子提交成功时间
+- `media_token` / `cdn_dc_id` / `chat_id` + `message_id` 等 MTProto 字段删除
+
+**去重策略**:`webview_query_downloaded(fileName)` 查询 `status = 'completed' AND file_name = ?`(取最近一条)。查看器路径无 messageId,文件名是唯一稳定标识。文件名解析失败的下载不参与去重。
 
 ## 10. 设置页
 
@@ -273,66 +291,61 @@ Telegram Web 文件 URL 通常 1 小时内有效(基于内部签名 + token)。�
 - **新增**:HTTP 域名白名单(高级设置,默认隐藏;展开后可见白名单列表,可编辑)
 - **新增**:WebView2 数据根(已有,保留)
 
-## 11. 测试
+## 11. 验证
 
-### 11.1 Rust 单元/集成
+**JS 注入脚本不做单元测试**(合成 DOM fixture 不能代表真实 Telegram Web),验证靠真机。
+
+### 11.1 Rust 侧(保留 cargo test 惯例,不涉 Telegram 网络)
 
 `cargo test --locked`:
 - `UrlValidator` 各组合(host 白名单 / 协议 / 私有 IP / 拒绝列表)
-- `ChunkedFetcher` 用 mock HTTP server(用 `axum` 或 `wiremock`)模拟:
-  - 200 + Content-Length 正常分块
-  - 206 Partial Content
-  - Range 不支持退化
-  - 401 / 404 / 410 错误码
-  - 429 + 重试耗尽
-  - 网络错误 + 重试
+- `ChunkedFetcher` 用本地 mock HTTP server(`wiremock`)验证:200 + Content-Length、206 Partial Content、Range 不支持退化、401/404/410、429 重试耗尽、网络错误重试
 - `HttpDownloadManager` 调度:并发上限、取消、续传命中
-- 命令校验:URL 非白名单 → 拒;chat_id/message_id 非法 → 拒
+- 命令校验:URL 非白名单 → 拒
 
-### 11.2 Init script 单元
+以上均为真实逻辑测试(本地 HTTP server + 真实文件字节),非模拟 DOM。
 
-- `media.js`:从 `src` 读取后送 invoke,payload 含 `mediaUrl`
-- `button.js`:URL 提取逻辑(空 src / blob: / data: / cdn 域名各种)
-- 边界:src 为空、blob URL、无 src 属性 → button 拒绝点击并提示
-
-### 11.3 手工端到端
+### 11.2 手工端到端(主要验证方式)
 
 `npx tauri dev`:
 1. WebView 中登录 Telegram Web(扫描二维码)
-2. 普通消息点下载,正常完成
-3. 禁保存消息点下载,正常完成
-4. **大文件**(>10MB)点下载,正常完成(关键验证 — HTTP API 透明处理 CDN)
-5. 杀掉客户端,重启,未完成任务自动从断点恢复
-6. URL 过期(等 1 小时后)再次点击,失败提示明确
+2. 打开图片查看器 → 点按钮 → 下载完成
+3. 打开视频查看器 → 点按钮 → 大文件(>10MB)正常完成(HTTP Range 分块)
+4. 禁保存频道的媒体 → 同样可下载
+5. 打开 Story → 点按钮 → 下载完成
+6. 置顶音频(webk)→ 点按钮 → 下载完成
+7. 杀掉客户端,重启,未完成任务自动从断点恢复
+8. URL 过期(等 1 小时后)再次点击,失败提示明确
 
 ## 12. 风险与缓解
 
 | 风险 | 缓解 |
 |---|---|
-| Telegram Web 文件 URL 过期(用户停留后回来点) | 错误信息明确指向"重新打开该消息";不自动重试 |
+| Telegram Web 文件 URL 过期(用户停留后回来点) | 错误信息明确指向"重新打开媒体";不自动重试 |
 | Range 请求不被服务端支持 | 退化到整文件 GET(走 `accept-ranges: none` 检测) |
 | 域名白名单过严,真实 URL 被拒 | 默认白名单含 `web.telegram.org` + `*.cdn-telegram.org` + `*.telegram.org`;可由用户编辑 |
 | 域名白名单过松,被 SSRF 利用 | 同时拒绝私有 IP(127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1) |
 | reqwest 间接依赖把包大小撑大 | 用 `default-features = false, features = ["stream", "rustls-tls"]`,禁用 native-tls |
 | WebView 关闭后 cookie 失效 | WebView2 profile 持久化,与现有行为一致;不增加复杂度 |
-| CDN 大文件 Range 不支持 | 单流下载整文件,自动原子提交;并发模型仍生效(多文件并行)|
+| CDN 大文件 Range 不支持 | 单流下载整文件,自动原子提交 |
+| 查看器 selector 随 Telegram 版本变化 | selector 集中于 config.json;对齐验证脚本 #446342 的做法 |
 
 ## 13. 验收标准
 
-- [ ] `cargo test --locked` 全部通过(含新增 HTTP 下载器测试)
+- [ ] `cargo test --locked` 全部通过(含新增 HTTP 下载器逻辑测试)
 - [ ] `cargo clippy --locked --all-targets` 无 warning
 - [ ] `desktop/src/lib/api.ts` 的 TS 类型与命令签名一致
 - [ ] `npm run build` 通过
 - [ ] `npx tauri build` 产出 MSI/NSIS
-- [ ] 真实账号端到端:
-  - 普通消息下载 ✓
-  - 禁保存消息下载 ✓(HTTP API 直接支持)
-  - **大文件(>10MB)下载 ✓**(CDN 透明处理)
+- [ ] 真实账号端到端(查看器路径):
+  - 图片 / 视频 / GIF / 语音 / Story / 置顶音频 下载 ✓
+  - 禁保存频道媒体下载 ✓
+  - 大文件(>10MB)下载 ✓
   - 杀掉客户端重启,断点续传 ✓
   - WebView 关闭后再打开,WebView2 profile 保留登录 ✓
 - [ ] Rust 端零 Grammers 依赖(`grep grammers Cargo.lock` 返回空)
-- [ ] Rust 端无 chacha20poly1305 / keyring / sea-orm 上传字段
-- [ ] 桌面客户端所有 Tauri 命令无 `*_upload*` / `*_forward*` / `*_bot*` / `*_cloud*` / `*_transfer*`
+- [ ] Rust 端无 chacha20poly1305 / keyring
+- [ ] 桌面客户端所有 Tauri 命令无 `*_upload*` / `*_forward*` / `*_bot*` / `*_cloud*` / `*_transfer*` / `*_batch*`
 
 ## 14. 后续
 
@@ -343,8 +356,8 @@ Telegram Web 文件 URL 通常 1 小时内有效(基于内部签名 + token)。�
 
 ## 15. 参考
 
-- 现有 MTProto 路径下载核心:`desktop/src-tauri/src/downloader.rs:680-760`
-- 现有事件协议:已通过 inject plan Task 13 升级到 webview-task-*
+- 验证脚本源码: https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader/code
+- 注入脚本规范(查看器方案): `docs/superpowers/specs/2026-09-26-telegram-webview-inject-enhancement-design.md`
 - 现有 chunk_writer:`desktop/src-tauri/src/chunk_writer.rs`
+- 现有任务库:`desktop/src-tauri/src/task_store.rs`
 - Telegram CDN 协议说明(本次不实现,HTTP API 已透明):`docs/TELEGRAM_CDN_ZH.md`
-- inject plan:本次 spec 完成后,**修订** `docs/superpowers/plans/2026-09-26-telegram-webview-inject-enhancement.md` 的 Task 11/12/13/16 与 Rust 端命令
