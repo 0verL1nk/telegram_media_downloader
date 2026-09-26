@@ -1,6 +1,7 @@
 // desktop/src-tauri/webview-inject/src/state.js
 // Tauri 任务事件订阅:taskId → 按钮映射,事件驱动按钮状态。
 import { setButtonState } from './button.js';
+import { abortTask } from './downloader.js';
 
 const byTask = new Map();
 const activeTaskByButton = new WeakMap();
@@ -43,6 +44,10 @@ export function bindEvents() {
     listen('webview-task-failed', (event) => {
       const btn = byTask.get(event.payload?.taskId);
       if (btn) setButtonState(btn, 'failed');
+    }),
+    listen('webview-download-abort', (event) => {
+      const taskId = event.payload?.taskId;
+      if (taskId) abortTask(taskId);
     }),
   ]);
 }

@@ -17,8 +17,9 @@ const ORDER = [
   'extract.js',
   'detect.js',
   'button.js',
-  'state.js',
   'task-state.js',
+  'downloader.js',
+  'state.js',
   'watcher.js',
   'inject.js',
 ];

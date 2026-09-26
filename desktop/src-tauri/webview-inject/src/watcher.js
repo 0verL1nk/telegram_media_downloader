@@ -6,6 +6,7 @@ import { getMediaUrl, resolveFileName } from './extract.js';
 import { ensureButton, setButtonState, injectButtonStyles } from './button.js';
 import { registerTask, releaseButton } from './state.js';
 import { queryTaskState } from './task-state.js';
+import { runPipeline } from './downloader.js';
 
 export function startWatcher(cfg) {
   const version = detectVersion();
@@ -22,12 +23,12 @@ export function startWatcher(cfg) {
     const fileName = resolveFileName(url, detected.kind);
     setButtonState(btn, 'submitting');
     try {
-      const task = await window.__TAURI__.core.invoke('submit_download_from_webview', {
-        request: { mediaUrl: url, fileName, fileType: detected.kind, source: detected.source },
+      await runPipeline({
+        url, fileName, fileType: detected.kind, source: detected.source, cfg,
+        onTaskId: (taskId) => { registerTask(taskId, btn); setButtonState(btn, 'queued'); },
       });
-      registerTask(task.taskId, btn);
-      setButtonState(btn, 'queued');
-    } catch (_e) {
+    } catch (error) {
+      if (error && error.name === 'AbortError') { setButtonState(btn, 'ready'); return; }
       setButtonState(btn, 'failed');
     }
   };
