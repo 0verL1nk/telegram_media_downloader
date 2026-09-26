@@ -15,8 +15,8 @@ function parseSize(value) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-// 解析元素的渲染宽度。真实浏览器优先用 rect;happy-dom 等无布局环境
-// rect 恒为 0,回退到内联样式 width 或 width 属性。
+// 解析元素的渲染宽度。优先用 rect;元素未参与布局时 rect 为 0,
+// 回退到内联样式 width 或 width 属性。
 function renderedWidth(el) {
   if (el.getBoundingClientRect) {
     const rect = el.getBoundingClientRect();
@@ -32,8 +32,8 @@ function renderedWidth(el) {
 // 是否被显式隐藏。注意:
 // - 计算 opacity 可能为空字符串,必须用 parseFloat 并检查 isFinite,
 //   否则 Number('') === 0 会误判全部元素为不可见。
-// - 无 controls 的 <audio> 在浏览器(含 happy-dom)中计算 display 为 none,
-//   但它仍是可下载媒体,由调用方对 audio 单独处理,不走此门。
+// - 无 controls 的 <audio> 由 UA 样式计算为 display:none,但它仍是可下载媒体,
+//   由调用方对 audio 单独处理,不走此门。
 function isHidden(el) {
   if (!el.isConnected) return true;
   const style = getComputedStyle(el);
