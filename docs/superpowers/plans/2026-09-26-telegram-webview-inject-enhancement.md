@@ -2367,9 +2367,145 @@ git commit -m "feat(desktop): expose webview_query_downloaded and batch submit T
 
 ---
 
+## Task 16: 放开 noforwards 拦截(对齐油猴脚本)
+
+**Files:**
+- Modify: `desktop/src-tauri/src/telegram.rs`(改 `protected_or_ttl` + 加测试)
+
+- [ ] **Step 1: 写失败测试**
+
+打开 `desktop/src-tauri/src/telegram.rs`,找到文件末尾的测试模块(若没有则在末尾添加 `#[cfg(test)] mod tests { ... }`)。在 tests 模块内新增:
+
+```rust
+#[test]
+fn message_with_noforwards_is_not_protected() {
+    use grammers_client::tl::enums::{Message as TlMessage, MessageReplyHeader};
+    let raw = TlMessage::Message(grammers_client::tl::types::Message {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        silent: false,
+        post: false,
+        from_scheduled: false,
+        legacy: false,
+        edit_hide: false,
+        pinned: false,
+        from_id: None,
+        from_boosts_applied: None,
+        saved_peer_id: None,
+        fwd_from: None,
+        via_bot_id: None,
+        via_business_bot_id: None,
+        reply_to: Some(MessageReplyHeader::Header(Default::default())),
+        date: 0,
+        message: String::new(),
+        media: None,
+        reply_markup: None,
+        entities: None,
+        views: None,
+        forwards: None,
+        replies: None,
+        edit_date: None,
+        post_author: None,
+        grouped_id: None,
+        reactions: None,
+        restriction_reason: None,
+        ttl_period: None,
+        noforwards: true,
+        quick_reply_shortcut_id: None,
+        effect: None,
+        factcheck: None,
+        report_delivery_until_date: None,
+        suggested_post: None,
+        from_pep: false,
+    });
+    let msg = grammers_client::message::Message { raw, ..unsafe { std::mem::zeroed() } };
+    // SAFETY: 测试用,只读 noforwards 字段。
+    assert!(!crate::telegram::protected_or_ttl(&msg));
+}
+```
+
+**注意**:该 fixture 用 `std::mem::zeroed()` 构造 Message,仅依赖 `noforwards` 字段。若 Grammers 的 `Message` 字段集与上述不同,以你本机 `grammers 0.10.0` 实际字段为准,**禁止臆造**;若构造困难,可改为不构造 Message 整体、改测一个独立的 `is_noforwards(raw: &RawMessage) -> bool` 纯函数,把判断从 `protected_or_ttl` 抽出来,测试更稳。
+
+更稳的备选写法:
+
+```rust
+// telegram.rs 顶部新增:
+fn raw_is_ttl(raw: &grammers_client::tl::enums::Message) -> bool {
+    matches!(raw, grammers_client::tl::enums::Message::Message(m) if m.ttl_period.unwrap_or(0) > 0)
+}
+
+pub fn protected_or_ttl(message: &grammers_client::message::Message) -> bool {
+    raw_is_ttl(&message.raw)
+}
+
+// 测试:
+#[test]
+fn raw_is_ttl_detects_ttl() {
+    use grammers_client::tl::enums::Message as TlMessage;
+    let mut m = make_empty_raw();
+    m.ttl_period = Some(60);
+    assert!(crate::telegram::raw_is_ttl(&TlMessage::Message(m)));
+}
+
+#[test]
+fn raw_is_ttl_ignores_noforwards() {
+    use grammers_client::tl::enums::Message as TlMessage;
+    let mut m = make_empty_raw();
+    m.noforwards = true;
+    assert!(!crate::telegram::raw_is_ttl(&TlMessage::Message(m)));
+}
+```
+
+(其中 `make_empty_raw` 由 implementer 在测试模块内写一个最小 helper,只填 `ttl_period` 与 `noforwards`,其余字段用默认。)
+
+- [ ] **Step 2: 跑测试验证失败**
+
+Run: `cd desktop/src-tauri && cargo test --locked raw_is_ttl`
+Expected: FAIL — 现有 `protected_or_ttl` 仍是 `noforwards || ttl_period`,抽函数前的编译错误或断言失败。
+
+- [ ] **Step 3: 重构 protected_or_ttl + 抽 raw_is_ttl**
+
+打开 `desktop/src-tauri/src/telegram.rs`,把 `protected_or_ttl` 替换为:
+
+```rust
+fn raw_is_ttl(raw: &grammers_client::tl::enums::Message) -> bool {
+    matches!(
+        raw,
+        grammers_client::tl::enums::Message::Message(m) if m.ttl_period.unwrap_or(0) > 0
+    )
+}
+
+pub fn protected_or_ttl(message: &grammers_client::message::Message) -> bool {
+    raw_is_ttl(&message.raw)
+}
+```
+
+`message_info` 中的 `if protected_or_ttl(message)` 调用不动 — 它依然为 ttl_period 触发 `unavailable_reason`,只是不再为 noforwards 触发。
+
+- [ ] **Step 4: 跑测试验证通过**
+
+Run: `cd desktop/src-tauri && cargo test --locked raw_is_ttl protected_or_ttl`
+Expected: PASS。
+
+Run: `cd desktop/src-tauri && cargo test --locked`
+Expected: 全部通过(原有测试不受影响)。
+
+Run: `cd desktop/src-tauri && cargo fmt --all -- --check`
+Expected: 无 diff。
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add desktop/src-tauri/src/telegram.rs
+git commit -m "feat(desktop): open noforwards downloads, keep ttl-only protection"
+```
+
+---
+
 ## 自审记录(写完后已自审)
 
-- **Spec 覆盖**:逐项对照 spec 第 3-13 节,所有功能落在对应任务。
+- **Spec 覆盖**:逐项对照 spec 第 3-14 节,所有功能落在对应任务。
   - 图标按钮 → Task 5 (button.js)
   - 多文件识别 → Task 4 (media.js) + Task 5 (button 主+子)
   - 状态反馈 → Task 6 (state.js) + Task 13 (事件升级)
@@ -2377,9 +2513,10 @@ git commit -m "feat(desktop): expose webview_query_downloaded and batch submit T
   - Story → Task 8 (story.js) + Task 14 (集成)
   - 批量提交 → Task 12 (Rust 命令)
   - 失败重试 → Task 12 (webview_task_action)
+  - 禁保存策略 → Task 16 (noforwards 放开,ttl_period 保留)
   - 安全边界 → 各模块注释 + setup.js mock
   - 测试 → Task 2-10 + 11-13 + 15
   - 配置 → Task 1
 - **占位符扫描**:无 TBD/TODO。`todo!()` 仅出现在测试与实现初版,Step 4/5 立即替换为真实代码。
-- **类型一致**:`find_completed_for_dedupe` 返回 `Option<DownloadedMatch>`,在 Task 11 定义,在 Task 11/14 使用,一致。`webview_query_downloaded` 命令 payload 字段 `chatId`、`messageId` 与 inject.js dedupe.js 调用一致。事件 payload 在 Task 13 升级前后一致。
-- **范围**:15 个任务,每任务 5-9 步,总计约 2 周单人工作量。
+- **类型一致**:`find_completed_for_dedupe` 返回 `Option<DownloadedMatch>`,在 Task 11 定义,在 Task 11/14 使用,一致。`webview_query_downloaded` 命令 payload 字段 `chatId`、`messageId` 与 inject.js dedupe.js 调用一致。事件 payload 在 Task 13 升级前后一致。`raw_is_ttl` 抽离后在 Task 16 定义并使用,与 `protected_or_ttl` 行为等价(后者只剩包装)。
+- **范围**:16 个任务,每任务 5-9 步,总计约 2 周单人工作量。
