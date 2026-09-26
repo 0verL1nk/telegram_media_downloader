@@ -90,7 +90,7 @@ desktop/src-tauri/src/
 │   │   ├── extract.js    新:URL 提取 + 文件名解析
 │   │   ├── button.js     重写:原生风格按钮 + 状态机
 │   │   ├── state.js      保留:事件订阅
-│   │   ├── dedupe.js     重写:按文件名去重
+│   │   ├── task-state.js 重写:按文件名查任务状态(含下载中/已完成/失败)
 │   │   └── icons.js      保留
 │   └── ...
 ├── app_state.rs          调整:删除 telegram() 字段
@@ -202,7 +202,7 @@ invoke('submit_download_from_webview', { request: SubmitDownloadRequest });
 | 命令 | 状态 |
 |---|---|
 | `submit_download_from_webview` | 保留,payload 改为上表 |
-| `webview_query_downloaded` | 保留,查询键由 `chatId+messageId` 改为 `fileName` |
+| `webview_query_task_state` | 新命令(替代原 `webview_query_downloaded`),按 `fileName` 返回最近一条任务状态:`queued` / `downloading` / `completed` / `failed` / `none` |
 | `webview_task_action` | 保留(cancel / retry / open) |
 | `submit_batch_download_from_webview` | **删除** — 查看器一次只显示一个媒体,无批量来源 |
 
@@ -278,7 +278,7 @@ Telegram Web 文件 URL 通常 1 小时内有效(基于内部签名 + token)。�
 - `started_at` 用下载开始时间,`completed_at` 用原子提交成功时间
 - `media_token` / `cdn_dc_id` / `chat_id` + `message_id` 等 MTProto 字段删除
 
-**去重策略**:`webview_query_downloaded(fileName)` 查询 `status = 'completed' AND file_name = ?`(取最近一条)。查看器路径无 messageId,文件名是唯一稳定标识。文件名解析失败的下载不参与去重。
+**任务状态查询**:`webview_query_task_state(fileName)` 取该文件名**最近一条**任务(cancelled 视为 none),返回 `{state, taskId?, progress?, fileSize?, completedAt?}`。用途:查看器打开时按钮直接显示真实状态 — 正在下载 / 已下载 / 上次失败 / 从未下过。文件名是唯一稳定标识(查看器路径无 messageId);解析失败的文件不参与查询。
 
 ## 10. 设置页
 

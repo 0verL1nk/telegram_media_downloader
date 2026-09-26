@@ -42,7 +42,7 @@
 | `src/extract.js` | URL 提取 + 文件名解析 | 新建 |
 | `src/button.js` | 原生风格按钮 + 状态机 | 重写 |
 | `src/state.js` | Tauri 事件订阅(taskId → 按钮) | 重写 |
-| `src/dedupe.js` | 按文件名去重 + TTL 缓存 | 重写 |
+| `src/task-state.js` | 按文件名查任务状态(queued/downloading/completed/failed)+ TTL 缓存 | 新建 |
 | `src/inject.js` | 组装入口 | 重写 |
 | `build.mjs` | concat + terser → dist/inject.js | 新建 |
 | `README.md` | 已有(已更新验证方式) | ✅ |
@@ -55,7 +55,7 @@
 |---|---|---|
 | `downloader.rs` | 改造 | 保留调度骨架(TaskControl/限流/分块编排/进度事件);`fetch_chunk` 换 reqwest;删 `refresh_location`/`verify_telegram_hashes`;任务创建改为 URL 基 |
 | `commands.rs` | 重构 | `submit_download_from_webview` 新 payload;删 batch/upload/forward/cloud/login 命令 |
-| `task_store.rs` | 扩展 | 新增 `media_url` / `file_name` 列 + `find_completed_by_file_name` |
+| `task_store.rs` | 扩展 | 新增 `media_url` / `file_name` 列 + `find_latest_by_file_name`(返回状态+taskId+进度) |
 | `db_migration.rs` | 扩展 | 新列迁移 |
 | `app_state.rs` | 调整 | 删 `telegram()`;接线新下载器 |
 | `webview_bridge.rs` | 调整 | `include_str!` 打包后的 inject.js |
@@ -374,11 +374,11 @@ export function injectButtonStyles() {
 
 ---
 
-### Task 5: state.js + dedupe.js(重写)
+### Task 5: state.js + task-state.js(重写)
 
 **Files:**
 - Rewrite: `desktop/src-tauri/webview-inject/src/state.js`
-- Rewrite: `desktop/src-tauri/webview-inject/src/dedupe.js`
+- Create: `desktop/src-tauri/webview-inject/src/task-state.js`(替代原 dedupe.js)
 
 state.js:taskId → button 映射;订阅 4 个事件更新状态,不再依赖 chatId/messageId。
 
@@ -418,28 +418,30 @@ export async function bindEvents(onCompleted) {
 }
 ```
 
-dedupe.js:按文件名查询 + 5s TTL 缓存。
+task-state.js:按文件名查任务状态 + 5s TTL 缓存。返回 `{state, taskId?, progress?, fileSize?, completedAt?}`;`state ∈ 'queued'|'downloading'|'completed'|'failed'|'none'`。
 
 ```javascript
-// dedupe.js
+// desktop/src-tauri/webview-inject/src/task-state.js
 const cache = new Map();
 
-export async function isDownloaded(fileName, cfg) {
-  if (!fileName) return null;
+export async function queryTaskState(fileName, cfg) {
+  if (!fileName) return { state: 'none' };
   const ttl = cfg.dedupeCacheTtlMs ?? 5000;
   const now = Date.now();
   const hit = cache.get(fileName);
   if (hit && now - hit.at < ttl) return hit.value;
-  let value = null;
+  let value = { state: 'none' };
   try {
-    value = await window.__TAURI__.core.invoke('webview_query_downloaded', { fileName });
-  } catch (_e) { value = null; }
+    value = await window.__TAURI__.core.invoke('webview_query_task_state', { fileName });
+  } catch (_e) {
+    value = { state: 'none' };
+  }
   cache.set(fileName, { at: now, value });
   return value;
 }
 ```
 
-- [ ] **Step 1: 写 state.js 与 dedupe.js**
+- [ ] **Step 1: 写 state.js 与 task-state.js**
 - [ ] **Step 2: `node --check` 两者**
 - [ ] **Step 3: Commit**
 
@@ -460,7 +462,7 @@ import { detectVersion, detectViewer, detectStory, detectPinnedAudio } from './d
 import { getMediaUrl, resolveFileName } from './extract.js';
 import { ensureButton, setButtonState, injectButtonStyles } from './button.js';
 import { registerTask, taskIdFor } from './state.js';
-import { isDownloaded } from './dedupe.js';
+import { queryTaskState } from './task-state.js';
 
 export function startWatcher(cfg) {
   const version = detectVersion();
@@ -493,13 +495,16 @@ export function startWatcher(cfg) {
     const detected = detectViewer(version, cfg) || detectStory(version, cfg) || detectPinnedAudio(version, cfg);
     if (!detected) return;
     const btn = ensureButton(version, cfg, detected, onDownload, onRetry);
-    if (!btn || btn.dataset.telState !== 'ready' || btn.dataset.telDeduped === '1') return;
+    if (!btn || btn.dataset.telState !== 'ready' || btn.dataset.telChecked === '1') return;
     const url = getMediaUrl(detected.element, detected.kind);
     const fileName = resolveFileName(url, detected.kind);
-    const hit = await isDownloaded(fileName, cfg);
-    btn.dataset.telDeduped = '1';
+    const st = await queryTaskState(fileName, cfg);
+    btn.dataset.telChecked = '1';
     btn.dataset.telFileName = fileName;
-    if (hit) setButtonState(btn, 'completed');
+    if (st.state === 'completed') setButtonState(btn, 'completed');
+    else if (st.state === 'failed') setButtonState(btn, 'failed');
+    else if (st.state === 'downloading') { setButtonState(btn, 'downloading', { progress: st.progress }); if (st.taskId) registerTask(st.taskId, btn); }
+    else if (st.state === 'queued') { setButtonState(btn, 'queued'); if (st.taskId) registerTask(st.taskId, btn); }
   }, cfg.refreshDelayMs);
 }
 ```
@@ -524,7 +529,7 @@ import { bindEvents } from './state.js';
 })();
 ```
 
-build.mjs:按依赖序 concat(boot 无,顺序:icons, extract, detect, button, state, dedupe, watcher, inject),注入 `globalThis.__INJECT_CONFIG__ = {...}`,terser minify,输出 `dist/inject.js`。
+build.mjs:按依赖序 concat(顺序:icons, extract, detect, button, state, task-state, watcher, inject),注入 `globalThis.__INJECT_CONFIG__ = {...}`,terser minify,输出 `dist/inject.js`。
 
 - [ ] **Step 1: 写 watcher.js / inject.js / build.mjs**
 - [ ] **Step 2: 跑打包**:`cd desktop && node src-tauri/webview-inject/build.mjs` → 产出 `dist/inject.js`
@@ -767,7 +772,7 @@ pub async fn create_http_task(
 
 ---
 
-### Task 10: task_store.rs 新增列 + 去重查询
+### Task 10: task_store.rs 新增列 + 任务状态查询
 
 **Files:**
 - Modify: `desktop/src-tauri/src/task_store.rs`
@@ -778,18 +783,28 @@ pub async fn create_http_task(
 
 `tasks` 表加 `media_url TEXT`、`file_name TEXT`;`chat_id`/`message_id` 保留列定义(避免 SQLite 迁移复杂度),新任务不写入。
 
-- [ ] **Step 2: `find_completed_by_file_name`**
+- [ ] **Step 2: `find_latest_by_file_name`**
 
 ```rust
-pub async fn find_completed_by_file_name(&self, file_name: &str) -> Result<Option<DownloadedMatch>> {
-    // SELECT task_id, file_size, completed_at, output_path
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskStateMatch {
+    pub state: String,          // "queued" | "downloading" | "completed" | "failed" | "none"
+    pub task_id: Option<String>,
+    pub progress: Option<f64>,  // 0..1,downloading 时
+    pub file_size: Option<u64>,
+    pub completed_at: Option<String>,
+}
+
+pub async fn find_latest_by_file_name(&self, file_name: &str) -> Result<TaskStateMatch> {
+    // SELECT task_id, status, downloaded_bytes, total_bytes, file_size, completed_at
     //   FROM tasks
-    //  WHERE file_name = ? AND status = 'completed'
-    //  ORDER BY completed_at DESC LIMIT 1
+    //  WHERE file_name = ? AND status != 'cancelled'
+    //  ORDER BY updated_at DESC LIMIT 1
+    // 无记录 → TaskStateMatch { state: "none", .. }
+    // progress = downloaded_bytes / total_bytes(downloading 时)
 }
 ```
-
-`DownloadedMatch` 保持 `{task_id, file_size, completed_at, output_path}`。
 
 - [ ] **Step 3: `cargo test --locked` + Commit**
 
@@ -835,7 +850,25 @@ pub async fn submit_download_from_webview(
 }
 ```
 
-- [ ] **Step 3: `webview_query_downloaded` 参数改 `fileName`**
+- [ ] **Step 3: 新命令 `webview_query_task_state`**
+
+```rust
+#[tauri::command(rename_all = "camelCase")]
+pub async fn webview_query_task_state(
+    state: State<'_, AppState>,
+    file_name: String,
+) -> Result<crate::task_store::TaskStateMatch, String> {
+    if file_name.trim().is_empty() || file_name.len() > 512 {
+        return Err("文件名无效".into());
+    }
+    state.shared.store
+        .find_latest_by_file_name(&file_name)
+        .await
+        .map_err(command_error)
+}
+```
+
+(替代旧的 `webview_query_downloaded`;payload 字段 `fileName`。)
 
 - [ ] **Step 4: 删除命令**:`submit_batch_download_from_webview`、全部 `*_upload*`/`*_forward*`/`*_transfer*`/`*_cloud*`/login 命令;`app_state.rs` 删 `telegram` 字段与 `telegram()`;`lib.rs` invoke_handler 同步。
 
@@ -887,7 +920,7 @@ cd desktop/src-tauri && cargo check --locked && cargo test --locked && cargo cli
 - [ ] **Step 1: api.ts**
 
 删:upload/transfer/cloud 相关类型与函数、`ChatSummary`/`ChatMessage`、login 系列、`submitBatchDownloadFromWebview`。
-改:`webviewQueryDownloaded(fileName)`;`DownloadedMatch` 不变。
+改:`webviewQueryTaskState(fileName)` 返回 `TaskStateMatch`(state/taskId/progress/fileSize/completedAt)。
 加:`DownloadTask` 增 `fileName?: string | null`。
 
 - [ ] **Step 2: App.tsx**
