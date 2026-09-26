@@ -231,6 +231,7 @@ ready → submitting → queued → downloading → completed
     "videoControls": ".VideoPlayerControls .buttons",
     "storyRoot": "#StoryViewer",
     "storyHeader": ".GrsJNw3y",
+    "storyHeaderFallback": ".DropdownMenu",
     "storyImage": "img.PVZ8TOWS",
     "buttonClass": "Button smaller translucent-white round tel-download"
   }
