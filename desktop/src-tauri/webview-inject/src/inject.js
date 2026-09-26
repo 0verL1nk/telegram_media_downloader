@@ -15,5 +15,9 @@ import { startWatcher } from './watcher.js';
   if (!trusted.includes(location.origin)) { diag(`boot: skip — untrusted origin ${location.origin}`); return; }
   diag(`boot: ok — version=${detectVersion()}`);
   bindEvents().catch((e) => diag(`bindEvents error: ${e && e.message}`));
-  startWatcher(cfg);
+  try {
+    startWatcher(cfg);
+  } catch (error) {
+    diag(`startWatcher threw: ${error && error.message ? error.message : String(error)}`);
+  }
 })();

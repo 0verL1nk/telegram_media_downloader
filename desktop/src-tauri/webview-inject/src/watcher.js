@@ -12,9 +12,18 @@ import { runPipeline } from './downloader.js';
 
 const TICK_INTERVAL_MS = 10000;
 
+// 模块级去重:同一问题只上报一次(上限 20 条),避免持续错误刷爆 diag 的 500 条上限。
+const reportedIssues = new Set();
+
+function reportIssue(message) {
+  if (reportedIssues.size >= 20 || reportedIssues.has(message)) return;
+  reportedIssues.add(message);
+  diag(message);
+}
+
 export function startWatcher(cfg) {
   const version = detectVersion();
-  injectButtonStyles();
+  // 样式注入延迟到轮询里(见下):初始化脚本可能早于 DOM,同步注入失败会拖垮整个启动路径。
 
   // 诊断状态:每个容器只报一次检测结果;首次检测成功前每 ~10s 报一次心跳。
   const loggedContainers = new WeakSet();
@@ -67,10 +76,15 @@ export function startWatcher(cfg) {
   };
 
   let running = false;
+  let stylesReady = false;
   setInterval(async () => {
     if (running) return;
     running = true;
     try {
+      if (!stylesReady) {
+        try { stylesReady = injectButtonStyles(); } catch (_e) { stylesReady = false; }
+        if (!stylesReady) { reportIssue('styles: waiting for DOM'); return; }
+      }
       const detected = detectAny();
       if (!detected) return;
       const btn = ensureButton(version, cfg, detected, onDownload, onRetry);
@@ -105,6 +119,8 @@ export function startWatcher(cfg) {
         setButtonState(btn, 'queued');
         if (st.taskId) registerTask(st.taskId, btn);
       }
+    } catch (error) {
+      reportIssue(`tick error: ${error && error.message ? error.message : String(error)}`);
     } finally {
       running = false;
     }

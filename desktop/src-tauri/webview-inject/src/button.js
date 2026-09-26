@@ -78,9 +78,13 @@ export function setButtonState(btn, state, payload) {
   btn.classList.toggle('tel-download-failed', state === 'failed');
 }
 
-// 注入微型状态样式(幂等);基础外观全部来自原生类,此处不接管
+// 注入微型状态样式(幂等);基础外观全部来自原生类,此处不接管。
+// 返回 false 表示 DOM 尚未就绪(document.head 与 document.documentElement 都缺失),
+// 由调用方在轮询中重试;本函数自身绝不抛出。
 export function injectButtonStyles() {
-  if (document.getElementById('tel-download-style')) return;
+  if (document.getElementById('tel-download-style')) return true;
+  const root = document.head || document.documentElement;
+  if (!root) return false; // DOM 尚未就绪,由调用方在轮询中重试
   const style = document.createElement('style');
   style.id = 'tel-download-style';
   style.textContent = `
@@ -89,7 +93,8 @@ export function injectButtonStyles() {
     .tel-download.tel-download-failed { color: ${FAILED_COLOR} !important; }
     @keyframes tel-pulse { 50% { opacity: ${PULSE_OPACITY}; } }
   `;
-  (document.head || document.documentElement).appendChild(style);
+  root.appendChild(style);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
