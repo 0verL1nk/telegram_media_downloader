@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>TMD 0.3 UI Mockups</title>
+<style>
+  :root { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background:#d7dade; padding:24px; display:flex; flex-direction:column; gap:24px; align-items:flex-start; }
+  .frame-label { font:600 13px/1 -apple-system,"Segoe UI",sans-serif; color:#3c4043; margin-bottom:8px; }
+  .frame { width:1280px; height:800px; overflow:hidden; position:relative; }
+
+  /* ---------- tokens: light (Telegram 家系 + DSH 纪律) ---------- */
+  .theme-light {
+    --bg-base:#ffffff; --bg-layer:#f7f8fa; --bg-sidebar:#ffffff; --bg-hover:#f1f3f5;
+    --border-l1:#e5e7eb; --border-l2:#f0f0f1;
+    --text-1:#0f1419; --text-2:#6b7280; --text-3:#9ca3af;
+    --accent:#3390ec; --accent-hover:#2b82d9; --accent-soft:#e8f2fd;
+    --success:#4dcd5e; --danger:#e53935; --warn:#f59e0b;
+    --track:#eef0f2;
+  }
+  .theme-dark {
+    --bg-base:#17212b; --bg-layer:#1c2733; --bg-sidebar:#0e1621; --bg-hover:#1f2b38;
+    --border-l1:#24313f; --border-l2:#1c2836;
+    --text-1:#f2f5f7; --text-2:#8b9aa9; --text-3:#5f7180;
+    --accent:#4a9fe8; --accent-hover:#5cb0f5; --accent-soft:#233648;
+    --success:#4dcd5e; --danger:#ef5350; --warn:#f5a623;
+    --track:#22303e;
+  }
+
+  .app { width:100%; height:100%; display:flex; flex-direction:column; background:var(--bg-base); color:var(--text-1); }
+
+  /* titlebar */
+  .titlebar { height:36px; display:flex; align-items:center; justify-content:space-between; padding:0 0 0 14px; border-bottom:1px solid var(--border-l2); flex:none; }
+  .titlebar .tb-left { display:flex; align-items:center; gap:8px; color:var(--text-2); font:500 12px/1 inherit; }
+  .tb-mark { width:16px; height:16px; border-radius:50%; background:linear-gradient(135deg,#3390ec,#52b8ff); }
+  .tb-controls { display:flex; }
+  .tb-btn { width:44px; height:35px; display:grid; place-items:center; color:var(--text-2); font:400 12px/1 inherit; }
+  .tb-btn.close:hover { background:#e53935; color:#fff; }
+
+  .body { flex:1; display:flex; min-height:0; }
+
+  /* sidebar */
+  .sidebar { width:236px; flex:none; background:var(--bg-sidebar); border-right:1px solid var(--border-l1); display:flex; flex-direction:column; padding:14px 10px 10px; }
+  .brand { display:flex; align-items:center; gap:10px; padding:2px 8px 16px; }
+  .brand-mark { width:34px; height:34px; border-radius:10px; background:linear-gradient(135deg,#3390ec,#52b8ff); display:grid; place-items:center; color:#fff; font:700 15px/1 inherit; }
+  .brand-name { font:600 13px/1.25 inherit; }
+  .brand-name small { display:block; font:400 11px/1.3 inherit; color:var(--text-2); }
+
+  .nav { display:flex; flex-direction:column; gap:2px; }
+  .nav-item { height:38px; display:flex; align-items:center; gap:10px; padding:0 10px; border-radius:8px; color:var(--text-2); font:500 13.5px/1 inherit; }
+  .nav-item .ic { width:18px; height:18px; opacity:.85; }
+  .nav-item:hover { background:var(--bg-hover); color:var(--text-1); }
+  .nav-item.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .nav-item .count { margin-left:auto; font:500 11px/1 inherit; color:var(--text-3); background:var(--bg-hover); padding:3px 7px; border-radius:999px; }
+  .nav-item.active .count { background:#fff; color:var(--accent); }
+  .theme-dark .nav-item.active .count { background:#0e1621; }
+
+  .side-dock { margin-top:auto; border-top:1px solid var(--border-l2); padding:12px 8px 4px; display:flex; flex-direction:column; gap:8px; }
+  .dock-row { display:flex; align-items:center; gap:8px; font:400 12px/1.3 inherit; color:var(--text-2); }
+  .dot { width:7px; height:7px; border-radius:50%; flex:none; }
+  .dot.ok { background:var(--success); }
+  .dock-speed { font:600 12.5px/1 inherit; color:var(--text-1); }
+  .dock-hint { font:400 11px/1.4 inherit; color:var(--text-3); }
+
+  /* main */
+  .main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  .main-head { padding:20px 26px 0; flex:none; }
+  .head-row { display:flex; align-items:center; justify-content:space-between; }
+  h1 { font:700 20px/1.3 inherit; }
+  .head-actions { display:flex; gap:8px; }
+  .btn { height:36px; display:inline-flex; align-items:center; gap:7px; padding:0 14px; border-radius:8px; font:500 13px/1 inherit; border:1px solid var(--border-l1); background:var(--bg-base); color:var(--text-1); }
+  .btn.ghost { border-color:transparent; background:transparent; color:var(--text-2); }
+  .btn.ghost:hover { background:var(--bg-hover); color:var(--text-1); }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .btn.primary:hover { background:var(--accent-hover); }
+
+  .tabs { display:flex; gap:6px; margin-top:16px; }
+  .tab { height:32px; display:inline-flex; align-items:center; gap:6px; padding:0 13px; border-radius:999px; font:500 13px/1 inherit; color:var(--text-2); border:1px solid transparent; }
+  .tab .n { font:500 11.5px/1 inherit; color:var(--text-3); }
+  .tab:hover { background:var(--bg-hover); }
+  .tab.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .tab.active .n { color:var(--accent); }
+
+  .list-wrap { flex:1; display:flex; flex-direction:column; min-height:0; padding:12px 26px 0; }
+  .list-head { display:grid; grid-template-columns: 30px minmax(0,1fr) 220px 92px 84px 118px; gap:12px; padding:0 12px 8px; border-bottom:1px solid var(--border-l1); font:500 11.5px/1 inherit; color:var(--text-3); letter-spacing:.02em; }
+  .row { display:grid; grid-template-columns: 30px minmax(0,1fr) 220px 92px 84px 118px; gap:12px; align-items:center; padding:0 12px; height:56px; border-bottom:1px solid var(--border-l2); }
+  .row:hover { background:var(--bg-layer); }
+  .st { width:26px; height:26px; border-radius:8px; display:grid; place-items:center; font:600 12.5px/1 inherit; }
+  .st.dl { background:var(--accent-soft); color:var(--accent); }
+  .st.ok { background:#e9f9ee; color:var(--success); }
+  .st.bad { background:#fdeaea; color:var(--danger); }
+  .theme-dark .st.ok { background:#173627; }
+  .theme-dark .st.bad { background:#3a2020; }
+
+  .fname { min-width:0; }
+  .fname b { display:block; font:600 13.5px/1.35 inherit; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fname span { font:400 11.5px/1.4 inherit; color:var(--text-3); }
+
+  .prog-cell { display:flex; align-items:center; gap:10px; }
+  .track { flex:1; height:5px; border-radius:999px; background:var(--track); overflow:hidden; }
+  .fill { height:100%; border-radius:999px; background:var(--accent); }
+  .pct { font:600 12px/1 inherit; color:var(--text-2); width:34px; text-align:right; }
+  .done-mark { font:600 12.5px/1 inherit; color:var(--success); }
+  .size { font:400 12.5px/1 inherit; color:var(--text-2); }
+  .speed { font:500 12.5px/1 inherit; color:var(--text-1); }
+  .speed small { display:block; font:400 11px/1.4 inherit; color:var(--text-3); }
+  .ops { display:flex; gap:6px; justify-content:flex-end; opacity:0; }
+  .row:hover .ops { opacity:1; }
+  .row .ops.always { opacity:1; }
+  .op { width:30px; height:30px; border-radius:7px; display:grid; place-items:center; color:var(--text-2); border:1px solid transparent; }
+  .op:hover { background:var(--bg-hover); color:var(--text-1); }
+  .op.danger:hover { color:var(--danger); }
+  .err { font:400 11.5px/1.4 inherit; color:var(--danger); }
+
+  .statusbar { height:30px; flex:none; display:flex; align-items:center; justify-content:space-between; padding:0 26px; border-top:1px solid var(--border-l1); background:var(--bg-layer); font:400 11.5px/1 inherit; color:var(--text-2); }
+
+  /* settings */
+  .set-body { flex:1; display:flex; min-height:0; }
+  .set-nav { width:196px; flex:none; padding:18px 10px; border-right:1px solid var(--border-l2); display:flex; flex-direction:column; gap:2px; }
+  .set-title { font:700 18px/1.3 inherit; padding:0 10px 14px; }
+  .set-nav .nav-item { height:34px; font-size:13px; }
+  .set-main { flex:1; overflow:hidden; padding:22px 30px; display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .card { border:1px solid var(--border-l1); border-radius:12px; padding:18px 20px 16px; }
+  .card h3 { font:600 14.5px/1.3 inherit; margin-bottom:2px; }
+  .card .desc { font:400 12px/1.5 inherit; color:var(--text-2); margin-bottom:14px; }
+  .field { display:grid; grid-template-columns: 170px minmax(0,1fr); align-items:center; gap:14px; padding:9px 0; }
+  .field + .field { border-top:1px solid var(--border-l2); }
+  .field label { font:500 13px/1.4 inherit; }
+  .field label small { display:block; font:400 11.5px/1.4 inherit; color:var(--text-3); margin-top:2px; }
+  .input { height:38px; display:flex; align-items:center; gap:8px; padding:0 12px; border:1px solid var(--border-l1); border-radius:8px; font:400 12.5px/1 inherit; color:var(--text-1); background:var(--bg-base); }
+  .input .path { font-family:Consolas,"Cascadia Mono",monospace; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .input .unit { margin-left:auto; color:var(--text-3); font-size:11.5px; }
+  .seg { display:inline-flex; border:1px solid var(--border-l1); border-radius:8px; overflow:hidden; }
+  .seg div { padding:9px 14px; font:500 12.5px/1 inherit; color:var(--text-2); }
+  .seg div.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .switch { width:40px; height:22px; border-radius:999px; background:var(--accent); position:relative; }
+  .switch::after { content:""; position:absolute; width:16px; height:16px; border-radius:50%; background:#fff; top:3px; right:3px; }
+  .switch.off { background:var(--track); }
+  .switch.off::after { right:auto; left:3px; }
+  .card-foot { display:flex; justify-content:flex-end; gap:10px; padding-top:14px; }
+  .stepper { display:inline-flex; align-items:center; border:1px solid var(--border-l1); border-radius:8px; height:38px; }
+  .stepper button { width:34px; height:100%; background:none; border:0; color:var(--text-2); font:500 15px/1 inherit; }
+  .stepper .val { width:44px; text-align:center; font:600 13px/1 inherit; border-left:1px solid var(--border-l1); border-right:1px solid var(--border-l1); line-height:36px; }
+
+  /* onboarding */
+  .onb { width:100%; height:100%; display:grid; place-items:center; background:var(--bg-layer); }
+  .onb-card { width:600px; background:var(--bg-base); border:1px solid var(--border-l1); border-radius:16px; padding:34px 38px 26px; }
+  .onb-mark { width:52px; height:52px; border-radius:14px; background:linear-gradient(135deg,#3390ec,#52b8ff); display:grid; place-items:center; color:#fff; font:700 22px/1 inherit; margin-bottom:18px; }
+  .onb-card h2 { font:700 22px/1.3 inherit; margin-bottom:6px; }
+  .onb-card .sub { font:400 13.5px/1.6 inherit; color:var(--text-2); margin-bottom:24px; }
+  .step { display:flex; gap:14px; padding:14px 0; border-top:1px solid var(--border-l2); }
+  .step .num { width:26px; height:26px; flex:none; border-radius:999px; background:var(--accent-soft); color:var(--accent); display:grid; place-items:center; font:600 12.5px/1 inherit; }
+  .step b { display:block; font:600 13.5px/1.4 inherit; margin-bottom:3px; }
+  .step p { font:400 12.5px/1.55 inherit; color:var(--text-2); }
+  .step .input { margin-top:9px; height:36px; }
+  .step .hint { display:inline-block; margin-top:8px; font:400 12px/1.5 inherit; color:var(--text-3); }
+  .onb-foot { display:flex; align-items:center; justify-content:space-between; padding-top:20px; }
+  .onb-foot .later { font:400 12.5px/1 inherit; color:var(--text-2); }
+</style>
+</head>
+<body>
+
+<!-- ============ 1. 主界面 · 浅色 ============ -->
+<div>
+<div class="frame-label">① 主界面 · 下载任务(浅色,Telegram 蓝白 + DSH 质感纪律)</div>
+<div class="frame theme-light">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">T</div>
+          <div class="brand-name">Telegram Media<small>Downloader · v0.2.1</small></div>
+        </div>
+        <nav class="nav">
+          <div class="nav-item"><span class="ic">▦</span>总览</div>
+          <div class="nav-item active"><span class="ic">↓</span>任务<span class="count">2</span></div>
+          <div class="nav-item"><span class="ic">≡</span>日志</div>
+          <div class="nav-item"><span class="ic">⚙</span>设置</div>
+        </nav>
+        <div class="side-dock">
+          <div class="dock-row"><span class="dot ok"></span>Telegram 已登录 · @overlink</div>
+          <div class="dock-row"><span class="dock-speed">2 下载中 · 4.5 MB/s</span></div>
+          <div class="dock-hint">关闭窗口将驻留托盘,下载继续</div>
+        </div>
+      </aside>
+      <main class="main">
+        <div class="main-head">
+          <div class="head-row">
+            <h1>任务</h1>
+            <div class="head-actions">
+              <button class="btn">打开下载目录</button>
+              <button class="btn ghost">清除已完成</button>
+            </div>
+          </div>
+          <div class="tabs">
+            <div class="tab">全部<span class="n">12</span></div>
+            <div class="tab active">下载中<span class="n">2</span></div>
+            <div class="tab">已完成<span class="n">9</span></div>
+            <div class="tab">失败<span class="n">1</span></div>
+          </div>
+        </div>
+        <div class="list-wrap">
+          <div class="list-head"><span></span><span>文件</span><span>进度</span><span>大小</span><span>速度</span><span style="text-align:right">操作</span></div>
+          <div class="row">
+            <div class="st dl">↓</div>
+            <div class="fname"><b>视频_4K_夕阳延时.mp4</b><span>来自 · 摄影素材频道 · 1.21 GB</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:68%"></div></div><span class="pct">68%</span></div>
+            <div class="size">824 MB</div>
+            <div class="speed">3.1 MB/s<small>剩余 2:05</small></div>
+            <div class="ops"><div class="op">‖</div><div class="op danger">✕</div></div>
+          </div>
+          <div class="row">
+            <div class="st dl">↓</div>
+            <div class="fname"><b>演唱会现场_饭拍版.mkv</b><span>来自 · 音乐分享群 · 486 MB</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div>
+            <div class="size">486 MB</div>
+            <div class="speed">1.4 MB/s<small>剩余 4:30</small></div>
+            <div class="ops"><div class="op">‖</div><div class="op danger">✕</div></div>
+          </div>
+          <div class="row">
+            <div class="st ok">✓</div>
+            <div class="fname"><b>风景照_03.jpg</b><span>来自 · 摄影素材频道 · 今天 00:12</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:100%;background:var(--success)"></div></div><span class="done-mark">完成</span></div>
+            <div class="size">3.2 MB</div>
+            <div class="speed">—</div>
+            <div class="ops always"><div class="op">↗</div><div class="op">📁</div></div>
+          </div>
+          <div class="row">
+            <div class="st ok">✓</div>
+            <div class="fname"><b>语音消息_0912.ogg</b><span>来自 · 家人群 · 今天 00:05</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:100%;background:var(--success)"></div></div><span class="done-mark">完成</span></div>
+            <div class="size">512 KB</div>
+            <div class="speed">—</div>
+            <div class="ops always"><div class="op">↗</div><div class="op">📁</div></div>
+          </div>
+          <div class="row">
+            <div class="st bad">✕</div>
+            <div class="fname"><b>纪录片_EP04.mp4</b><span class="err">URL 已过期或无权限 — 重新打开该媒体后点击下载即可从断点继续</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:41%;background:var(--danger)"></div></div><span class="pct" style="color:var(--danger)">41%</span></div>
+            <div class="size">610 MB</div>
+            <div class="speed">—</div>
+            <div class="ops always"><div class="op">↻</div><div class="op danger">✕</div></div>
+          </div>
+        </div>
+        <div class="statusbar">
+          <span>2 项下载中 · 4.5 MB/s · 已完成 9 · 失败 1 · 排队 0</span>
+          <span>托盘运行中 · WebView2 profile 独立保存</span>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 2. 主界面 · 深色 ============ -->
+<div>
+<div class="frame-label">② 主界面 · 深色(Telegram 深色家系,跟随系统)</div>
+<div class="frame theme-dark">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">T</div>
+          <div class="brand-name">Telegram Media<small>Downloader · v0.2.1</small></div>
+        </div>
+        <nav class="nav">
+          <div class="nav-item"><span class="ic">▦</span>总览</div>
+          <div class="nav-item active"><span class="ic">↓</span>任务<span class="count">2</span></div>
+          <div class="nav-item"><span class="ic">≡</span>日志</div>
+          <div class="nav-item"><span class="ic">⚙</span>设置</div>
+        </nav>
+        <div class="side-dock">
+          <div class="dock-row"><span class="dot ok"></span>Telegram 已登录 · @overlink</div>
+          <div class="dock-row"><span class="dock-speed">2 下载中 · 4.5 MB/s</span></div>
+          <div class="dock-hint">关闭窗口将驻留托盘,下载继续</div>
+        </div>
+      </aside>
+      <main class="main">
+        <div class="main-head">
+          <div class="head-row">
+            <h1>任务</h1>
+            <div class="head-actions">
+              <button class="btn">打开下载目录</button>
+              <button class="btn ghost">清除已完成</button>
+            </div>
+          </div>
+          <div class="tabs">
+            <div class="tab active">下载中<span class="n">2</span></div>
+            <div class="tab">全部<span class="n">12</span></div>
+            <div class="tab">已完成<span class="n">9</span></div>
+            <div class="tab">失败<span class="n">1</span></div>
+          </div>
+        </div>
+        <div class="list-wrap">
+          <div class="list-head"><span></span><span>文件</span><span>进度</span><span>大小</span><span>速度</span><span style="text-align:right">操作</span></div>
+          <div class="row">
+            <div class="st dl">↓</div>
+            <div class="fname"><b>视频_4K_夕阳延时.mp4</b><span>来自 · 摄影素材频道 · 1.21 GB</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:68%"></div></div><span class="pct">68%</span></div>
+            <div class="size">824 MB</div>
+            <div class="speed">3.1 MB/s<small>剩余 2:05</small></div>
+            <div class="ops"><div class="op">‖</div><div class="op danger">✕</div></div>
+          </div>
+          <div class="row">
+            <div class="st dl">↓</div>
+            <div class="fname"><b>演唱会现场_饭拍版.mkv</b><span>来自 · 音乐分享群 · 486 MB</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div>
+            <div class="size">486 MB</div>
+            <div class="speed">1.4 MB/s<small>剩余 4:30</small></div>
+            <div class="ops"><div class="op">‖</div><div class="op danger">✕</div></div>
+          </div>
+          <div class="row">
+            <div class="st ok">✓</div>
+            <div class="fname"><b>纪录片_EP03.mp4</b><span>来自 · 纪录片频道 · 昨天 23:48</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:100%;background:var(--success)"></div></div><span class="done-mark">完成</span></div>
+            <div class="size">590 MB</div>
+            <div class="speed">—</div>
+            <div class="ops always"><div class="op">↗</div><div class="op">📁</div></div>
+          </div>
+          <div class="row">
+            <div class="st bad">✕</div>
+            <div class="fname"><b>演唱会现场_完整版.mkv</b><span class="err">URL 已过期或无权限 — 重新打开该媒体后点击下载即可从断点继续</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:41%;background:var(--danger)"></div></div><span class="pct" style="color:var(--danger)">41%</span></div>
+            <div class="size">1.1 GB</div>
+            <div class="speed">—</div>
+            <div class="ops always"><div class="op">↻</div><div class="op danger">✕</div></div>
+          </div>
+        </div>
+        <div class="statusbar">
+          <span>2 项下载中 · 4.5 MB/s · 已完成 9 · 失败 1 · 排队 0</span>
+          <span>托盘运行中 · WebView2 profile 独立保存</span>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 3. 设置 ============ -->
+<div>
+<div class="frame-label">③ 设置(左类别导航 + 卡片表单,就地保存)</div>
+<div class="frame theme-light">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">T</div>
+          <div class="brand-name">Telegram Media<small>Downloader · v0.2.1</small></div>
+        </div>
+        <nav class="nav">
+          <div class="nav-item"><span class="ic">▦</span>总览</div>
+          <div class="nav-item"><span class="ic">↓</span>任务<span class="count">2</span></div>
+          <div class="nav-item"><span class="ic">≡</span>日志</div>
+          <div class="nav-item active"><span class="ic">⚙</span>设置</div>
+        </nav>
+        <div class="side-dock">
+          <div class="dock-row"><span class="dot ok"></span>Telegram 已登录 · @overlink</div>
+          <div class="dock-row"><span class="dock-speed">2 下载中 · 4.5 MB/s</span></div>
+          <div class="dock-hint">关闭窗口将驻留托盘,下载继续</div>
+        </div>
+      </aside>
+      <div class="set-body">
+        <nav class="set-nav">
+          <div class="set-title">设置</div>
+          <div class="nav-item active">下载与存储</div>
+          <div class="nav-item">并发与限速</div>
+          <div class="nav-item">外观与语言</div>
+          <div class="nav-item">软件更新</div>
+          <div class="nav-item">关于</div>
+        </nav>
+        <div class="set-main">
+          <div class="card">
+            <h3>下载与存储</h3>
+            <div class="desc">媒体文件保存位置与重名处理。修改目录后新任务立即生效。</div>
+            <div class="field">
+              <label>下载目录</label>
+              <div class="input"><span class="path">E:\TelegramMediaDownloader\Downloads</span></div>
+            </div>
+            <div class="field">
+              <label>重复文件</label>
+              <div class="seg"><div>跳过</div><div class="on">重命名</div><div>覆盖</div></div>
+            </div>
+            <div class="field">
+              <label>保留未完成分块</label>
+              <div class="switch"></div>
+            </div>
+            <div class="card-foot">
+              <button class="btn ghost">重置</button>
+              <button class="btn primary">应用</button>
+            </div>
+          </div>
+          <div class="card">
+            <h3>并发与限速</h3>
+            <div class="desc">页面抓取并发与分块策略;0 表示不限速。</div>
+            <div class="field">
+              <label>同时下载文件数</label>
+              <div class="stepper"><button>−</button><div class="val">4</div><button>+</button></div>
+            </div>
+            <div class="field">
+              <label>每文件并发分块</label>
+              <div class="stepper"><button>−</button><div class="val">4</div><button>+</button></div>
+            </div>
+            <div class="field">
+              <label>分块大小</label>
+              <div class="input" style="width:200px">512 KiB<span class="unit">▾</span></div>
+            </div>
+            <div class="field">
+              <label>限速</label>
+              <div class="input" style="width:200px">0<span class="unit">KiB/s</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>软件更新</h3>
+            <div class="desc">当前版本 0.2.1 · 更新由页面抓取管线独立于版本号运行,无需迁移数据。</div>
+            <div class="field">
+              <label>自动检查更新</label>
+              <div class="switch"></div>
+            </div>
+            <div class="card-foot">
+              <button class="btn">检查更新</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 4. 首次引导 ============ -->
+<div>
+<div class="frame-label">④ 首次启动引导(三步确认,不挡路)</div>
+<div class="frame theme-light">
+  <div class="onb">
+    <div class="onb-card">
+      <div class="onb-mark">T</div>
+      <h2>欢迎使用 Telegram Media Downloader</h2>
+      <div class="sub">三个确认即可开始:文件放哪里、用哪个 Telegram 账号、数据存在哪。之后一切都在托盘和任务列表里。</div>
+      <div class="step">
+        <div class="num">1</div>
+        <div style="flex:1">
+          <b>选择下载目录</b>
+          <p>下载完成的媒体文件保存到这里,可随时在设置中更改。</p>
+          <div class="input"><span class="path">E:\TelegramMediaDownloader\Downloads</span></div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">2</div>
+        <div style="flex:1">
+          <b>在 Telegram 窗口登录</b>
+          <p>切换到「Telegram」页,用手机扫码或手机号登录——就像浏览器一样一次登录,之后长期有效。</p>
+          <span class="hint">不需要 API ID / 验证码之外任何配置</span>
+        </div>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <div style="flex:1">
+          <b>数据目录</b>
+          <p>任务数据库、登录 profile 与缓存都保存在此,可在设置中整体迁移。</p>
+          <div class="input"><span class="path">E:\TelegramMediaDownloader</span></div>
+        </div>
+      </div>
+      <div class="onb-foot">
+        <span class="later">稍后再说 — 直接进入</span>
+        <button class="btn primary" style="height:40px;padding:0 22px">开始使用</button>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+</body>
+</html>
