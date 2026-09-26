@@ -9,6 +9,7 @@ export type TaskAction = "pause" | "resume" | "cancel" | "retry";
 export interface ConcurrencySettings {
   maxFiles: number;
   perFileChunks: number;
+  adaptive: boolean;
   chunkSizeKib: number;
   requestTimeoutSeconds: number;
   retries: number;

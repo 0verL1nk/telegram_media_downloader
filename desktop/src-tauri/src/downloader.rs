@@ -13,6 +13,7 @@
 //! `webview-download-abort`(覆盖 WebView 关闭/刷新/网络掉线等 JS 侧消失的情形)。
 
 use crate::{
+    adaptive::AdaptiveConcurrency,
     app_state::SharedState,
     chunk_writer::{self, IncomingChunk},
     models::TaskRecord,
@@ -59,6 +60,12 @@ const MAX_CHUNK_SIZE_KIB: usize = 1024;
 /// 每个文件的并发抓取路数(随计划返回给页面 JS)。
 const MIN_PER_FILE_CHUNKS: usize = 1;
 const MAX_PER_FILE_CHUNKS: usize = 16;
+/// 自适应模式下的初始并发(从较小值起步,由控制器按投递率爬升)。
+const INITIAL_CONCURRENCY: usize = 4;
+/// 自适应模式下的并发下限。
+const MIN_ADAPTIVE_CONCURRENCY: usize = 2;
+/// 自适应并发的投递率采样间隔。
+const ADAPT_SAMPLE: Duration = Duration::from_secs(2);
 /// 请求超时(秒),随计划返回给页面 JS。
 const MIN_TIMEOUT_SECONDS: u64 = 5;
 const MAX_TIMEOUT_SECONDS: u64 = 600;
@@ -84,7 +91,10 @@ pub struct ChunkRange {
 #[serde(rename_all = "camelCase")]
 pub struct PlanInfo {
     pub chunk_size_bytes: u64,
+    /// 页面线程池的初始宽度(自适应模式下从较小值起步爬升)。
     pub concurrency: usize,
+    /// 并发上限(自适应模式下控制器不会越过它;页面用它兜底钳制事件值)。
+    pub max_concurrency: usize,
     pub timeout_seconds: u64,
     pub retries: u32,
     pub missing: Vec<ChunkRange>,
@@ -196,13 +206,21 @@ impl DownloadManager {
         let settings = self.shared.settings.read().await.clone();
         let chunk_size_bytes =
             (supported_chunk_size_kib(settings.concurrency.chunk_size_kib) as u64) * 1024;
-        let concurrency = settings
+        let max_concurrency = settings
             .concurrency
             .per_file_chunks
             .clamp(MIN_PER_FILE_CHUNKS, MAX_PER_FILE_CHUNKS);
+        let adaptive_enabled = settings.concurrency.adaptive;
+        // 自适应模式从较小并发起步,由控制器按投递率爬升;固定模式直接用设置值。
+        let concurrency = if adaptive_enabled {
+            max_concurrency.min(INITIAL_CONCURRENCY)
+        } else {
+            max_concurrency
+        };
         let parameters = PlanInfo {
             chunk_size_bytes,
             concurrency,
+            max_concurrency,
             timeout_seconds: settings
                 .concurrency
                 .request_timeout_seconds
@@ -317,6 +335,9 @@ impl DownloadManager {
             task_id.to_owned(),
             total_bytes,
             progress_receiver,
+            adaptive_enabled.then(|| {
+                AdaptiveConcurrency::new(MIN_ADAPTIVE_CONCURRENCY, concurrency, max_concurrency)
+            }),
         );
         active.insert(
             task_id.to_owned(),
@@ -452,14 +473,19 @@ impl DownloadManager {
                 "outputPath": output.to_string_lossy(),
             }),
         );
+        let record = self.require_record(task_id).await?;
         self.shared
             .log(
                 "info",
                 DOWNLOAD_LOG_TARGET,
-                format!("任务 {task_id} 已校验并原子提交:{}", output.display()),
+                format!(
+                    "任务 {task_id} 已校验并原子提交:{}{}",
+                    output.display(),
+                    completion_summary(record.started_at.as_deref(), total)
+                ),
             )
             .await;
-        self.require_record(task_id).await
+        Ok(record)
     }
 
     /// 页面侧失败(URL 过期、块级重试耗尽等):保留已校验分块,标记 `failed`。
@@ -709,25 +735,70 @@ fn announce_abort(shared: &SharedState, task_id: &str) {
     );
 }
 
-/// 节流后的进度广播:刷新任务页并通知页面按钮。
+/// 节流后的进度广播:刷新任务页并通知页面按钮;同时驱动自适应并发采样。
+///
+/// 自适应采样用"窗口内新增完成字节 / 窗口时长"作为投递率(BBR 式模型:看速率本身,
+/// 不看丢包/重试)。决策在 Rust,页面只按 `webview-task-concurrency` 事件调整线程池宽度。
 fn spawn_progress_watcher(
     shared: Arc<SharedState>,
     task_id: String,
     total_bytes: u64,
     mut progress_events: broadcast::Receiver<()>,
+    mut adaptive: Option<AdaptiveConcurrency>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dirty = false;
         let mut tick = tokio::time::interval(PROGRESS_TICK);
+        let mut sample_started = Instant::now();
+        let mut sample_bytes = shared
+            .store
+            .get(&task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.downloaded_bytes)
+            .unwrap_or(0);
         loop {
             tokio::select! {
                 event = progress_events.recv() => match event {
                     Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => dirty = true,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
-                _ = tick.tick() => if dirty {
-                    dirty = false;
-                    publish_progress(&shared, &task_id, total_bytes).await;
+                _ = tick.tick() => {
+                    if dirty {
+                        dirty = false;
+                        publish_progress(&shared, &task_id, total_bytes).await;
+                    }
+                    if adaptive.is_some() && sample_started.elapsed() >= ADAPT_SAMPLE {
+                        let elapsed = sample_started.elapsed();
+                        sample_started = Instant::now();
+                        if let Ok(Some(record)) = shared.store.get(&task_id).await {
+                            let delta = record.downloaded_bytes.saturating_sub(sample_bytes);
+                            sample_bytes = record.downloaded_bytes;
+                            let rate = delta as f64 / elapsed.as_secs_f64();
+                            if let Some(controller) = adaptive.as_mut() {
+                                if let Some(width) = controller.sample(Instant::now(), rate) {
+                                    let _ = shared.app.emit(
+                                        "webview-task-concurrency",
+                                        serde_json::json!({
+                                            "taskId": task_id,
+                                            "concurrency": width,
+                                        }),
+                                    );
+                                    shared
+                                        .log(
+                                            "info",
+                                            DOWNLOAD_LOG_TARGET,
+                                            format!(
+                                                "任务 {task_id} 自适应并发调整为 {width} 路(窗口速率 {:.1} MB/s)",
+                                                rate / 1_048_576.0
+                                            ),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                    }
                 },
             }
         }
@@ -759,6 +830,28 @@ fn progress_ratio(downloaded: u64, total: u64) -> f64 {
     } else {
         (downloaded as f64 / total as f64).clamp(0.0, 1.0)
     }
+}
+
+/// 完成日志后缀:";共 X MB,用时 Y 秒,平均 Z MB/s"。
+/// 供用户判断是否跑满链路(无开始时间时返回空串)。
+fn completion_summary(started_at: Option<&str>, total_bytes: u64) -> String {
+    let Some(started) =
+        started_at.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    else {
+        return String::new();
+    };
+    let seconds = (chrono::Utc::now() - started.with_timezone(&chrono::Utc))
+        .num_milliseconds()
+        .max(0) as f64
+        / 1000.0;
+    if seconds <= 0.0 {
+        return String::new();
+    }
+    let megabytes = total_bytes as f64 / 1_048_576.0;
+    format!(
+        ";共 {megabytes:.0} MB,用时 {seconds:.0} 秒,平均 {:.1} MB/s",
+        megabytes / seconds
+    )
 }
 
 async fn missing_chunk_ranges(store: &TaskStore, task_id: &str) -> Result<Vec<ChunkRange>> {

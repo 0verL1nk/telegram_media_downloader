@@ -1,12 +1,18 @@
 use crate::task_store::TaskStore;
 use anyhow::{Context, Result, bail};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, path::Path};
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     sync::{broadcast, mpsc},
 };
+
+/// 速率采样的固定时间窗:窗口内累计字节除以窗口时长。
+///
+/// 逐块采样会把突发到达(两块间隔可低至毫秒级)当成瞬时速率,UI 速度/ETA
+/// 会突然飙高几个数量级;固定窗口 + EMA 平滑后读数才稳定可信。
+const RATE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct IncomingChunk {
@@ -155,13 +161,18 @@ pub async fn write_chunks_bounded(
             .await?;
         completed_offsets.insert(chunk.offset);
         already = already.saturating_add(expected);
-        let elapsed = rate_window_started.elapsed().as_secs_f64().max(0.001);
-        let window_speed = already.saturating_sub(rate_window_bytes) as f64 / elapsed;
-        smoothed_speed = if smoothed_speed == 0.0 {
-            window_speed
-        } else {
-            smoothed_speed * 0.65 + window_speed * 0.35
-        };
+        let elapsed = rate_window_started.elapsed();
+        if elapsed >= RATE_WINDOW {
+            let window_speed =
+                already.saturating_sub(rate_window_bytes) as f64 / elapsed.as_secs_f64();
+            smoothed_speed = if smoothed_speed == 0.0 {
+                window_speed
+            } else {
+                smoothed_speed * 0.6 + window_speed * 0.4
+            };
+            rate_window_started = Instant::now();
+            rate_window_bytes = already;
+        }
         store
             .update_progress(
                 &task_id,
@@ -170,8 +181,6 @@ pub async fn write_chunks_bounded(
             )
             .await?;
         let _ = progress_events.send(());
-        rate_window_started = Instant::now();
-        rate_window_bytes = already;
     }
     file.sync_all().await?;
     let chunks = store.chunk_map(&task_id).await?;

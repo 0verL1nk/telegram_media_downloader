@@ -93,19 +93,62 @@ async function fetchChunk(url, offset, length, opts) {
   }
 }
 
-async function runPool(items, limit, worker) {
+/** taskId → 并发宽度控制器 { current, max, pump }。 */
+const widthControllers = new Map();
+
+/** 自适应并发事件入口(webview-task-concurrency):按 Rust 决策调整线程池宽度。 */
+export function setTaskConcurrency(taskId, width) {
+  const ctl = widthControllers.get(taskId);
+  if (!ctl) return;
+  const next = Math.max(1, Math.min(Number(width) || ctl.current, ctl.max));
+  if (next === ctl.current) return;
+  ctl.current = next;
+  ctl.pump?.();
+}
+
+/**
+ * 可变宽度线程池:并发度由 ctl.current 决定。
+ * 缩小时不打断在途分块(等 worker 自然结束);放大时立即补开 worker。
+ */
+async function runAdaptivePool(items, ctl, worker) {
   const queue = items.slice();
-  const count = Math.max(1, Math.min(limit, queue.length));
-  const workers = [];
-  for (let i = 0; i < count; i += 1) {
-    workers.push((async () => {
-      while (queue.length > 0) {
-        const item = queue.shift();
-        await worker(item);
-      }
-    })());
+  const running = new Set();
+  let failure = null;
+  let notifyIdle = null;
+
+  const spawn = () => {
+    while (
+      !failure &&
+      queue.length > 0 &&
+      running.size < Math.max(1, Math.min(ctl.current, queue.length + running.size))
+    ) {
+      const run = async () => {
+        while (!failure && queue.length > 0) {
+          const item = queue.shift();
+          await worker(item);
+        }
+      };
+      const task = run()
+        .catch((error) => { failure = error; })
+        .finally(() => {
+          running.delete(task);
+          if (running.size === 0) notifyIdle?.();
+        });
+      running.add(task);
+    }
+  };
+
+  ctl.pump = spawn;
+  try {
+    spawn();
+    while (running.size > 0) {
+      const idle = new Promise((resolve) => { notifyIdle = resolve; });
+      if (running.size > 0) await idle;
+    }
+    if (failure) throw failure;
+  } finally {
+    ctl.pump = null;
   }
-  await Promise.all(workers);
 }
 
 /** webview-download-abort 的入口:中止该任务全部在途 fetch。 */
@@ -142,7 +185,7 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
     diag(`pipeline: total=${totalBytes}`);
     const plan = await window.__TAURI__.core.invoke('plan_chunks', { taskId, totalBytes });
     const missingCount = plan.missing ? plan.missing.length : 0;
-    diag(`pipeline: missing=${missingCount} concurrency=${plan.concurrency}`);
+    diag(`pipeline: missing=${missingCount} concurrency=${plan.concurrency}/${plan.maxConcurrency}`);
 
     if (!plan.missing || plan.missing.length === 0) {
       await window.__TAURI__.core.invoke('finish_download', { taskId });
@@ -150,7 +193,15 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
       return taskId;
     }
 
-    await runPool(plan.missing, plan.concurrency, async ({ offset, length }) => {
+    // 宽度控制器:初值来自 plan,后续由 Rust 的 webview-task-concurrency 事件调整。
+    const widthCtl = {
+      current: Math.max(1, plan.concurrency || 1),
+      max: Math.max(1, plan.maxConcurrency || plan.concurrency || 1),
+      pump: null,
+    };
+    widthControllers.set(taskId, widthCtl);
+
+    await runAdaptivePool(plan.missing, widthCtl, async ({ offset, length }) => {
       const buffer = await fetchChunk(url, offset, length, {
         timeoutSeconds: plan.timeoutSeconds,
         retries: plan.retries,
@@ -182,5 +233,6 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
     throw error;
   } finally {
     controllers.delete(taskId);
+    widthControllers.delete(taskId);
   }
 }

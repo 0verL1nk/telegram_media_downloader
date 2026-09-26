@@ -64,7 +64,10 @@ mod date_format_tests {
 #[serde(default, rename_all = "camelCase")]
 pub struct ConcurrencySettings {
     pub max_files: usize,
+    /// 单文件分块并发数。adaptive 开启时是自适应上限;关闭时即固定并发。
     pub per_file_chunks: usize,
+    /// 自适应并发(BBR 式投递率探测 + 乘性退避),默认开启。
+    pub adaptive: bool,
     pub chunk_size_kib: usize,
     pub request_timeout_seconds: u64,
     pub retries: u32,
@@ -75,7 +78,8 @@ impl Default for ConcurrencySettings {
     fn default() -> Self {
         Self {
             max_files: 3,
-            per_file_chunks: 2,
+            per_file_chunks: 16,
+            adaptive: true,
             chunk_size_kib: 512,
             request_timeout_seconds: 45,
             retries: 5,

@@ -161,18 +161,32 @@ WebviewDownloadManager
 | JS 并发抓取触发 Telegram 限流 | 并发数默认保守(4);块级退避 |
 | 看门狗误判慢速下载为中断 | "活动"定义 = 收到任意 push/finish;30s 阈值 + 慢速场景下进度事件也算活动 |
 
-## 11.5 后续(v2,不做进本批)— 自适应并发
+## 11.5 自适应并发(v0.2.2 已实现)— BBR 式投递率探测 + 乘性退避
 
-固定默认 4 路 + 手动设置是 v1 方案。v2 加自适应(算法有文献背书,见下),作为设置页的"自动并发"开关:
+把"单文件并发分块数"当作拥塞窗口来调,决策全部在 Rust(`src/adaptive.rs` 纯状态机,单元测试覆盖),
+页面线程池只按 `webview-task-concurrency` 事件软调整宽度(缩小不打断在途分块)。参数:
 
-- 初始并发 `c₀ = 2`;采样周期 `T = 5s`;每周期用 Rust 端已有 `speed_bytes_per_second` 测聚合吞吐
-- 提升 ≥ 10% → 增(×1.5);持平 → 保持;**下降 → 回退(×0.5)**;上限 = 用户设置的最大值
-- 收敛一般 2-3 个周期(约 10-15 秒);因 HTTP/2 多路复用收益曲线较平,增量设保守
-- 文献依据:
-  - Yildirim/Kosar et al., *Dynamically Tuning Level of Parallelism in Wide Area Data Transfers*(DADC'07)—"逐步加大并发、不再提升即停,收敛到近似最优"
-  - Balman et al., *Adaptive Transfer Adjustment*(LBL PDCS'10)—用历史传输记录推算参数
-  - ADAPT(LBL/NSF 2014)—参数化自适应框架(初始并发/增因子/减因子/采样周期)
-  - Zhang et al., *Reasons Not to Parallelize TCP*(IEICE'05)—并行连接会互相竞争,必须带上限与回退
+- 采样周期 `T = 2s`;投递率 = 窗口内新增完成字节 ÷ 窗口时长;整窗零进展不作为样本(停滞交给看门狗)
+- **提升 ≥3% → 乘性增长 ×1.25**(BBR ProbeBW 增益);已顶到 ceiling 时只允许 +1,由增益证明抬升 ceiling
+- **回落 ≥20% → 乘性退避 ×0.75**,并把退避前宽度记为该任务的 ceiling(之后没有增益证明不再越过,消除锯齿)
+- 平台期每 6s 探测 +1;连续 2 次探测无收益即停止探测;空闲 20s 后重新允许探测(链路容量可能已变化)
+- 初始 4 路,下限 2 路,上限 = 设置页"分块并发上限"(Rust 侧封顶 16);设置页开关"自适应分块并发",默认开
+- 不把丢包/重试当拥塞信号(页面侧已有逐块重试),只看速率本身 —— 与 BBR 一致
+- 完成日志附"共 X MB,用时 Y 秒,平均 Z MB/s";每次并发调整也会写日志,可直接判断是否跑满链路
+
+文献依据:
+
+- Cardwell et al., *BBR: Congestion-Based Congestion Control*(ACM Queue 2016;现行 IETF draft-ietf-ccwg-bbr)——
+  投递率窗口最大滤波 + ProbeBW 的 1.25×/0.75× 乘性探测与退避;速率建模优先于丢包信号
+- Netflix, *concurrency-limits* + *Performance Under Load*(Netflix Tech Blog 2018)——
+  把并发度当 TCP 拥塞窗口的 Vegas/Gradient2 自适应限流,是"并发维自适应"的工程先例
+- NVIDIA NeMo Data Designer 工程笔记(AIMD 自适应并发)——
+  **ceiling 稳定化**:退避后记录已探明的上限,加性增长不冲回配置上限,消除锯齿式反复撞墙
+- Yildirim/Kosar et al., *Dynamically Tuning Level of Parallelism in Wide Area Data Transfers*(DADC'07)——
+  "逐步加大并发、不再提升即停";Zhang et al., *Reasons Not to Parallelize TCP*(IEICE'05)——
+  并行连接互相竞争,必须带上限与回退
+
+手动固定模式仍保留:关闭开关后 `per_file_chunks` 即固定并发(旧行为),便于对照与排障。
 
 ## 12. 验收标准
 

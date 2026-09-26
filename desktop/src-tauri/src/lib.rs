@@ -1,3 +1,4 @@
+mod adaptive;
 mod app_state;
 mod atomic_file;
 mod chunk_writer;

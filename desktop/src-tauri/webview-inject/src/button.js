@@ -60,7 +60,9 @@ export function ensureButton(version, cfg, detected, onDownload, onRetry) {
 // 状态视觉常量(done/failed 覆盖原生按钮颜色)
 const DONE_COLOR = '#4dcd5e';
 const FAILED_COLOR = '#e53935';
-const PULSE_OPACITY = 0.5;
+// 进行中状态(提交/排队/下载)统一显示旋转 spinner:点击后立刻可见,
+// 不再用透明度脉冲动画(闪烁难辨认,用户反馈过)。
+const BUSY_STATES = new Set(['submitting', 'queued', 'downloading']);
 
 export function setButtonState(btn, state, payload) {
   if (!btn) return;
@@ -73,9 +75,26 @@ export function setButtonState(btn, state, payload) {
       : '下载中';
   }
   btn.title = title || STATE_TITLES.ready;
-  btn.classList.toggle('tel-download-progress', state === 'downloading');
+  const busy = BUSY_STATES.has(state);
+  btn.classList.toggle('tel-download-busy', busy);
   btn.classList.toggle('tel-download-done', state === 'completed');
   btn.classList.toggle('tel-download-failed', state === 'failed');
+  syncSpinner(btn, busy);
+}
+
+// spinner 是绝对定位居中的覆盖层:原有图标用 visibility 隐藏(保留布局),
+// 不改动 Telegram 按钮自身的 display/尺寸,避免任何布局跳动。
+function syncSpinner(btn, busy) {
+  const existing = btn.querySelector(':scope > .tel-spinner');
+  if (busy && !existing) {
+    if (getComputedStyle(btn).position === 'static') btn.style.position = 'relative';
+    const spinner = document.createElement('span');
+    spinner.className = 'tel-spinner';
+    spinner.setAttribute('aria-hidden', 'true');
+    btn.appendChild(spinner);
+  } else if (!busy && existing) {
+    existing.remove();
+  }
 }
 
 // 注入微型状态样式(幂等);基础外观全部来自原生类,此处不接管。
@@ -88,10 +107,23 @@ export function injectButtonStyles() {
   const style = document.createElement('style');
   style.id = 'tel-download-style';
   style.textContent = `
-    .tel-download[data-tel-state="downloading"] { animation: tel-pulse 1s infinite; }
+    .tel-download.tel-download-busy > * { visibility: hidden; }
+    .tel-download.tel-download-busy > .tel-spinner { visibility: visible; }
+    .tel-spinner {
+      position: absolute;
+      inset: 0;
+      margin: auto;
+      width: 18px;
+      height: 18px;
+      box-sizing: border-box;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: tel-spin 0.7s linear infinite;
+    }
+    @keyframes tel-spin { to { transform: rotate(360deg); } }
     .tel-download.tel-download-done { color: ${DONE_COLOR} !important; }
     .tel-download.tel-download-failed { color: ${FAILED_COLOR} !important; }
-    @keyframes tel-pulse { 50% { opacity: ${PULSE_OPACITY}; } }
   `;
   root.appendChild(style);
   return true;
