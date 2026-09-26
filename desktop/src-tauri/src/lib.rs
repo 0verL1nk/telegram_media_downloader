@@ -16,7 +16,6 @@ mod storage;
 mod task_store;
 mod telegram;
 mod transfers;
-mod url_validator;
 mod webview_bridge;
 
 use app_state::AppState;

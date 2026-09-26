@@ -44,9 +44,15 @@ impl TaskStore {
         let db = Database::connect(options)
             .await
             .context("无法打开任务数据库")?;
-        Migrator::up(&db, None)
+        // SQLite migrations default to non-transactional execution, so each DDL statement may be
+        // handed a different pooled connection. A connection that loaded its schema before an
+        // earlier migration added a column will reject a later `DROP COLUMN` with "no such
+        // column". Pinning the whole migration run to one connection keeps the schema consistent.
+        let migration = db.begin().await.context("无法开启迁移事务")?;
+        Migrator::up(&migration, None)
             .await
             .context("任务数据库迁移失败")?;
+        migration.commit().await.context("无法提交迁移事务")?;
         let store = Self { db };
         store.recover_interrupted().await?;
         Ok(store)

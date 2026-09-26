@@ -10,7 +10,51 @@ impl MigratorTrait for Migrator {
             Box::new(m20260926_000002_upload_tasks::Migration),
             Box::new(m20260926_000003_telegram_transfers::Migration),
             Box::new(m20260926_000004_tasks_media_url::Migration),
+            Box::new(m20260926_000005_drop_tasks_media_url::Migration),
         ]
+    }
+}
+
+mod m20260926_000005_drop_tasks_media_url {
+    use sea_orm_migration::prelude::*;
+
+    pub struct Migration;
+
+    impl MigrationName for Migration {
+        fn name(&self) -> &str {
+            "m20260926_000005_drop_tasks_media_url"
+        }
+    }
+
+    #[derive(DeriveIden)]
+    enum Tasks {
+        Table,
+        MediaUrl,
+    }
+
+    #[async_trait::async_trait]
+    impl MigrationTrait for Migration {
+        async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Tasks::Table)
+                        .drop_column(Tasks::MediaUrl)
+                        .to_owned(),
+                )
+                .await
+        }
+
+        async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(Tasks::Table)
+                        .add_column(ColumnDef::new(Tasks::MediaUrl).string().null())
+                        .to_owned(),
+                )
+                .await
+        }
     }
 }
 
