@@ -15,6 +15,7 @@ export const ICONS = {
   music: svg('<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>'),
   sticker: svg('<path d="M21 11v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8"/><path d="M21 3 L9 15"/><circle cx="15" cy="9" r="3"/>'),
   file: svg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'),
+  story: svg('<path d="M12 2 L22 7 L17 22 L7 22 L2 7 Z"/><circle cx="12" cy="12" r="3"/>'),
 };
 
 export function getIcon(name) {
