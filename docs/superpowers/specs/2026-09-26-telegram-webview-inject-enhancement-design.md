@@ -3,6 +3,7 @@
 - 日期: 2026-09-26
 - 状态: 待用户审阅
 - 范围: 单人完整版,约 2 周。不含拖拽下载、不含设置页 UI、不含 i18n、不含批量选择面板、不含 CDN。
+- 策略: 禁保存(noforwards)媒体按"可下载"对待,与油猴脚本对齐。详见 §10。
 
 ## 1. 摘要
 
@@ -14,6 +15,7 @@
 - 点击后状态实时反馈(提交中 / 已入队 / 进行中 / 完成 / 失败重试)
 - 本地已下载文件标记。匹配键:`chat_id + message_id`(`file_size` 不参与匹配,仅取自同一消息最近一次已完成下载用于显示「✓ 已下载 · 3.4 MB」)
 - Story 下载走 MTProto 任务系统
+- 禁保存(`noforwards`)媒体开放下载,见 §10
 
 桥接只增加 3 个新 Tauri 命令。现有 `submit_download_from_webview` 行为不变,仅事件名升级。
 
@@ -477,9 +479,51 @@ Rust 侧命令**永不接收**:路径、URL、文件名、token、cookie、sessi
 
 每条命令入口**重做** `is_trusted_telegram_webview` 校验。
 
-## 10. 测试
+## 10. 禁保存策略
 
-### 10.1 Rust 单元/集成
+### 10.1 决策
+
+`noforwards=true`(频道主设的"禁止保存内容")**不视为**下载屏障,与油猴脚本对齐。
+
+### 10.2 协议层依据
+
+- Telegram 的 `noforwards` 是 UI 层标记(给官方客户端在按钮/右键菜单隐藏下载入口用),**不是协议层拒绝**
+- MTProto 拿到消息对象后,服务端对用户账号的 `upload.getFile` 请求照常响应
+- 油猴脚本能下是因为它走 HTTP API 完全看不见这个标记;我们走 MTProto 看得见,但选择不拦
+
+### 10.3 拦截范围(收紧)
+
+`desktop/src-tauri/src/telegram.rs::protected_or_ttl` 现状:
+
+```rust
+raw.noforwards || raw.ttl_period.unwrap_or(0) > 0
+```
+
+改为:
+
+```rust
+raw.ttl_period.unwrap_or(0) > 0
+```
+
+仅保留 `ttl_period`(自毁/限时消息)的拦截 — 这类消息不下载会消失,拦截必要。
+
+`noforwards` 不再返回 true,`message_info` 不再为它设置 `unavailable_reason`。
+
+### 10.4 用户告知
+
+前端不为禁保存媒体单独加视觉标记(单人使用,频道名自证)。如后续多人产品化需加"下载后请尊重原作者"水印,另起 spec。
+
+### 10.5 验收
+
+- [ ] `noforwards=true` 的消息在聊天列表中正常出现下载按钮
+- [ ] 实际下载成功,任务状态 `completed`
+- [ ] `ttl_period > 0` 的消息仍不出现下载按钮(自毁消息必须拦截)
+
+---
+
+## 11. 测试
+
+### 11.1 Rust 单元/集成
 
 `cargo test --locked` 新增:
 
@@ -488,7 +532,7 @@ Rust 侧命令**永不接收**:路径、URL、文件名、token、cookie、sessi
 - `webview_task_action` 三种 action 路由正确;非法 action 拒绝
 - 事件 payload schema:序列化后字段名 camelCase,字段类型正确
 
-### 10.2 Init script 单元(webview-inject/test/)
+### 11.2 Init script 单元(webview-inject/test/)
 
 vitest + happy-dom:
 
@@ -503,7 +547,7 @@ vitest + happy-dom:
   - Story 关闭清理按钮
   - origin 不匹配 / 非顶层 frame 时 boot 提前返回
 
-### 10.3 手工(开发模式)
+### 11.3 手工(开发模式)
 
 `npx tauri dev` 登录真实账号:
 
@@ -512,12 +556,12 @@ vitest + happy-dom:
 - 关闭客户端重启,已下载标记是否保留
 - 主按钮 / 子按钮视觉与 Telegram Web 融合度
 
-### 10.4 Lint
+### 11.4 Lint
 
 - ESLint (vanilla config) 作用于 `webview-inject/src/`
 - `cargo clippy --locked --all-targets`
 
-## 11. 配置(`config.json`,编译期内联到 `inject.js` 顶部)
+## 12. 配置(`config.json`,编译期内联到 `inject.js` 顶部)
 
 ```js
 {
@@ -545,7 +589,7 @@ vitest + happy-dom:
 }
 ```
 
-## 12. 风险与缓解
+## 13. 风险与缓解
 
 | 风险 | 缓解 |
 |---|---|
@@ -556,7 +600,7 @@ vitest + happy-dom:
 | 多文件识别歧义(同消息 document + img) | document 优先(体积更大,通常更值得下载);可在 `config.js` 调优先级 |
 | Node 不可用导致打包失败 | build.rs 警告不阻断;dist 已存在则跳过;CI 单独验证 |
 
-## 13. 验收标准
+## 14. 验收标准
 
 - [ ] `cargo test --locked` 全部通过
 - [ ] `cd desktop && npm run check && npm run build` 通过
@@ -572,7 +616,7 @@ vitest + happy-dom:
 - [ ] Story overlay 关闭后按钮自动清理
 - [ ] 中文 UI 文案一致,每条 ≤ 8 字
 
-## 14. 参考
+## 15. 参考
 
 - 现有 init script: `desktop/src-tauri/src/webview_bridge.rs:147`
 - 现有命令: `desktop/src-tauri/src/commands.rs:1115`
