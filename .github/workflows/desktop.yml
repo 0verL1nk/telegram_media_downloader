@@ -34,7 +34,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop/src-tauri -> target
-          shared-key: desktop-rust # 与 release job 共享同一缓存
+          shared-key: desktop-rust # checks 自己的 debug 档缓存(仅本任务使用)
           cache-all-crates: true
       - name: Install frontend packages
         working-directory: desktop
@@ -65,11 +65,26 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # release 任务不用 Swatinem/rust-cache:它在缓存键完全命中时会跳过回写
+      # ("Cache up-to-date."),而 checks 先存下的只有 debug 档产物 —— 两头一夹,
+      # release 档产物永远进不了缓存,每次发版都要从零全量重编 release。
+      # 改用原生 actions/cache:key 里带 run_id 保证本次必定回写,
+      # restore-keys 前缀保证下次发布能取到上一次的 release 档产物。
+      - name: Cache cargo home
+        uses: actions/cache@v4
         with:
-          workspaces: desktop/src-tauri -> target
-          shared-key: desktop-rust # 与 checks job 共享同一缓存
-          cache-all-crates: true
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+      - name: Cache release profile target dir
+        uses: actions/cache@v4
+        with:
+          path: desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-release-target-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-target-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-release-target-
       - name: Install frontend packages
         working-directory: desktop
         run: npm ci
