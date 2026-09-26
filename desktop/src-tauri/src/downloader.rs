@@ -1,157 +1,460 @@
+//! WebView 页面抓取下载管理器。
+//!
+//! 下载的网络请求全部在 Telegram Web 页面上下文里执行(与脚本 #446342 一致),Rust 只负责
+//! 任务登记、分块落盘(`chunk_writer`)、进度事件、槽位/背压、看门狗兜底与原子提交。
+//! URL 与 cookie 永不进入 Rust。
+//!
+//! 数据流(见 `docs/superpowers/specs/2026-09-26-webview-http-downloader-design.md`):
+//! `create` 建记录 → `plan`(占文件槽位、配置分块表、启动 writer,返回缺块清单) →
+//! `push`(页面 fetch 到的分块经 IPC 入队,mpsc 满时自然背压) →
+//! `finish`(全块校验 + 原子提交)/ `fail`(保留已校验分块以便续传)。
+//!
+//! 看门狗每 10 秒巡检一次:下载中且 30 秒既无 push 也无 finish 的任务会被暂停并发出
+//! `webview-download-abort`(覆盖 WebView 关闭/刷新/网络掉线等 JS 侧消失的情形)。
+
 use crate::{
     app_state::SharedState,
     chunk_writer::{self, IncomingChunk},
-    filter::{FilterMetadata, evaluate},
-    models::{MessageInfo, Settings, TaskRecord},
-    telegram::{self, TelegramAdapter},
+    models::TaskRecord,
+    task_store::TaskStore,
 };
-use anyhow::{Context, Result, bail};
-use futures_util::{StreamExt, stream};
-use grammers_client::{InvocationError, media::Downloadable, tl};
-use sha2::{Digest, Sha256};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tauri::Emitter;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
-    sync::{Mutex, Notify, RwLock, Semaphore, broadcast, mpsc, oneshot},
+    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc},
+    task::JoinHandle,
 };
-use tokio_util::sync::CancellationToken;
 
-const MAX_TASK_WORKERS: usize = 12;
-const JOB_QUEUE_CAPACITY: usize = 256;
-const MAX_BATCH_TASKS: usize = 20_000;
+/// 进度事件节流间隔。
+const PROGRESS_TICK: Duration = Duration::from_millis(350);
+/// 看门狗巡检间隔。
+const WATCHDOG_TICK: Duration = Duration::from_secs(10);
+/// 活动任务超过此间隔既无 push 也无 finish,即判定页面侧已消失。
+const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单个 IPC 分块字节数硬上限。分块设置上界是 1 MiB,这里留出余量以拒绝异常调用方。
+const CHUNK_HARD_CAP: usize = 4 * 1024 * 1024;
+/// 分块映射允许的单块最大字节数(与设置页 1 MiB 上界一致)。
+const MAX_CHUNK_BYTES: u64 = 1024 * 1024;
+/// 文件名最大字符数。
+const MAX_FILE_NAME_CHARS: usize = 512;
+/// 媒体类型标记最大字符数。
+const MAX_FILE_TYPE_CHARS: usize = 64;
+/// 任务来源摘要最大字符数(只用于日志)。
+const MAX_SOURCE_SUMMARY_CHARS: usize = 200;
+/// 重复文件命名候选上限。
+const MAX_DUPLICATE_NAME_ATTEMPTS: u32 = 100_000;
+/// 分块大小候选(设置页 64–1024 KiB;HTTP Range 没有 Telegram 的 1 MiB 对齐约束)。
+const CHUNK_SIZE_KIB_CHOICES: [usize; 5] = [64, 128, 256, 512, 1024];
+const MIN_CHUNK_SIZE_KIB: usize = 64;
+const MAX_CHUNK_SIZE_KIB: usize = 1024;
+/// 每个文件的并发抓取路数(随计划返回给页面 JS)。
+const MIN_PER_FILE_CHUNKS: usize = 1;
+const MAX_PER_FILE_CHUNKS: usize = 16;
+/// 请求超时(秒),随计划返回给页面 JS。
+const MIN_TIMEOUT_SECONDS: u64 = 5;
+const MAX_TIMEOUT_SECONDS: u64 = 600;
+/// 页面侧块级重试次数上限。
+const MAX_RETRIES: u32 = 20;
+/// 进度广播缓冲(只用来置脏标记,容量小即可)。
+const PROGRESS_EVENT_BUFFER: usize = 8;
+/// 同时下载的文件数硬上限。
+const MAX_FILE_SLOTS: usize = 12;
+/// 管理动作的日志目标。
+const DOWNLOAD_LOG_TARGET: &str = "download";
 
-#[derive(Clone)]
-struct TaskControl {
-    token: CancellationToken,
-    join: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    dispatch_ready: Arc<AtomicBool>,
-    dispatch_changed: Arc<Notify>,
+/// 页面需要补齐的一个分块区间。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
+/// `plan_chunks` 的返回:除缺块清单外,并发/超时/重试参数决定页面侧抓取行为。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanInfo {
+    pub chunk_size_bytes: u64,
+    pub concurrency: usize,
+    pub timeout_seconds: u64,
+    pub retries: u32,
+    pub missing: Vec<ChunkRange>,
+}
+
+/// 一个正在下载中的任务:分块入队通道、writer/进度监视句柄、活动时间与占用的文件槽位。
+struct ActiveDownload {
+    sender: mpsc::Sender<IncomingChunk>,
+    writer: JoinHandle<Result<u64>>,
+    watcher: JoinHandle<()>,
+    /// 最后活动时间(std Mutex:只在同步短临界区内读写)。
+    last_activity: Arc<Mutex<Instant>>,
+    total: u64,
+    /// `plan_chunks` 获取的文件槽位;随本结构体一并释放。
+    _slot: OwnedSemaphorePermit,
 }
 
 pub struct DownloadManager {
     shared: Arc<SharedState>,
-    sender: mpsc::Sender<String>,
-    controls: Arc<Mutex<HashMap<String, TaskControl>>>,
+    slots: Arc<Semaphore>,
+    active: Arc<AsyncMutex<HashMap<String, ActiveDownload>>>,
 }
 
 impl DownloadManager {
+    /// 构造管理器并启动看门狗。不自动入队:WebView 任务由页面探明大小后调用 `plan`。
     pub async fn start(shared: Arc<SharedState>) -> Result<Self> {
-        let (sender, receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
-        let controls = Arc::new(Mutex::new(HashMap::new()));
-        let manager = Self {
-            shared: Arc::clone(&shared),
-            sender,
-            controls: Arc::clone(&controls),
+        let limit = {
+            let settings = shared.settings.read().await;
+            settings.concurrency.max_files.clamp(1, MAX_FILE_SLOTS)
         };
-        tokio::spawn(dispatch(Arc::clone(&shared), receiver, controls));
-        let queued = shared.store.list(Some("queued"), 2000).await?;
-        for task in queued {
-            manager.enqueue(task.task_id).await?;
-        }
+        let manager = Self {
+            shared,
+            slots: Arc::new(Semaphore::new(limit)),
+            active: Arc::new(AsyncMutex::new(HashMap::new())),
+        };
+        manager.spawn_watchdog();
         Ok(manager)
     }
 
-    pub async fn enqueue(&self, task_id: String) -> Result<()> {
-        let mut controls = self.controls.lock().await;
-        if controls
-            .get(&task_id)
-            .is_some_and(|control| !control.token.is_cancelled())
-        {
-            return Ok(());
+    /// 登记一个 WebView 下载任务:校验文件名、应用重复策略、建立 `queued` 记录。
+    pub async fn create(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        source: &str,
+    ) -> Result<TaskRecord> {
+        let name = validate_file_name(file_name)?;
+        let sanitized = safe_component(&name);
+        let settings = self.shared.settings.read().await.clone();
+        if settings.download_root.trim().is_empty() {
+            bail!("请先在设置中配置下载目录");
         }
-        let control = TaskControl {
-            token: CancellationToken::new(),
-            join: Arc::new(Mutex::new(None)),
-            dispatch_ready: Arc::new(AtomicBool::new(false)),
-            dispatch_changed: Arc::new(Notify::new()),
+        let root = PathBuf::from(&settings.download_root);
+        let target = resolve_download_target(&root, &sanitized, &settings.duplicate_policy)?;
+        let record = TaskRecord {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            // 页面抓取的任务没有 Telegram 消息上下文;列约束要求非空,写入空串。
+            chat_id: String::new(),
+            chat_title: None,
+            message_id: None,
+            media_type: Some(normalize_file_type(file_type)),
+            file_name: Some(sanitized.clone()),
+            status: "queued".into(),
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            speed_bytes_per_second: 0,
+            remaining_bytes: None,
+            started_at: None,
+            updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            completed_at: None,
+            output_path: Some(target.to_string_lossy().into_owned()),
+            error: None,
+            retry_count: 0,
+            group_id: None,
         };
-        controls.insert(task_id.clone(), control.clone());
-        drop(controls);
-        if self.sender.send(task_id.clone()).await.is_err() {
-            mark_dispatch_ready(&control);
-            self.controls.lock().await.remove(&task_id);
-            bail!("下载任务队列已关闭；任务已保留在本机，可稍后重启恢复");
+        self.shared.store.create(&record).await?;
+        self.shared.publish_task(&record.task_id).await;
+        self.emit(
+            "webview-task-submitted",
+            serde_json::json!({ "taskId": record.task_id }),
+        );
+        self.shared
+            .log(
+                "info",
+                DOWNLOAD_LOG_TARGET,
+                format!(
+                    "已创建网页下载任务 {task_id}:{sanitized}(来源:{summary})",
+                    task_id = record.task_id,
+                    summary = summarize_source(source)
+                ),
+            )
+            .await;
+        Ok(record)
+    }
+
+    /// 页面探明文件大小后排定分块计划:占文件槽位、配置分块表、启动 writer,返回缺块清单。
+    ///
+    /// 幂等:任务已在下载中时只返回当前缺块清单,不重复占槽位或启动 writer。
+    pub async fn plan(&self, task_id: &str, total_bytes: u64) -> Result<PlanInfo> {
+        if total_bytes == 0 {
+            bail!("文件大小无效,无法规划分块下载");
         }
+        let record = self.require_record(task_id).await?;
+        if !matches!(record.status.as_str(), "queued" | "paused" | "downloading") {
+            bail!("任务当前状态不允许开始下载:{}", record.status);
+        }
+        ensure_total_matches(record.total_bytes, total_bytes)?;
+        let settings = self.shared.settings.read().await.clone();
+        let chunk_size_bytes =
+            (supported_chunk_size_kib(settings.concurrency.chunk_size_kib) as u64) * 1024;
+        let concurrency = settings
+            .concurrency
+            .per_file_chunks
+            .clamp(MIN_PER_FILE_CHUNKS, MAX_PER_FILE_CHUNKS);
+        let parameters = PlanInfo {
+            chunk_size_bytes,
+            concurrency,
+            timeout_seconds: settings
+                .concurrency
+                .request_timeout_seconds
+                .clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
+            retries: settings.concurrency.retries.clamp(0, MAX_RETRIES),
+            missing: Vec::new(),
+        };
+        let active_activity = {
+            let active = self.active.lock().await;
+            active
+                .get(task_id)
+                .map(|entry| Arc::clone(&entry.last_activity))
+        };
+        if let Some(last_activity) = active_activity {
+            // 已在下载中:刷新活动时间并返回当前缺块,由既有 writer 落盘。
+            *last_activity
+                .lock()
+                .map_err(|_| anyhow!("任务活动时间读取失败"))? = Instant::now();
+            let missing = missing_chunk_ranges(&self.shared.store, task_id).await?;
+            return Ok(PlanInfo {
+                missing,
+                ..parameters
+            });
+        }
+        // 排队中的任务在这里等待空闲槽位;取消/暂停会由随后的状态复查拦截。
+        let slot = Arc::clone(&self.slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("下载槽位已关闭;任务保留在本机,可重启客户端恢复"))?;
+        let record = self.require_record(task_id).await?;
+        if !matches!(record.status.as_str(), "queued" | "paused" | "downloading") {
+            bail!("任务当前状态不允许开始下载:{}", record.status);
+        }
+        ensure_total_matches(record.total_bytes, total_bytes)?;
+        let output = PathBuf::from(record.output_path.as_deref().context("任务目标路径为空")?);
+        let temp = temporary_output_path(&output, task_id);
+        if let Some(parent) = temp.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        chunk_writer::configure_chunk_map(
+            &self.shared.store,
+            task_id,
+            total_bytes,
+            chunk_size_bytes,
+        )
+        .await?;
+        chunk_writer::verify_resumable_chunks(&self.shared.store, task_id, &temp).await?;
+        let missing = missing_chunk_ranges(&self.shared.store, task_id).await?;
+        self.shared
+            .store
+            .set_total_bytes(task_id, total_bytes)
+            .await?;
+        match record.status.as_str() {
+            "paused" => {
+                // 状态机只允许 paused → queued → downloading。
+                self.shared
+                    .store
+                    .set_status(task_id, "queued", None)
+                    .await?;
+                self.shared
+                    .store
+                    .set_status(task_id, "downloading", None)
+                    .await?;
+            }
+            "downloading" => {}
+            _ => {
+                self.shared
+                    .store
+                    .set_status(task_id, "downloading", None)
+                    .await?;
+            }
+        }
+        let (sender, receiver) =
+            mpsc::channel(chunk_queue_depth(settings.concurrency.per_file_chunks));
+        let (progress_events, progress_receiver) = broadcast::channel(PROGRESS_EVENT_BUFFER);
+        let writer_store = self.shared.store.clone();
+        let writer_task_id = task_id.to_owned();
+        let writer_temp = temp;
+        let writer = tokio::spawn(async move {
+            chunk_writer::write_chunks_bounded(
+                writer_store,
+                writer_task_id,
+                &writer_temp,
+                total_bytes,
+                receiver,
+                progress_events,
+            )
+            .await
+        });
+        let watcher = spawn_progress_watcher(
+            Arc::clone(&self.shared),
+            task_id.to_owned(),
+            total_bytes,
+            progress_receiver,
+        );
+        self.active.lock().await.insert(
+            task_id.to_owned(),
+            ActiveDownload {
+                sender,
+                writer,
+                watcher,
+                last_activity: Arc::new(Mutex::new(Instant::now())),
+                total: total_bytes,
+                _slot: slot,
+            },
+        );
+        // writer 首轮刷新与 350ms 节流器会立即补上 `webview-task-updated`。
+        self.shared.publish_task(task_id).await;
+        self.shared
+            .log(
+                "info",
+                DOWNLOAD_LOG_TARGET,
+                format!(
+                    "任务 {task_id} 开始分块下载,共 {total_bytes} 字节,缺 {missing_len} 块",
+                    missing_len = missing.len()
+                ),
+            )
+            .await;
+        Ok(PlanInfo {
+            missing,
+            ..parameters
+        })
+    }
+
+    /// 页面抓取到的分块入队。mpsc 满时 `send` 阻塞,形成自然背压。
+    pub async fn push(&self, task_id: &str, offset: u64, bytes: Vec<u8>) -> Result<()> {
+        if bytes.is_empty() {
+            bail!("分块数据为空");
+        }
+        if bytes.len() > CHUNK_HARD_CAP {
+            bail!("单个分块超过 {CHUNK_HARD_CAP} 字节上限");
+        }
+        let (sender, last_activity, total) = {
+            let active = self.active.lock().await;
+            let entry = active.get(task_id).context("任务不在活动状态")?;
+            (
+                entry.sender.clone(),
+                Arc::clone(&entry.last_activity),
+                entry.total,
+            )
+        };
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .context("分块偏移溢出")?;
+        if end > total {
+            bail!("分块超出文件大小");
+        }
+        *last_activity
+            .lock()
+            .map_err(|_| anyhow!("任务活动时间读取失败"))? = Instant::now();
+        sender
+            .send(IncomingChunk {
+                offset,
+                data: bytes,
+            })
+            .await
+            .map_err(|_| anyhow!("下载已结束或中断"))?;
         Ok(())
     }
 
-    pub async fn action(&self, task_id: &str, action: &str) -> Result<TaskRecord> {
-        let record = self
-            .shared
-            .store
-            .get(task_id)
-            .await?
-            .with_context(|| format!("未找到下载任务：{task_id}"))?;
-        match action {
-            "pause" | "cancel" => {
-                if !matches!(record.status.as_str(), "queued" | "downloading") {
-                    bail!("该任务当前状态不能暂停或取消");
-                }
-                if let Some(control) = self.controls.lock().await.get(task_id).cloned() {
-                    control.token.cancel();
-                    wait_for_dispatch(&control).await;
-                    let join = { control.join.lock().await.take() };
-                    if let Some(join) = join {
-                        let _ = join.await;
-                    }
-                }
-                let latest = self
-                    .shared
-                    .store
-                    .get(task_id)
-                    .await?
-                    .with_context(|| format!("未找到下载任务：{task_id}"))?;
-                if !matches!(latest.status.as_str(), "queued" | "downloading") {
-                    return Ok(latest);
-                }
-                self.shared
-                    .store
-                    .set_status(
-                        task_id,
-                        if action == "pause" {
-                            "paused"
-                        } else {
-                            "cancelled"
-                        },
-                        None,
-                    )
-                    .await?;
-                self.controls.lock().await.remove(task_id);
-                if action == "cancel" {
-                    let settings = self.shared.settings.read().await.clone();
-                    if !settings.preserve_partial_files
-                        && let Some(output) = record.output_path.as_deref()
-                    {
-                        let temp = temporary_output_path(Path::new(output), task_id);
-                        let _ = tokio::fs::remove_file(temp).await;
-                    }
-                }
-                self.shared.publish_task(task_id).await;
-                self.shared
-                    .log(
-                        "info",
-                        "download",
-                        format!(
-                            "任务 {task_id} 已{}",
-                            if action == "pause" {
-                                "暂停"
-                            } else {
-                                "取消"
-                            }
-                        ),
-                    )
+    /// 全部块抓取完成后调用:校验分块完整并原子提交到目标路径。
+    ///
+    /// 缺块或提交失败时走与 [`Self::fail`] 相同的失败路径(保留临时文件以便续传)。
+    pub async fn finish(&self, task_id: &str) -> Result<TaskRecord> {
+        let Some(active) = self.detach(task_id).await else {
+            // 幂等:重复 finish(典型是成功后重放)直接返回当前记录。
+            let record = self.require_record(task_id).await?;
+            if record.status == "completed" {
+                return Ok(record);
+            }
+            bail!("任务不在活动状态,无法完成:{task_id}");
+        };
+        let total = active.total;
+        let writer_result = join_download_children(active.writer, active.watcher).await;
+        let output = match self.output_path(task_id).await {
+            Ok(output) => output,
+            Err(error) => {
+                return self
+                    .mark_failed(task_id, &safe_error(&format!("{error:#}")))
                     .await;
             }
+        };
+        let temp = temporary_output_path(&output, task_id);
+        let chunks = self.shared.store.chunk_map(task_id).await?;
+        let failure = if !chunk_map_is_complete(&chunks, total) {
+            Some("分块未完成,请重新打开媒体补齐".to_owned())
+        } else {
+            writer_result
+                .err()
+                .map(|error| safe_error(&format!("{error:#}")))
+        };
+        if let Some(reason) = failure {
+            return self.mark_failed(task_id, &reason).await;
+        }
+        let overwrite = self
+            .shared
+            .settings
+            .read()
+            .await
+            .duplicate_policy
+            .eq("overwrite");
+        if let Err(error) = complete_download(
+            &self.shared.store,
+            task_id,
+            total,
+            &temp,
+            &output,
+            overwrite,
+        )
+        .await
+        {
+            return self
+                .mark_failed(task_id, &safe_error(&format!("{error:#}")))
+                .await;
+        }
+        self.shared.store.update_progress(task_id, total, 0).await?;
+        self.shared
+            .store
+            .set_status(task_id, "completed", None)
+            .await?;
+        self.shared.publish_task(task_id).await;
+        self.emit(
+            "webview-task-completed",
+            serde_json::json!({
+                "taskId": task_id,
+                "outputPath": output.to_string_lossy(),
+            }),
+        );
+        self.shared
+            .log(
+                "info",
+                DOWNLOAD_LOG_TARGET,
+                format!("任务 {task_id} 已校验并原子提交:{}", output.display()),
+            )
+            .await;
+        self.require_record(task_id).await
+    }
+
+    /// 页面侧失败(URL 过期、块级重试耗尽等):保留已校验分块,标记 `failed`。
+    pub async fn fail(&self, task_id: &str, error: &str) -> Result<TaskRecord> {
+        if let Some(active) = self.detach(task_id).await {
+            stop_active(active).await;
+        }
+        self.mark_failed(task_id, error).await
+    }
+
+    /// 任务页操作:`pause` / `resume` / `cancel` / `retry`。
+    pub async fn action(&self, task_id: &str, action: &str) -> Result<TaskRecord> {
+        match action {
+            "pause" => pause_task(&self.shared, &self.active, task_id, "用户暂停").await,
             "resume" => {
+                let record = self.require_record(task_id).await?;
                 if record.status != "paused" {
                     bail!("只有已暂停的任务可以继续");
                 }
@@ -159,10 +462,19 @@ impl DownloadManager {
                     .store
                     .set_status(task_id, "queued", None)
                     .await?;
-                self.enqueue(task_id.to_owned()).await?;
                 self.shared.publish_task(task_id).await;
+                self.shared
+                    .log(
+                        "info",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("任务 {task_id} 已排队;重新打开媒体后按缺块续传"),
+                    )
+                    .await;
+                self.require_record(task_id).await
             }
+            "cancel" => cancel_task(&self.shared, &self.active, task_id).await,
             "retry" => {
+                let record = self.require_record(task_id).await?;
                 if !matches!(record.status.as_str(), "failed" | "cancelled") {
                     bail!("只有失败或已取消的任务可以重试");
                 }
@@ -170,1489 +482,293 @@ impl DownloadManager {
                     .store
                     .set_status(task_id, "queued", None)
                     .await?;
-                self.enqueue(task_id.to_owned()).await?;
                 self.shared.publish_task(task_id).await;
+                self.shared
+                    .log(
+                        "info",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("任务 {task_id} 已重新排队"),
+                    )
+                    .await;
+                self.require_record(task_id).await
             }
             _ => bail!("不支持的任务操作"),
         }
+    }
+
+    /// 每 10 秒巡检:下载中且长时间无 push/finish 的任务按“暂停”处理。
+    fn spawn_watchdog(&self) {
+        let shared = Arc::clone(&self.shared);
+        let active = Arc::clone(&self.active);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(WATCHDOG_TICK);
+            loop {
+                tick.tick().await;
+                let stale = {
+                    let active_map = active.lock().await;
+                    active_map
+                        .iter()
+                        .filter(|(_, entry)| {
+                            entry
+                                .last_activity
+                                .lock()
+                                .map(|at| at.elapsed() >= ACTIVITY_TIMEOUT)
+                                .unwrap_or(false)
+                        })
+                        .map(|(task_id, _)| task_id.clone())
+                        .collect::<Vec<_>>()
+                };
+                for task_id in stale {
+                    if let Err(error) =
+                        pause_task(&shared, &active, &task_id, "超过 30 秒无下载活动").await
+                    {
+                        shared
+                            .log(
+                                "warn",
+                                DOWNLOAD_LOG_TARGET,
+                                format!("看门狗暂停任务 {task_id} 失败:{error:#}"),
+                            )
+                            .await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn detach(&self, task_id: &str) -> Option<ActiveDownload> {
+        self.active.lock().await.remove(task_id)
+    }
+
+    async fn require_record(&self, task_id: &str) -> Result<TaskRecord> {
         self.shared
             .store
             .get(task_id)
             .await?
-            .context("任务状态更新后无法读取")
+            .with_context(|| format!("未找到下载任务:{task_id}"))
     }
-}
 
-async fn dispatch(
-    shared: Arc<SharedState>,
-    mut receiver: mpsc::Receiver<String>,
-    controls: Arc<Mutex<HashMap<String, TaskControl>>>,
-) {
-    let slots = Arc::new(Semaphore::new(MAX_TASK_WORKERS));
-    let active_count = Arc::new(AtomicUsize::new(0));
-    let capacity_changed = Arc::new(Notify::new());
-    let limiter = Arc::new(RequestLimiter::new(6));
-    let bandwidth = Arc::new(BandwidthLimiter::default());
-    let flood_gate = Arc::new(FloodGate::default());
-    while let Some(task_id) = receiver.recv().await {
-        let Some(control) = controls.lock().await.get(&task_id).cloned() else {
-            continue;
-        };
-        let token = control.token.clone();
-        let permit = tokio::select! {
-            _ = token.cancelled() => {
-                mark_dispatch_ready(&control);
-                remove_control_if_current(&controls, &task_id, &control).await;
-                continue;
-            },
-            permit = Arc::clone(&slots).acquire_owned() => match permit {
-                Ok(p) => p,
-                Err(_) => {
-                    mark_dispatch_ready(&control);
-                    remove_control_if_current(&controls, &task_id, &control).await;
-                    break;
-                }
-            },
-        };
-        let task_shared = Arc::clone(&shared);
-        let task_controls = Arc::clone(&controls);
-        let task_active = Arc::clone(&active_count);
-        let task_capacity = Arc::clone(&capacity_changed);
-        let task_limiter = Arc::clone(&limiter);
-        let task_bandwidth = Arc::clone(&bandwidth);
-        let task_gate = Arc::clone(&flood_gate);
-        let id = task_id.clone();
-        let task_control = control.clone();
-        let (start_tx, start_rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            let _ = start_rx.await;
-            run_task(
-                task_shared,
-                id.clone(),
-                token,
-                task_active,
-                task_capacity,
-                task_limiter,
-                task_bandwidth,
-                task_gate,
-            )
-            .await;
-            drop(permit);
-            remove_control_if_current(&task_controls, &id, &task_control).await;
-        });
-        *control.join.lock().await = Some(handle);
-        mark_dispatch_ready(&control);
-        let _ = start_tx.send(());
+    async fn output_path(&self, task_id: &str) -> Result<PathBuf> {
+        let record = self.require_record(task_id).await?;
+        record
+            .output_path
+            .as_deref()
+            .map(PathBuf::from)
+            .context("任务目标路径为空")
     }
-}
 
-fn mark_dispatch_ready(control: &TaskControl) {
-    control.dispatch_ready.store(true, Ordering::Release);
-    control.dispatch_changed.notify_waiters();
-}
-
-async fn wait_for_dispatch(control: &TaskControl) {
-    loop {
-        let notified = control.dispatch_changed.notified();
-        if control.dispatch_ready.load(Ordering::Acquire) {
-            return;
+    /// 标记失败:幂等,已失败的任务直接返回,其它终态拒绝。
+    async fn mark_failed(&self, task_id: &str, error: &str) -> Result<TaskRecord> {
+        let detail = safe_error(error);
+        let record = self.require_record(task_id).await?;
+        match record.status.as_str() {
+            "failed" => {}
+            "queued" | "downloading" | "paused" => {
+                self.shared
+                    .store
+                    .set_status(task_id, "failed", Some(&detail))
+                    .await?;
+            }
+            other => bail!("任务当前状态无法标记失败:{other}"),
         }
-        notified.await;
-    }
-}
-
-async fn remove_control_if_current(
-    controls: &Mutex<HashMap<String, TaskControl>>,
-    task_id: &str,
-    control: &TaskControl,
-) {
-    let mut controls = controls.lock().await;
-    if controls
-        .get(task_id)
-        .is_some_and(|current| Arc::ptr_eq(&current.join, &control.join))
-    {
-        controls.remove(task_id);
-    }
-}
-
-async fn wait_for_file_slot(
-    shared: &SharedState,
-    token: &CancellationToken,
-    active: &AtomicUsize,
-    changed: &Notify,
-) -> bool {
-    loop {
-        if token.is_cancelled() {
-            return false;
-        }
-        let limit = shared
-            .settings
-            .read()
-            .await
-            .concurrency
-            .max_files
-            .clamp(1, MAX_TASK_WORKERS);
-        let current = active.load(Ordering::Acquire);
-        if current < limit
-            && active
-                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return true;
-        }
-        tokio::select! { _ = token.cancelled() => return false, _ = changed.notified() => {}, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
-    }
-}
-
-async fn run_task(
-    shared: Arc<SharedState>,
-    task_id: String,
-    token: CancellationToken,
-    active: Arc<AtomicUsize>,
-    changed: Arc<Notify>,
-    limiter: Arc<RequestLimiter>,
-    bandwidth: Arc<BandwidthLimiter>,
-    flood_gate: Arc<FloodGate>,
-) {
-    if !wait_for_file_slot(&shared, &token, &active, &changed).await {
-        return;
-    }
-    if token.is_cancelled() {
-        active.fetch_sub(1, Ordering::AcqRel);
-        changed.notify_waiters();
-        return;
-    }
-    let _active_guard = ActiveGuard { active, changed };
-    if let Err(error) = shared.store.set_status(&task_id, "downloading", None).await {
-        shared
+        self.shared.publish_task(task_id).await;
+        self.emit(
+            "webview-task-failed",
+            serde_json::json!({ "taskId": task_id, "error": detail }),
+        );
+        self.shared
             .log(
                 "error",
-                "database",
-                format!("任务 {task_id} 无法开始：{error:#}"),
+                DOWNLOAD_LOG_TARGET,
+                format!("任务 {task_id} 失败:{detail}"),
             )
             .await;
-        return;
+        self.require_record(task_id).await
     }
-    shared.publish_task(&task_id).await;
-    let result = download_task(&shared, &task_id, &token, &limiter, &bandwidth, &flood_gate).await;
-    if token.is_cancelled() {
-        return;
-    }
-    match result {
-        Ok(()) => {
-            if let Err(error) = shared.store.set_status(&task_id, "completed", None).await {
-                shared
-                    .log(
-                        "error",
-                        "database",
-                        format!("任务 {task_id} 完成状态保存失败：{error:#}"),
-                    )
-                    .await;
-            } else if shared.settings.read().await.cloud_upload.enabled {
-                if let Err(error) =
-                    crate::cloud_upload::queue_completed_download(&shared, &task_id).await
-                {
-                    shared
-                        .log(
-                            "warn",
-                            "cloud-upload",
-                            format!("下载已完成，但自动云上传未能排队：{error:#}"),
-                        )
-                        .await;
-                }
-            }
-            shared
-                .log("info", "download", format!("任务 {task_id} 下载并校验完成"))
-                .await;
-        }
-        Err(error) => {
-            let detail = safe_error(&error.to_string());
-            let _ = shared
-                .store
-                .set_status(&task_id, "failed", Some(&detail))
-                .await;
-            shared
-                .log(
-                    "error",
-                    "download",
-                    format!("任务 {task_id} 失败：{detail}"),
-                )
-                .await;
-        }
-    }
-    shared.publish_task(&task_id).await;
-}
 
-struct ActiveGuard {
-    active: Arc<AtomicUsize>,
-    changed: Arc<Notify>,
-}
-impl Drop for ActiveGuard {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-        self.changed.notify_waiters();
+    fn emit(&self, event: &str, payload: serde_json::Value) {
+        let _ = self.shared.app.emit(event, payload);
     }
 }
 
-async fn download_task(
+/// 在活动表上执行暂停:停止 writer/进度监视,状态置 `paused`,并通知页面中止抓取。
+async fn pause_task(
     shared: &SharedState,
+    active: &AsyncMutex<HashMap<String, ActiveDownload>>,
     task_id: &str,
-    token: &CancellationToken,
-    limiter: &Arc<RequestLimiter>,
-    bandwidth: &Arc<BandwidthLimiter>,
-    flood_gate: &Arc<FloodGate>,
-) -> Result<()> {
-    let record = shared
+    reason: &str,
+) -> Result<TaskRecord> {
+    let detached = active.lock().await.remove(task_id);
+    if let Some(entry) = detached {
+        stop_active(entry).await;
+    }
+    let record = require_record(shared, task_id).await?;
+    match record.status.as_str() {
+        "queued" | "downloading" => {
+            shared.store.set_status(task_id, "paused", None).await?;
+        }
+        "paused" => {}
+        other => bail!("该任务当前状态不能暂停:{other}"),
+    }
+    announce_abort(shared, task_id);
+    shared.publish_task(task_id).await;
+    shared
+        .log(
+            "info",
+            DOWNLOAD_LOG_TARGET,
+            format!("任务 {task_id} 已暂停({reason})"),
+        )
+        .await;
+    require_record(shared, task_id).await
+}
+
+/// 取消任务:与暂停相同的收尾,但状态置 `cancelled`,并按设置清理临时分块文件。
+async fn cancel_task(
+    shared: &SharedState,
+    active: &AsyncMutex<HashMap<String, ActiveDownload>>,
+    task_id: &str,
+) -> Result<TaskRecord> {
+    let record = require_record(shared, task_id).await?;
+    if !matches!(record.status.as_str(), "queued" | "downloading" | "paused") {
+        bail!("该任务当前状态不能取消:{}", record.status);
+    }
+    let detached = active.lock().await.remove(task_id);
+    if let Some(entry) = detached {
+        stop_active(entry).await;
+    }
+    shared.store.set_status(task_id, "cancelled", None).await?;
+    announce_abort(shared, task_id);
+    let settings = shared.settings.read().await.clone();
+    if !settings.preserve_partial_files
+        && let Some(output) = record.output_path.as_deref()
+    {
+        let temp = temporary_output_path(Path::new(output), task_id);
+        let _ = tokio::fs::remove_file(temp).await;
+    }
+    shared.publish_task(task_id).await;
+    shared
+        .log(
+            "info",
+            DOWNLOAD_LOG_TARGET,
+            format!("任务 {task_id} 已取消"),
+        )
+        .await;
+    require_record(shared, task_id).await
+}
+
+async fn require_record(shared: &SharedState, task_id: &str) -> Result<TaskRecord> {
+    shared
         .store
         .get(task_id)
         .await?
-        .with_context(|| format!("任务记录不存在：{task_id}"))?;
-    if record.media_type.as_deref() == Some("text") {
-        return save_text_task(shared, &record, token).await;
-    }
-    let service = shared.telegram().await?;
-    let message = service
-        .message_by_id(&record.chat_id, record.message_id.unwrap_or_default())
-        .await?
-        .with_context(|| "Telegram 消息已删除、不可访问或当前账号没有权限")?;
-    let metadata = telegram::message_info(&record.chat_id, &message);
-    if !metadata.downloadable {
-        bail!(
-            "{}",
-            metadata
-                .unavailable_reason
-                .unwrap_or_else(|| "Telegram 媒体不可下载".into())
-        );
-    }
-    let media = message.media().context("Telegram 消息不再包含可下载媒体")?;
-    let location = media
-        .to_raw_input_location()
-        .context("当前媒体没有可用的 Telegram 文件位置")?;
-    let total = media.size().context("Telegram 未返回文件大小")? as u64;
-    if total == 0 {
-        bail!("Telegram 返回了空媒体文件");
-    }
-    if record.total_bytes.is_some_and(|expected| expected != total) {
-        bail!("消息媒体大小已变化；为保护续传文件，任务已停止，请重试任务");
-    }
-    let output = PathBuf::from(record.output_path.clone().context("下载目标路径为空")?);
-    let temp = temporary_output_path(&output, task_id);
-    let settings = shared.settings.read().await.clone();
-    bandwidth.set_limit(settings.concurrency.max_bandwidth_kib.saturating_mul(1024));
-    let chunk_size = (supported_chunk_size_kib(settings.concurrency.chunk_size_kib) as u64) * 1024;
-    if tokio::fs::try_exists(&output).await? {
-        if verified_final_file_matches_chunks(&shared.store, task_id, &output, total).await? {
-            shared.store.update_progress(task_id, total, 0).await?;
-            write_sidecars(&output, &metadata, &settings).await?;
-            return Ok(());
-        }
-        if settings.duplicate_policy != "overwrite" {
-            bail!(
-                "目标文件已存在，且不匹配此任务已校验的分块；为避免覆盖文件，任务已停止：{}",
-                output.display()
-            );
-        }
-    }
-    chunk_writer::configure_chunk_map(&shared.store, task_id, total, chunk_size).await?;
-    let temp_parent = temp.parent().context("临时文件目录无效")?;
-    tokio::fs::create_dir_all(temp_parent).await?;
-    // Validate persisted bytes before spawning child tasks. Any error here then
-    // returns without detaching a writer or progress-event task.
-    chunk_writer::verify_resumable_chunks(&shared.store, task_id, &temp).await?;
-    let rows = shared.store.chunk_map(task_id).await?;
-    let missing = rows
-        .into_iter()
-        .filter(|(_, _, _, complete)| !complete)
-        .map(|(offset, length, _, _)| (offset, length))
-        .collect::<Vec<_>>();
-    let (chunk_tx, chunk_rx) = mpsc::channel(settings.concurrency.per_file_chunks.clamp(1, 16) * 2);
-    let (progress_tx, mut progress_rx) = broadcast::channel(8);
-    let writer_store = shared.store.clone();
-    let writer_id = task_id.to_owned();
-    let writer_path = temp.clone();
-    let writer = tokio::spawn(async move {
-        chunk_writer::write_chunks_bounded(
-            writer_store,
-            writer_id,
-            &writer_path,
-            total,
-            chunk_rx,
-            progress_tx,
-        )
-        .await
-    });
-    let update_shared = shared.app.clone();
-    let store_for_events = shared.store.clone();
-    let id_for_events = task_id.to_owned();
-    let event_watcher = tokio::spawn(async move {
+        .with_context(|| format!("未找到下载任务:{task_id}"))
+}
+
+/// 停止一个活动下载:关闭分块通道并等待 writer/进度监视退出(槽位随结构体释放)。
+async fn stop_active(active: ActiveDownload) {
+    drop(active.sender);
+    let _ = join_download_children(active.writer, active.watcher).await;
+}
+
+fn announce_abort(shared: &SharedState, task_id: &str) {
+    let _ = shared.app.emit(
+        "webview-download-abort",
+        serde_json::json!({ "taskId": task_id }),
+    );
+}
+
+/// 节流后的进度广播:刷新任务页并通知页面按钮。
+fn spawn_progress_watcher(
+    shared: Arc<SharedState>,
+    task_id: String,
+    total_bytes: u64,
+    mut progress_events: broadcast::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let mut dirty = false;
-        let mut tick = tokio::time::interval(Duration::from_millis(350));
+        let mut tick = tokio::time::interval(PROGRESS_TICK);
         loop {
             tokio::select! {
-                event = progress_rx.recv() => match event {
-                    Ok(()) => dirty = true,
-                    Err(broadcast::error::RecvError::Lagged(_)) => dirty = true,
+                event = progress_events.recv() => match event {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => dirty = true,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = tick.tick() => if dirty {
                     dirty = false;
-                    if let Ok(Some(task)) = store_for_events.get(&id_for_events).await {
-                        use tauri::Emitter;
-                        let _ = update_shared.emit("task-updated", task);
-                    }
+                    publish_progress(&shared, &task_id, total_bytes).await;
                 },
             }
         }
-        if let Ok(Some(task)) = store_for_events.get(&id_for_events).await {
-            use tauri::Emitter;
-            let _ = update_shared.emit("task-updated", task);
+        if let Ok(Some(record)) = shared.store.get(&task_id).await {
+            let progress = progress_ratio(record.downloaded_bytes, total_bytes);
+            emit_webview_progress(&shared, &task_id, progress).await;
         }
-    });
+    })
+}
 
-    let location = Arc::new(RwLock::new(location));
-    limiter.set_ceiling(
-        settings.concurrency.max_files.clamp(1, 12)
-            * settings.concurrency.per_file_chunks.clamp(1, 16),
+async fn publish_progress(shared: &SharedState, task_id: &str, total_bytes: u64) {
+    shared.publish_task(task_id).await;
+    if let Ok(Some(record)) = shared.store.get(task_id).await {
+        let progress = progress_ratio(record.downloaded_bytes, total_bytes);
+        emit_webview_progress(shared, task_id, progress).await;
+    }
+}
+
+async fn emit_webview_progress(shared: &SharedState, task_id: &str, progress: f64) {
+    let _ = shared.app.emit(
+        "webview-task-updated",
+        serde_json::json!({ "taskId": task_id, "progress": progress }),
     );
-    let client = service.client().clone();
-    let file_limit = settings.concurrency.per_file_chunks.clamp(1, 16);
-    let timeout = Duration::from_secs(settings.concurrency.request_timeout_seconds.clamp(5, 600));
-    let retries = settings.concurrency.retries.clamp(0, 20);
-    let token_for_chunks = token.clone();
-    let service_for_refresh = Arc::clone(&service);
-    let location_for_chunks = Arc::clone(&location);
-    let bandwidth_for_chunks = Arc::clone(bandwidth);
-    let chat_id = record.chat_id.clone();
-    let message_id = record.message_id.unwrap_or_default();
-    let chunk_stream = stream::iter(missing)
-        .map(|(offset, length)| {
-            let client = client.clone();
-            let token = token_for_chunks.clone();
-            let location = Arc::clone(&location_for_chunks);
-            let service = Arc::clone(&service_for_refresh);
-            let gate = Arc::clone(flood_gate);
-            let limiter = Arc::clone(limiter);
-            let bandwidth = Arc::clone(&bandwidth_for_chunks);
-            let chat_id = chat_id.clone();
-            async move {
-                let data = fetch_chunk(
-                    &client, &service, &chat_id, message_id, total, &location, offset, length,
-                    retries, timeout, &token, &gate, &limiter,
-                )
-                .await?;
-                bandwidth.consume(data.len() as u64, &token).await?;
-                Ok::<IncomingChunk, anyhow::Error>(IncomingChunk { offset, data })
-            }
-        })
-        .buffer_unordered(file_limit);
-    tokio::pin!(chunk_stream);
-    let mut result: Result<()> = Ok(());
-    loop {
-        let chunk = tokio::select! {
-            _ = token.cancelled() => break,
-            chunk = chunk_stream.next() => chunk,
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        match chunk {
-            Ok(chunk) => {
-                if let Err(error) = chunk_tx.send(chunk).await {
-                    result = Err(error.into());
-                    break;
-                }
-            }
-            Err(error) => {
-                result = Err(error);
-                break;
-            }
-        }
+}
+
+fn progress_ratio(downloaded: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (downloaded as f64 / total as f64).clamp(0.0, 1.0)
     }
-    drop(chunk_tx);
-    let writer_result = join_download_children(writer, event_watcher).await;
-    if token.is_cancelled() {
-        let _ = writer_result;
+}
+
+async fn missing_chunk_ranges(store: &TaskStore, task_id: &str) -> Result<Vec<ChunkRange>> {
+    Ok(store
+        .chunk_map(task_id)
+        .await?
+        .into_iter()
+        .filter(|(_, _, _, complete)| !complete)
+        .map(|(offset, length, _, _)| ChunkRange { offset, length })
+        .collect())
+}
+
+/// 提交已完成的分块:先做“目标已是本任务产物”的恢复检查,再原子移动临时文件。
+///
+/// 独立于管理器的自由函数,便于在无 Tauri 运行时的单测里验证提交语义。
+async fn complete_download(
+    store: &TaskStore,
+    task_id: &str,
+    total_bytes: u64,
+    temp_path: &Path,
+    output: &Path,
+    overwrite: bool,
+) -> Result<()> {
+    let chunks = store.chunk_map(task_id).await?;
+    if !chunk_map_is_complete(&chunks, total_bytes) {
+        bail!("分块未完成,请重新打开媒体补齐");
+    }
+    if verified_final_file_matches_chunks(store, task_id, output, total_bytes).await? {
+        // 目标文件已是本任务的完整产物(提交后中断重入):无需再次覆盖。
+        let _ = tokio::fs::remove_file(temp_path).await;
         return Ok(());
     }
-    if let Err(error) = result {
-        let _ = writer_result;
-        return Err(error);
-    }
-    writer_result?;
-    if token.is_cancelled() {
-        return Ok(());
-    }
-    verify_telegram_hashes(
-        service.client(),
-        &service,
-        &record.chat_id,
-        record.message_id.unwrap_or_default(),
-        &location,
-        &temp,
-        total,
-        limiter,
-        flood_gate,
-        token,
-        timeout,
-        retries,
-    )
-    .await?;
-    if token.is_cancelled() {
-        return Ok(());
-    }
-    let overwrite = settings.duplicate_policy == "overwrite";
-    if !overwrite && tokio::fs::try_exists(&output).await? {
-        if verified_final_file_matches_chunks(&shared.store, task_id, &output, total).await? {
-            let _ = tokio::fs::remove_file(&temp).await;
-            write_sidecars(&output, &metadata, &settings).await?;
-            return Ok(());
-        }
+    if !overwrite && tokio::fs::try_exists(output).await? {
         bail!(
-            "目标文件在下载期间被其他文件占用；已验证的临时文件已保留，请移走冲突文件后重试：{}",
+            "目标文件已存在,且不匹配此任务已校验的分块;为避免覆盖文件,任务已停止:{}",
             output.display()
         );
     }
-    chunk_writer::commit_completed_file(&temp, &output, overwrite)?;
-    write_sidecars(&output, &metadata, &settings).await?;
-    Ok(())
-}
-
-async fn save_text_task(
-    shared: &SharedState,
-    record: &TaskRecord,
-    token: &CancellationToken,
-) -> Result<()> {
-    let service = shared.telegram().await?;
-    let message = service
-        .message_by_id(&record.chat_id, record.message_id.unwrap_or_default())
-        .await?
-        .with_context(|| "Telegram 文本消息已删除或当前账号没有权限")?;
-    if message.media().is_some() {
-        bail!("此任务对应的消息已不再是纯文本消息");
-    }
-    let text = message.text();
-    if text.trim().is_empty() {
-        bail!("Telegram 文本消息内容为空");
-    }
-    if record
-        .total_bytes
-        .is_some_and(|expected| expected != text.len() as u64)
-    {
-        bail!("文本消息内容已变化；为避免静默替换旧内容，任务已停止");
-    }
-    let output = PathBuf::from(
-        record
-            .output_path
-            .as_deref()
-            .context("文本任务目标路径为空")?,
-    );
-    let temp = temporary_output_path(&output, &record.task_id);
-    if let Some(parent) = output.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    if let Some(parent) = temp.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut file = File::create(&temp).await?;
-    tokio::select! {
-        _ = token.cancelled() => bail!("文本保存已取消"),
-        result = file.write_all(text.as_bytes()) => result.context("无法写入 Telegram 文本消息")?,
-    }
-    file.sync_all().await?;
-    drop(file);
-    if token.is_cancelled() {
-        bail!("文本保存已取消");
-    }
-    let settings = shared.settings.read().await.clone();
-    if settings.duplicate_policy == "overwrite" && tokio::fs::try_exists(&output).await? {
-        tokio::fs::remove_file(&output).await?;
-    }
-    tokio::fs::rename(&temp, &output)
-        .await
-        .with_context(|| format!("无法提交文本文件：{}", output.display()))?;
-    shared
-        .store
-        .update_progress(&record.task_id, text.len() as u64, 0)
-        .await?;
-    Ok(())
-}
-
-async fn fetch_chunk(
-    client: &grammers_client::Client,
-    service: &TelegramAdapter,
-    chat_id: &str,
-    message_id: i64,
-    total_size: u64,
-    location: &RwLock<tl::enums::InputFileLocation>,
-    offset: u64,
-    length: u64,
-    retries: u32,
-    timeout: Duration,
-    token: &CancellationToken,
-    gate: &Arc<FloodGate>,
-    limiter: &Arc<RequestLimiter>,
-) -> Result<Vec<u8>> {
-    let mut attempt = 0_u32;
-    loop {
-        if token.is_cancelled() {
-            bail!("任务已取消");
-        }
-        gate.wait(token).await?;
-        let _permit = limiter.acquire(token).await?;
-        let location_snapshot = location.read().await.clone();
-        let request = tl::functions::upload::GetFile {
-            precise: true,
-            cdn_supported: false,
-            location: location_snapshot,
-            offset: offset as i64,
-            limit: i32::try_from(length).context("分块长度超出 Telegram API 范围")?,
-        };
-        let response = tokio::select! {
-            _ = token.cancelled() => bail!("任务已取消"),
-            response = tokio::time::timeout(timeout, client.invoke(&request)) => match response {
-                Ok(result) => result,
-                Err(_) => { attempt += 1; if attempt > retries { bail!("Telegram 分块请求超时（偏移 {offset}）"); } tokio::time::sleep(backoff(attempt)).await; continue; }
-            }
-        };
-        match response {
-            Ok(tl::enums::upload::File::File(file)) => {
-                if file.bytes.len() as u64 != length {
-                    attempt += 1;
-                    if attempt > retries {
-                        bail!(
-                            "Telegram 返回了不完整分块，偏移 {offset}，期望 {length} 字节，收到 {} 字节",
-                            file.bytes.len()
-                        );
-                    }
-                    tokio::time::sleep(backoff(attempt)).await;
-                    continue;
-                }
-                limiter.success();
-                return Ok(file.bytes);
-            }
-            Ok(tl::enums::upload::File::CdnRedirect(_)) => bail!(
-                "Telegram 将文件重定向到 CDN；当前版本尚未实现 CDN 加密与哈希验证，任务保持失败以避免保存未验证内容"
-            ),
-            Err(error) if is_file_reference_error(&error) => {
-                attempt += 1;
-                if attempt > retries {
-                    bail!("Telegram 文件引用已失效，重新读取消息后仍无法恢复：{error}");
-                }
-                refresh_location(service, chat_id, message_id, total_size, location).await?;
-            }
-            Err(error) if flood_wait_seconds(&error).is_some() => {
-                let wait = flood_wait_seconds(&error).unwrap_or(1).clamp(1, 86_400);
-                gate.extend(Duration::from_secs(u64::from(wait))).await;
-                limiter.back_off();
-                attempt += 1;
-                if attempt > retries {
-                    bail!("Telegram 限流，等待 {wait} 秒后重试次数已用尽");
-                }
-            }
-            Err(error) => {
-                attempt += 1;
-                if attempt > retries {
-                    bail!("Telegram 分块读取失败（偏移 {offset}）：{error}");
-                }
-                tokio::time::sleep(backoff(attempt)).await;
-            }
-        }
-    }
-}
-
-async fn refresh_location(
-    service: &TelegramAdapter,
-    chat_id: &str,
-    message_id: i64,
-    total_size: u64,
-    location: &RwLock<tl::enums::InputFileLocation>,
-) -> Result<()> {
-    let message = service
-        .message_by_id(chat_id, message_id)
-        .await?
-        .with_context(|| "Telegram 原消息已不可访问，无法刷新文件引用")?;
-    let metadata = telegram::message_info(chat_id, &message);
-    if !metadata.downloadable {
-        bail!(
-            "文件引用失效，且原消息当前不可下载：{}",
-            metadata.unavailable_reason.unwrap_or_default()
-        );
-    }
-    let media = message.media().context("原消息已不包含媒体")?;
-    if media.size().is_none_or(|size| size as u64 != total_size) {
-        bail!("刷新文件引用时发现媒体大小已变化，停止续传以保护文件完整性");
-    }
-    let new_location = media
-        .to_raw_input_location()
-        .context("无法从原消息取得新的 Telegram 文件引用")?;
-    *location.write().await = new_location;
-    Ok(())
-}
-
-async fn verify_telegram_hashes(
-    client: &grammers_client::Client,
-    service: &TelegramAdapter,
-    chat_id: &str,
-    message_id: i64,
-    location: &RwLock<tl::enums::InputFileLocation>,
-    path: &Path,
-    total: u64,
-    limiter: &Arc<RequestLimiter>,
-    gate: &Arc<FloodGate>,
-    token: &CancellationToken,
-    timeout: Duration,
-    retries: u32,
-) -> Result<()> {
-    let mut file = File::open(path).await.context("无法打开待校验临时文件")?;
-    if file.metadata().await?.len() != total {
-        bail!("临时文件长度与 Telegram 元数据不一致");
-    }
-    let mut offset = 0_u64;
-    let mut checked_any = false;
-    let mut rounds = 0;
-    while offset < total && rounds < 4096 {
-        if token.is_cancelled() {
-            bail!("任务已取消");
-        }
-        gate.wait(token).await?;
-        let _permit = limiter.acquire(token).await?;
-        let mut attempt = 0_u32;
-        let hashes: Vec<tl::enums::FileHash> = loop {
-            let _permit = limiter.acquire(token).await?;
-            let request = tl::functions::upload::GetFileHashes {
-                location: location.read().await.clone(),
-                offset: offset as i64,
-            };
-            let response = tokio::select! {
-                _ = token.cancelled() => bail!("任务已取消"),
-                response = tokio::time::timeout(timeout, client.invoke(&request)) => response,
-            };
-            match response {
-                Ok(Ok(hashes)) => {
-                    limiter.success();
-                    break hashes;
-                }
-                Err(_) if attempt < retries => {
-                    attempt += 1;
-                    tokio::select! { _ = token.cancelled() => bail!("任务已取消"), _ = tokio::time::sleep(backoff(attempt)) => {} }
-                }
-                Err(_) => bail!("读取 Telegram 文件校验信息超时（偏移 {offset}）"),
-                Ok(Err(error)) if is_file_reference_error(&error) && attempt < retries => {
-                    attempt += 1;
-                    refresh_location(service, chat_id, message_id, total, location).await?;
-                }
-                Ok(Err(error)) if flood_wait_seconds(&error).is_some() && attempt < retries => {
-                    let wait = flood_wait_seconds(&error).unwrap_or(1).clamp(1, 86_400);
-                    gate.extend(Duration::from_secs(u64::from(wait))).await;
-                    limiter.back_off();
-                    attempt += 1;
-                }
-                Ok(Err(error)) => return Err(error).context("Telegram 分块哈希读取失败"),
-            }
-        };
-        if hashes.is_empty() {
-            break;
-        }
-        let previous = offset;
-        for item in hashes {
-            let tl::enums::FileHash::Hash(item) = item;
-            if item.offset < 0 || item.limit <= 0 {
-                bail!("Telegram 返回无效的文件校验范围");
-            }
-            let part_offset = item.offset as u64;
-            let part_len = item.limit as u64;
-            if part_offset.saturating_add(part_len) > total {
-                bail!("Telegram 返回的文件校验范围超出文件长度");
-            }
-            let mut bytes = vec![0_u8; part_len as usize];
-            file.seek(SeekFrom::Start(part_offset)).await?;
-            file.read_exact(&mut bytes).await?;
-            let digest = Sha256::digest(&bytes);
-            if digest.as_slice() != item.hash.as_slice() {
-                bail!("Telegram SHA-256 文件分块校验失败（偏移 {part_offset}）");
-            }
-            checked_any = true;
-            offset = offset.max(part_offset.saturating_add(part_len));
-        }
-        rounds += 1;
-        if offset <= previous {
-            break;
-        }
-    }
-    if rounds >= 4096 {
-        bail!("Telegram 文件哈希响应数量超出保护上限");
-    }
-    if !checked_any {
-        tracing::warn!(
-            "Telegram 未为本文件提供 SHA-256 哈希；任务仍按完整长度及本地持久分块摘要校验"
-        );
-    }
-    Ok(())
-}
-
-fn flood_wait_seconds(error: &InvocationError) -> Option<u32> {
-    match error {
-        InvocationError::Rpc(rpc) if rpc.is("FLOOD_WAIT_*") => rpc.value,
-        _ => None,
-    }
-}
-fn is_file_reference_error(error: &InvocationError) -> bool {
-    matches!(error, InvocationError::Rpc(rpc) if rpc.is("FILE_REFERENCE_EXPIRED") || rpc.is("FILE_REFERENCE_INVALID") || rpc.is("FILE_REFERENCE_*"))
-}
-fn backoff(attempt: u32) -> Duration {
-    Duration::from_millis(350_u64.saturating_mul(1_u64 << attempt.min(5)))
-}
-fn safe_error(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(700)
-        .collect()
-}
-fn supported_chunk_size_kib(requested: usize) -> usize {
-    [64_usize, 128, 256, 512, 1024]
-        .into_iter()
-        .min_by_key(|candidate| candidate.abs_diff(requested.clamp(64, 1024)))
-        .unwrap_or(512)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn record(id: &str, output_path: &Path, total_bytes: u64) -> TaskRecord {
-        TaskRecord {
-            task_id: id.into(),
-            chat_id: "-1".into(),
-            chat_title: Some("chat".into()),
-            message_id: Some(1),
-            media_type: Some("document".into()),
-            file_name: Some("media.bin".into()),
-            status: "queued".into(),
-            progress: 0.0,
-            downloaded_bytes: 0,
-            total_bytes: Some(total_bytes),
-            speed_bytes_per_second: 0,
-            remaining_bytes: Some(total_bytes),
-            started_at: None,
-            updated_at: None,
-            completed_at: None,
-            output_path: Some(output_path.to_string_lossy().into_owned()),
-            error: None,
-            retry_count: 0,
-            group_id: None,
-        }
-    }
-
-    #[test]
-    fn chunk_sizes_stay_aligned_to_telegram_megabyte_boundaries() {
-        for requested in [64, 80, 127, 192, 300, 600, 1024, 2048] {
-            let chosen = supported_chunk_size_kib(requested);
-            assert!([64, 128, 256, 512, 1024].contains(&chosen));
-            assert_eq!(1024 % chosen, 0);
-        }
-    }
-
-    #[test]
-    fn batch_limit_allows_exactly_the_configured_cap() {
-        let mut created = 0;
-        while !batch_limit_reached(created) {
-            created += 1;
-        }
-        assert_eq!(created, MAX_BATCH_TASKS);
-        assert!(batch_limit_reached(created));
-    }
-
-    #[test]
-    fn duplicate_skip_policy_returns_a_skip_decision() {
-        let dir = tempdir().unwrap();
-        let existing = dir.path().join("existing.bin");
-        std::fs::write(&existing, b"already here").unwrap();
-
-        assert!(
-            apply_duplicate_policy(&existing, "skip", 12)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            apply_duplicate_policy(&existing, "overwrite", 12).unwrap(),
-            Some(existing.clone())
-        );
-        assert!(
-            apply_duplicate_policy(&dir.path().join("new.bin"), "skip", 12)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn legacy_all_format_is_a_wildcard_instead_of_filtering_every_file() {
-        assert!(matches_file_format("clip.mp4", &["all".into()]));
-        assert!(matches_file_format("clip.mp4", &["*".into()]));
-        assert!(matches_file_format("clip.MP4", &[".mp4".into()]));
-        assert!(!matches_file_format("clip.mkv", &["mp4".into()]));
-    }
-
-    #[test]
-    fn resumable_temporary_file_stays_next_to_final_target_for_atomic_commit() {
-        let root = tempdir().unwrap();
-        let output = root.path().join("nested").join("media.bin");
-        let partial = temporary_output_path(&output, "task-123");
-        assert_eq!(partial.parent(), output.parent());
-        assert_eq!(
-            partial.file_name().unwrap().to_str().unwrap(),
-            ".telegram-media-task-123.part"
-        );
-    }
-
-    #[test]
-    fn output_path_applies_user_date_format_to_folder_and_filename_tokens() {
-        let root = tempdir().unwrap();
-        let mut settings = Settings::default();
-        settings.download_root = root.path().to_string_lossy().into_owned();
-        settings.path_template = "{chat}/{media_datetime}".into();
-        settings.file_name_template = "{media_datetime}_{message_id}_{name}".into();
-        settings.date_format = "%Y_%m".into();
-        let info = MessageInfo {
-            chat_id: "-1".into(),
-            message_id: 17,
-            media_type: Some("document".into()),
-            file_name: Some("report.pdf".into()),
-            caption: None,
-            text: None,
-            size_bytes: None,
-            media_width: None,
-            media_height: None,
-            media_duration: None,
-            file_extension: Some("pdf".into()),
-            sender_id: None,
-            sender_name: None,
-            reply_to_message_id: None,
-            message_thread_id: None,
-            date: None,
-            group_id: None,
-            downloadable: true,
-            unavailable_reason: None,
-        };
-        let date = chrono::DateTime::parse_from_rfc3339("2024-03-09T00:00:00Z")
-            .unwrap()
-            .to_utc();
-
-        let path = output_path(&settings, "sample-chat", "report.pdf", &info, date);
-        assert_eq!(path.parent().unwrap().file_name().unwrap(), "2024_03");
-        assert_eq!(path.file_name().unwrap(), "2024_03_17_report.pdf");
-    }
-
-    #[tokio::test]
-    async fn existing_final_file_is_recovered_only_when_all_chunk_hashes_match() {
-        let dir = tempdir().unwrap();
-        let store = crate::task_store::TaskStore::open(&dir.path().join("tasks.sqlite"))
-            .await
-            .unwrap();
-        let output = dir.path().join("recovered.bin");
-        let contents = (0..2048)
-            .map(|value| (value % 251) as u8)
-            .collect::<Vec<_>>();
-        store
-            .create(&record("recovery-task", &output, contents.len() as u64))
-            .await
-            .unwrap();
-        store
-            .set_chunks("recovery-task", contents.len() as u64, 1024)
-            .await
-            .unwrap();
-        for (offset, bytes) in contents.chunks(1024).enumerate() {
-            store
-                .complete_chunk(
-                    "recovery-task",
-                    (offset * 1024) as u64,
-                    &blake3::hash(bytes).to_hex().to_string(),
-                )
-                .await
-                .unwrap();
-        }
-        tokio::fs::write(&output, &contents).await.unwrap();
-
-        assert!(
-            verified_final_file_matches_chunks(
-                &store,
-                "recovery-task",
-                &output,
-                contents.len() as u64
-            )
-            .await
-            .unwrap()
-        );
-
-        tokio::fs::write(&output, vec![0; contents.len()])
-            .await
-            .unwrap();
-        assert!(
-            !verified_final_file_matches_chunks(
-                &store,
-                "recovery-task",
-                &output,
-                contents.len() as u64
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            store
-                .chunk_map("recovery-task")
-                .await
-                .unwrap()
-                .iter()
-                .all(|(_, _, _, complete)| *complete)
-        );
-    }
-
-    #[tokio::test]
-    async fn cancellation_cleanup_joins_writer_and_aborted_event_watcher() {
-        struct DropFlag(Arc<AtomicBool>);
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-
-        let watcher_dropped = Arc::new(AtomicBool::new(false));
-        let watcher_flag = Arc::clone(&watcher_dropped);
-        let (watcher_started_tx, watcher_started_rx) = oneshot::channel();
-        let event_watcher = tokio::spawn(async move {
-            let _drop_flag = DropFlag(watcher_flag);
-            let _ = watcher_started_tx.send(());
-            futures_util::future::pending::<()>().await;
-        });
-        watcher_started_rx.await.unwrap();
-        let (sender, mut receiver) = mpsc::channel::<()>(1);
-        let writer = tokio::spawn(async move {
-            while receiver.recv().await.is_some() {}
-            Ok::<_, anyhow::Error>(17_u8)
-        });
-        drop(sender);
-
-        assert_eq!(
-            join_download_children(writer, event_watcher).await.unwrap(),
-            17
-        );
-        assert!(watcher_dropped.load(Ordering::Acquire));
-    }
-}
-
-#[derive(Default)]
-struct FloodGate {
-    blocked_until: Mutex<Option<Instant>>,
-}
-impl FloodGate {
-    async fn extend(&self, duration: Duration) {
-        let until = Instant::now() + duration;
-        let mut current = self.blocked_until.lock().await;
-        if current.is_none_or(|saved| saved < until) {
-            *current = Some(until);
-        }
-    }
-    async fn wait(&self, token: &CancellationToken) -> Result<()> {
-        loop {
-            let remaining = self
-                .blocked_until
-                .lock()
-                .await
-                .and_then(|until| until.checked_duration_since(Instant::now()));
-            let Some(remaining) = remaining.filter(|duration| !duration.is_zero()) else {
-                return Ok(());
-            };
-            tokio::select! { _ = token.cancelled() => bail!("任务已取消"), _ = tokio::time::sleep(remaining) => {} }
-        }
-    }
-}
-
-struct RequestLimiter {
-    active: AtomicUsize,
-    current: AtomicUsize,
-    ceiling: AtomicUsize,
-    consecutive_successes: AtomicUsize,
-    changed: Notify,
-}
-impl RequestLimiter {
-    fn new(initial: usize) -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            current: AtomicUsize::new(initial),
-            ceiling: AtomicUsize::new(initial),
-            consecutive_successes: AtomicUsize::new(0),
-            changed: Notify::new(),
-        }
-    }
-    fn set_ceiling(&self, value: usize) {
-        let value = value.clamp(1, 60);
-        self.ceiling.store(value, Ordering::Release);
-        self.current.fetch_min(value, Ordering::AcqRel);
-        self.changed.notify_waiters();
-    }
-    fn back_off(&self) {
-        let now = self.current.load(Ordering::Acquire);
-        self.current.store((now / 2).max(1), Ordering::Release);
-        self.consecutive_successes.store(0, Ordering::Release);
-        self.changed.notify_waiters();
-    }
-    fn success(&self) {
-        if self.consecutive_successes.fetch_add(1, Ordering::AcqRel) >= 31 {
-            self.consecutive_successes.store(0, Ordering::Release);
-            let ceiling = self.ceiling.load(Ordering::Acquire);
-            let _ = self
-                .current
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    Some((current + 1).min(ceiling))
-                });
-            self.changed.notify_waiters();
-        }
-    }
-    async fn acquire(self: &Arc<Self>, token: &CancellationToken) -> Result<LimiterPermit> {
-        loop {
-            if token.is_cancelled() {
-                bail!("任务已取消");
-            }
-            let max = self.current.load(Ordering::Acquire);
-            let current = self.active.load(Ordering::Acquire);
-            if current < max
-                && self
-                    .active
-                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                return Ok(LimiterPermit(Arc::clone(self)));
-            }
-            tokio::select! { _ = token.cancelled() => bail!("任务已取消"), _ = self.changed.notified() => {}, _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
-        }
-    }
-}
-struct LimiterPermit(Arc<RequestLimiter>);
-impl Drop for LimiterPermit {
-    fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::AcqRel);
-        self.0.changed.notify_waiters();
-    }
-}
-
-struct BandwidthLimiter {
-    bytes_per_second: AtomicUsize,
-    state: Mutex<BandwidthBucket>,
-}
-struct BandwidthBucket {
-    tokens: f64,
-    updated: Instant,
-}
-impl Default for BandwidthLimiter {
-    fn default() -> Self {
-        Self {
-            bytes_per_second: AtomicUsize::new(0),
-            state: Mutex::new(BandwidthBucket {
-                tokens: 0.0,
-                updated: Instant::now(),
-            }),
-        }
-    }
-}
-impl BandwidthLimiter {
-    fn set_limit(&self, bytes_per_second: u64) {
-        self.bytes_per_second.store(
-            bytes_per_second.min(usize::MAX as u64) as usize,
-            Ordering::Release,
-        );
-    }
-    async fn consume(&self, bytes: u64, token: &CancellationToken) -> Result<()> {
-        let mut remaining = bytes as f64;
-        loop {
-            if token.is_cancelled() {
-                bail!("任务已取消");
-            }
-            let rate = self.bytes_per_second.load(Ordering::Acquire) as f64;
-            if rate <= 0.0 {
-                return Ok(());
-            }
-            let mut bucket = self.state.lock().await;
-            let now = Instant::now();
-            let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
-            bucket.tokens = (bucket.tokens + elapsed * rate).min(rate);
-            bucket.updated = now;
-            let take = bucket.tokens.min(remaining);
-            bucket.tokens -= take;
-            remaining -= take;
-            if remaining <= 0.0 {
-                return Ok(());
-            }
-            let wait = Duration::from_secs_f64(
-                ((1.0 - bucket.tokens).max(0.001) / rate).clamp(0.001, 0.25),
-            );
-            drop(bucket);
-            tokio::select! { _ = token.cancelled() => bail!("任务已取消"), _ = tokio::time::sleep(wait) => {} }
-        }
-    }
-}
-
-pub async fn create_task_for_message(
-    shared: &SharedState,
-    manager: &DownloadManager,
-    chat_id: &str,
-    message_id: i64,
-    requested_type: Option<&str>,
-) -> Result<TaskRecord> {
-    create_task_for_message_if_needed(shared, manager, chat_id, message_id, requested_type)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("目标文件已存在，按“跳过”策略未创建下载任务"))
-}
-
-async fn create_task_for_message_if_needed(
-    shared: &SharedState,
-    manager: &DownloadManager,
-    chat_id: &str,
-    message_id: i64,
-    requested_type: Option<&str>,
-) -> Result<Option<TaskRecord>> {
-    if requested_type == Some("text") {
-        return create_text_task_for_message_if_needed(shared, manager, chat_id, message_id).await;
-    }
-    let service = shared.telegram().await?;
-    let message = service
-        .message_by_id(chat_id, message_id)
-        .await?
-        .with_context(|| "消息已删除或当前账号没有权限")?;
-    let info = telegram::message_info(chat_id, &message);
-    if !info.downloadable {
-        bail!(
-            "{}",
-            info.unavailable_reason
-                .unwrap_or_else(|| "此消息不可下载".into())
-        );
-    }
-    if requested_type.is_some_and(|kind| info.media_type.as_deref() != Some(kind)) {
-        bail!("页面提供的媒体类型与 Telegram 消息实际类型不一致");
-    }
-    let settings = shared.settings.read().await.clone();
-    let title = message
-        .peer()
-        .and_then(|peer| peer.name())
-        .unwrap_or("Telegram 聊天")
-        .to_owned();
-    let file_name = info
-        .file_name
-        .clone()
-        .unwrap_or_else(|| format!("telegram_{}", message.id()));
-    let size = info.size_bytes.context("Telegram 未提供媒体大小")?;
-    let target = output_path(&settings, &title, &file_name, &info, message.date());
-    let Some(target) = apply_duplicate_policy(&target, &settings.duplicate_policy, size)? else {
-        return Ok(None);
-    };
-    let record = TaskRecord {
-        task_id: uuid::Uuid::new_v4().to_string(),
-        chat_id: chat_id.to_owned(),
-        chat_title: Some(title),
-        message_id: Some(message_id),
-        media_type: info.media_type.clone(),
-        file_name: Some(
-            target
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        status: "queued".into(),
-        progress: 0.0,
-        downloaded_bytes: 0,
-        total_bytes: Some(size),
-        speed_bytes_per_second: 0,
-        remaining_bytes: Some(size),
-        started_at: None,
-        updated_at: Some(chrono::Utc::now().to_rfc3339()),
-        completed_at: None,
-        output_path: Some(target.to_string_lossy().into_owned()),
-        error: None,
-        retry_count: 0,
-        group_id: info.group_id,
-    };
-    shared.store.create(&record).await?;
-    manager.enqueue(record.task_id.clone()).await?;
-    shared.publish_task(&record.task_id).await;
-    shared
-        .log(
-            "info",
-            "download",
-            format!(
-                "已排入下载：{}",
-                record.file_name.as_deref().unwrap_or("媒体文件")
-            ),
-        )
-        .await;
-    Ok(Some(record))
-}
-
-async fn create_text_task_for_message_if_needed(
-    shared: &SharedState,
-    manager: &DownloadManager,
-    chat_id: &str,
-    message_id: i64,
-) -> Result<Option<TaskRecord>> {
-    let service = shared.telegram().await?;
-    let message = service
-        .message_by_id(chat_id, message_id)
-        .await?
-        .with_context(|| "Telegram 文本消息已删除或当前账号没有权限")?;
-    if message.media().is_some() {
-        bail!("此消息不是纯文本消息，不能作为文本文件保存");
-    }
-    let text = message.text();
-    if text.trim().is_empty() {
-        bail!("Telegram 文本消息内容为空");
-    }
-    let source_info = telegram::message_info(chat_id, &message);
-    if source_info
-        .unavailable_reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("受保护") || reason.contains("限时"))
-    {
-        bail!("此消息属于受保护或限时内容，不能保存");
-    }
-    let mut path_info = source_info;
-    path_info.media_type = Some("msg".into());
-    path_info.file_name = Some(format!("message_{message_id}.txt"));
-    path_info.caption = None;
-    let settings = shared.settings.read().await.clone();
-    if !settings.text_sidecar {
-        bail!("请先在设置中启用纯文本消息保存");
-    }
-    let title = message
-        .peer()
-        .and_then(|peer| peer.name())
-        .unwrap_or("Telegram 聊天")
-        .to_owned();
-    let file_name = path_info.file_name.as_deref().unwrap_or("message.txt");
-    let target = output_path(&settings, &title, file_name, &path_info, message.date());
-    let Some(target) =
-        apply_duplicate_policy(&target, &settings.duplicate_policy, text.len() as u64)?
-    else {
-        return Ok(None);
-    };
-    let record = TaskRecord {
-        task_id: uuid::Uuid::new_v4().to_string(),
-        chat_id: chat_id.to_owned(),
-        chat_title: Some(title),
-        message_id: Some(message_id),
-        media_type: Some("text".into()),
-        file_name: Some(
-            target
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        status: "queued".into(),
-        progress: 0.0,
-        downloaded_bytes: 0,
-        total_bytes: Some(text.len() as u64),
-        speed_bytes_per_second: 0,
-        remaining_bytes: Some(text.len() as u64),
-        started_at: None,
-        updated_at: Some(chrono::Utc::now().to_rfc3339()),
-        completed_at: None,
-        output_path: Some(target.to_string_lossy().into_owned()),
-        error: None,
-        retry_count: 0,
-        group_id: None,
-    };
-    shared.store.create(&record).await?;
-    manager.enqueue(record.task_id.clone()).await?;
-    shared.publish_task(&record.task_id).await;
-    Ok(Some(record))
-}
-
-pub async fn create_chat_tasks(
-    shared: &SharedState,
-    manager: &DownloadManager,
-    chat_id: &str,
-    start_id: Option<i64>,
-    end_id: Option<i64>,
-    media_types: &[String],
-    file_formats: &std::collections::BTreeMap<String, Vec<String>>,
-    filter: Option<&str>,
-) -> Result<usize> {
-    let service = shared.telegram().await?;
-    let mut cursor = 0_i64;
-    let mut created = 0_usize;
-    let mut skipped = 0_usize;
-    let mut limit_reached = false;
-    let lower = start_id.unwrap_or(1).min(end_id.unwrap_or(i64::MAX));
-    let upper = start_id.unwrap_or(i64::MAX).max(end_id.unwrap_or(1));
-    let wanted = media_types
-        .iter()
-        .map(|item| item.to_lowercase())
-        .collect::<Vec<_>>();
-    let query = filter.unwrap_or_default().trim();
-    let settings = shared.settings.read().await.clone();
-    if !query.is_empty() {
-        crate::filter::validate(query).context("下载范围中的筛选表达式无效")?;
-    }
-    loop {
-        let (items, next, more) = service.messages(chat_id, cursor, 100).await?;
-        if items.is_empty() {
-            break;
-        }
-        let mut reached_start = false;
-        for item in items {
-            let id = item.message_id;
-            if id < lower {
-                reached_start = true;
-                break;
-            }
-            if id > upper {
-                continue;
-            }
-            if item.media_type.is_none() {
-                if !item
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| !text.trim().is_empty())
-                {
-                    continue;
-                }
-                if !settings.text_sidecar {
-                    continue;
-                }
-                if !query.is_empty()
-                    && !evaluate(query, &FilterMetadata::from_message(&item))
-                        .context("按旧版消息筛选表达式计算失败")?
-                {
-                    continue;
-                }
-                if batch_limit_reached(created) {
-                    limit_reached = true;
-                    break;
-                }
-                match create_text_task_for_message_if_needed(shared, manager, chat_id, id).await? {
-                    Some(_) => created += 1,
-                    None => skipped += 1,
-                }
-                continue;
-            }
-            if !item.downloadable {
-                continue;
-            }
-            let Some(kind) = item.media_type.as_deref() else {
-                continue;
-            };
-            if !wanted.is_empty() && !wanted.iter().any(|wanted| wanted == kind) {
-                continue;
-            }
-            let name = item.file_name.as_deref().unwrap_or_default();
-            if !query.is_empty()
-                && !evaluate(query, &FilterMetadata::from_message(&item))
-                    .context("按旧版消息筛选表达式计算失败")?
-            {
-                continue;
-            }
-            if let Some(extensions) = file_formats.get(kind)
-                && !matches_file_format(name, extensions)
-            {
-                continue;
-            }
-            if batch_limit_reached(created) {
-                limit_reached = true;
-                break;
-            }
-            match create_task_for_message_if_needed(shared, manager, chat_id, id, Some(kind))
-                .await?
-            {
-                Some(_) => created += 1,
-                None => skipped += 1,
-            }
-        }
-        if reached_start || !more || limit_reached {
-            break;
-        }
-        cursor = next.context("Telegram 消息分页没有返回游标")?;
-    }
-    if skipped > 0 {
-        shared
-            .log(
-                "info",
-                "download",
-                format!("按重复文件“跳过”策略略过 {skipped} 个媒体"),
-            )
-            .await;
-    }
-    if limit_reached {
-        shared
-            .log(
-                "warn",
-                "download",
-                format!("单次范围达到 {MAX_BATCH_TASKS} 个任务上限；其余匹配媒体未入队"),
-            )
-            .await;
-    }
-    Ok(created)
-}
-
-fn batch_limit_reached(created: usize) -> bool {
-    created >= MAX_BATCH_TASKS
-}
-
-fn output_path(
-    settings: &Settings,
-    chat_title: &str,
-    file_name: &str,
-    info: &MessageInfo,
-    date: chrono::DateTime<chrono::Utc>,
-) -> PathBuf {
-    let root = PathBuf::from(&settings.download_root);
-    let replacements = [
-        ("{chat}", chat_title.to_owned()),
-        ("{year}", date.format("%Y").to_string()),
-        ("{month}", date.format("%m").to_string()),
-        ("{date}", date.format("%Y%m%d_%H%M%S").to_string()),
-        (
-            "{media_datetime}",
-            date.format(&settings.date_format).to_string(),
-        ),
-        ("{message_id}", info.message_id.to_string()),
-        ("{name}", file_name.to_owned()),
-        ("{caption}", info.caption.clone().unwrap_or_default()),
-        (
-            "{media_type}",
-            info.media_type.clone().unwrap_or_else(|| "media".into()),
-        ),
-    ];
-    let mut relative = settings.path_template.clone();
-    for (key, value) in &replacements {
-        relative = relative.replace(key, value);
-    }
-    let segments = relative
-        .split(['/', '\\'])
-        .filter(|part| !part.trim().is_empty())
-        .map(safe_component)
-        .collect::<Vec<_>>();
-    let mut directory = root;
-    for segment in segments {
-        directory.push(segment);
-    }
-    let mut filename = settings.file_name_template.clone();
-    for (key, value) in &replacements {
-        filename = filename.replace(key, value);
-    }
-    filename = safe_component(&filename);
-    let original_ext = Path::new(file_name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_owned);
-    if original_ext.is_some() && Path::new(&filename).extension().is_none() {
-        filename.push('.');
-        filename.push_str(original_ext.as_deref().unwrap_or_default());
-    }
-    directory.join(filename)
+    chunk_writer::commit_completed_file(temp_path, output, overwrite)
 }
 
 async fn verified_final_file_matches_chunks(
-    store: &crate::task_store::TaskStore,
+    store: &TaskStore,
     task_id: &str,
     path: &Path,
     total_bytes: u64,
@@ -1665,7 +781,6 @@ async fn verified_final_file_matches_chunks(
     if !metadata.is_file() || metadata.len() != total_bytes {
         return Ok(false);
     }
-
     let chunks = store.chunk_map(task_id).await?;
     if !chunk_map_is_complete(&chunks, total_bytes) {
         return Ok(false);
@@ -1675,11 +790,6 @@ async fn verified_final_file_matches_chunks(
         let Some(digest) = digest else {
             return Ok(false);
         };
-        // Chunk sizes are bounded by the Telegram request layer. Keep that
-        // bound here too in case the persisted database is damaged.
-        if length > 1_048_576 {
-            return Ok(false);
-        }
         let mut bytes = vec![0_u8; length as usize];
         file.seek(SeekFrom::Start(offset)).await?;
         match file.read_exact(&mut bytes).await {
@@ -1702,7 +812,7 @@ fn chunk_map_is_complete(chunks: &[(u64, u64, Option<String>, bool)], total_byte
     for (offset, length, digest, complete) in chunks {
         if *offset != expected_offset
             || *length == 0
-            || *length > 1_048_576
+            || *length > MAX_CHUNK_BYTES
             || digest.is_none()
             || !complete
         {
@@ -1717,12 +827,88 @@ fn chunk_map_is_complete(chunks: &[(u64, u64, Option<String>, bool)], total_byte
 }
 
 async fn join_download_children<T>(
-    writer: tokio::task::JoinHandle<Result<T>>,
-    event_watcher: tokio::task::JoinHandle<()>,
+    writer: JoinHandle<Result<T>>,
+    watcher: JoinHandle<()>,
 ) -> Result<T> {
-    event_watcher.abort();
-    let _ = event_watcher.await;
+    watcher.abort();
+    let _ = watcher.await;
     writer.await.context("分块写入线程异常退出")?
+}
+
+/// 校验页面提交的文件名:去空白,限制长度,拒绝控制字符。
+fn validate_file_name(raw: &str) -> Result<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        bail!("文件名不能为空");
+    }
+    if name.chars().count() > MAX_FILE_NAME_CHARS {
+        bail!("文件名超过 {MAX_FILE_NAME_CHARS} 个字符");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("文件名包含控制字符");
+    }
+    Ok(name.to_owned())
+}
+
+fn normalize_file_type(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().count() > MAX_FILE_TYPE_CHARS
+        || trimmed.chars().any(char::is_control)
+    {
+        return "media".to_owned();
+    }
+    trimmed.to_owned()
+}
+
+fn summarize_source(source: &str) -> String {
+    safe_error(source)
+        .chars()
+        .take(MAX_SOURCE_SUMMARY_CHARS)
+        .collect()
+}
+
+/// 目标路径 = `download_root` + 净化后的文件名,再按重复策略决定跳过/改名/覆盖。
+fn resolve_download_target(root: &Path, sanitized_name: &str, policy: &str) -> Result<PathBuf> {
+    let target = root.join(sanitized_name);
+    let Some(resolved) = apply_duplicate_policy(&target, policy)? else {
+        bail!("目标文件已存在(按跳过策略)");
+    };
+    Ok(resolved)
+}
+
+fn apply_duplicate_policy(path: &Path, policy: &str) -> Result<Option<PathBuf>> {
+    if !path.exists() || policy == "overwrite" {
+        return Ok(Some(path.to_owned()));
+    }
+    if policy == "skip" {
+        return Ok(None);
+    }
+    let parent = path.parent().context("目标路径无父目录")?;
+    let name = path.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = path
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned());
+    for suffix in 1..=MAX_DUPLICATE_NAME_ATTEMPTS {
+        let candidate = parent.join(match &ext {
+            Some(ext) => format!("{name} ({suffix}).{ext}"),
+            None => format!("{name} ({suffix})"),
+        });
+        if !candidate.exists() {
+            return Ok(Some(candidate));
+        }
+    }
+    bail!("无法为重复文件生成不冲突的名称")
+}
+
+/// 页面探明的大小必须与本地记录一致,否则已有分块无法安全续传。
+fn ensure_total_matches(recorded: Option<u64>, probed: u64) -> Result<()> {
+    if let Some(recorded) = recorded
+        && recorded != probed
+    {
+        bail!("文件大小与此前记录不符,停止续传以保护数据");
+    }
+    Ok(())
 }
 
 fn safe_component(value: &str) -> String {
@@ -1748,77 +934,282 @@ fn temporary_output_path(output: &Path, task_id: &str) -> PathBuf {
     output.with_file_name(format!(".telegram-media-{task_id}.part"))
 }
 
-fn apply_duplicate_policy(
-    path: &Path,
-    policy: &str,
-    expected_size: u64,
-) -> Result<Option<PathBuf>> {
-    if !path.exists() || policy == "overwrite" {
-        return Ok(Some(path.to_owned()));
-    }
-    if policy == "skip" {
-        return Ok(None);
-    }
-    let parent = path.parent().context("目标路径无父目录")?;
-    let name = path.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = path
-        .extension()
-        .map(|value| value.to_string_lossy().into_owned());
-    for suffix in 1..=100_000_u32 {
-        let candidate = parent.join(match &ext {
-            Some(ext) => format!("{name} ({suffix}).{ext}"),
-            None => format!("{name} ({suffix})"),
-        });
-        if !candidate.exists() {
-            return Ok(Some(candidate));
-        }
-        if std::fs::metadata(&candidate).is_ok_and(|metadata| metadata.len() == expected_size) {
-            continue;
-        }
-    }
-    bail!("无法为重复文件生成不冲突的名称")
+fn chunk_queue_depth(per_file_chunks: usize) -> usize {
+    per_file_chunks.clamp(MIN_PER_FILE_CHUNKS, MAX_PER_FILE_CHUNKS) * 2
 }
 
-async fn write_sidecars(output: &Path, info: &MessageInfo, settings: &Settings) -> Result<()> {
-    let text = info
-        .caption
-        .as_deref()
-        .filter(|value| !value.trim().is_empty());
-    if settings.caption_sidecar {
-        if let Some(text) = text {
-            let path = output.with_extension(format!(
-                "{}.caption.txt",
-                output.extension().and_then(|e| e.to_str()).unwrap_or("")
-            ));
-            tokio::fs::write(path, text).await?;
-        }
-    }
-    Ok(())
-}
-
-fn matches_file_format(file_name: &str, allowed: &[String]) -> bool {
-    if allowed.is_empty()
-        || allowed.iter().any(|value| {
-            matches!(
-                value
-                    .trim()
-                    .trim_start_matches('.')
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "all" | "*"
-            )
+fn supported_chunk_size_kib(requested: usize) -> usize {
+    CHUNK_SIZE_KIB_CHOICES
+        .into_iter()
+        .min_by_key(|candidate| {
+            candidate.abs_diff(requested.clamp(MIN_CHUNK_SIZE_KIB, MAX_CHUNK_SIZE_KIB))
         })
-    {
-        return true;
+        .unwrap_or(512)
+}
+
+fn safe_error(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(700)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn record(id: &str, output_path: &Path) -> TaskRecord {
+        TaskRecord {
+            task_id: id.into(),
+            chat_id: String::new(),
+            chat_title: None,
+            message_id: None,
+            media_type: Some("document".into()),
+            file_name: Some("media.bin".into()),
+            status: "queued".into(),
+            progress: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: None,
+            speed_bytes_per_second: 0,
+            remaining_bytes: None,
+            started_at: None,
+            updated_at: None,
+            completed_at: None,
+            output_path: Some(output_path.to_string_lossy().into_owned()),
+            error: None,
+            retry_count: 0,
+            group_id: None,
+        }
     }
-    let extension = Path::new(file_name)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    allowed.iter().any(|value| {
-        value
-            .trim()
-            .trim_start_matches('.')
-            .eq_ignore_ascii_case(extension)
-    })
+
+    /// 写入内容并为每个分块登记 BLAKE3 摘要,模拟 writer 正常收尾后的现场。
+    async fn seed_complete_task(
+        store: &TaskStore,
+        task_id: &str,
+        output: &Path,
+        contents: &[u8],
+        chunk_size: u64,
+    ) -> PathBuf {
+        store.create(&record(task_id, output)).await.unwrap();
+        chunk_writer::configure_chunk_map(store, task_id, contents.len() as u64, chunk_size)
+            .await
+            .unwrap();
+        let temp = temporary_output_path(output, task_id);
+        tokio::fs::write(&temp, contents).await.unwrap();
+        for (index, bytes) in contents.chunks(chunk_size as usize).enumerate() {
+            store
+                .complete_chunk(
+                    task_id,
+                    index as u64 * chunk_size,
+                    blake3::hash(bytes).to_hex().as_str(),
+                )
+                .await
+                .unwrap();
+        }
+        temp
+    }
+
+    #[test]
+    fn file_name_validation_rejects_empty_oversized_and_control_names() {
+        assert!(validate_file_name("   ").is_err());
+        assert!(validate_file_name("").is_err());
+        assert_eq!(validate_file_name("  clip.mp4  ").unwrap(), "clip.mp4");
+        assert!(validate_file_name(&"x".repeat(MAX_FILE_NAME_CHARS)).is_ok());
+        assert!(validate_file_name(&"x".repeat(MAX_FILE_NAME_CHARS + 1)).is_err());
+        assert!(validate_file_name("bad\u{7}name.bin").is_err());
+        assert!(validate_file_name("line\nbreak.bin").is_err());
+        // 路径分隔符由 safe_component 净化,不会逃出下载目录。
+        assert_eq!(safe_component("a/b\\c.bin"), "a_b_c.bin");
+    }
+
+    #[test]
+    fn create_time_duplicate_policy_skips_renames_or_overwrites() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("clip.mp4");
+        std::fs::write(&existing, b"old").unwrap();
+
+        assert!(resolve_download_target(dir.path(), "clip.mp4", "skip").is_err());
+        assert_eq!(
+            resolve_download_target(dir.path(), "clip.mp4", "overwrite").unwrap(),
+            existing
+        );
+        let renamed = resolve_download_target(dir.path(), "clip.mp4", "rename").unwrap();
+        assert_eq!(
+            renamed.file_name().unwrap().to_str().unwrap(),
+            "clip (1).mp4"
+        );
+        assert_eq!(
+            resolve_download_target(dir.path(), "new.bin", "skip").unwrap(),
+            dir.path().join("new.bin")
+        );
+    }
+
+    #[test]
+    fn probed_total_must_match_the_recorded_total() {
+        assert!(ensure_total_matches(None, 10).is_ok());
+        assert!(ensure_total_matches(Some(10), 10).is_ok());
+        let mismatch = ensure_total_matches(Some(10), 11).unwrap_err();
+        assert!(mismatch.to_string().contains("文件大小与此前记录不符"));
+    }
+
+    #[test]
+    fn chunk_sizes_pick_the_closest_supported_candidate() {
+        for requested in [64, 80, 127, 192, 300, 600, 1024, 2048, 4096] {
+            let chosen = supported_chunk_size_kib(requested);
+            assert!(CHUNK_SIZE_KIB_CHOICES.contains(&chosen));
+        }
+        assert_eq!(supported_chunk_size_kib(1), 64);
+        assert_eq!(supported_chunk_size_kib(4096), 1024);
+        assert_eq!(supported_chunk_size_kib(300), 256);
+        assert_eq!(supported_chunk_size_kib(192), 128);
+    }
+
+    #[test]
+    fn resumable_temporary_file_stays_next_to_final_target_for_atomic_commit() {
+        let root = tempdir().unwrap();
+        let output = root.path().join("nested").join("media.bin");
+        let partial = temporary_output_path(&output, "task-123");
+        assert_eq!(partial.parent(), output.parent());
+        assert_eq!(
+            partial.file_name().unwrap().to_str().unwrap(),
+            ".telegram-media-task-123.part"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_chunk_ranges_only_lists_incomplete_chunks() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("tasks.sqlite"))
+            .await
+            .unwrap();
+        let output = dir.path().join("out.bin");
+        store.create(&record("plan-task", &output)).await.unwrap();
+        chunk_writer::configure_chunk_map(&store, "plan-task", 3072, 1024)
+            .await
+            .unwrap();
+        store
+            .complete_chunk(
+                "plan-task",
+                1024,
+                blake3::hash(&[7_u8; 1024]).to_hex().as_str(),
+            )
+            .await
+            .unwrap();
+
+        let missing = missing_chunk_ranges(&store, "plan-task").await.unwrap();
+        assert_eq!(
+            missing,
+            vec![
+                ChunkRange {
+                    offset: 0,
+                    length: 1024
+                },
+                ChunkRange {
+                    offset: 2048,
+                    length: 1024
+                }
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_download_commits_verified_chunks_and_removes_the_temp_file() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("tasks.sqlite"))
+            .await
+            .unwrap();
+        let output = dir.path().join("final.bin");
+        let contents = (0..2048)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let temp = seed_complete_task(&store, "commit-task", &output, &contents, 1024).await;
+
+        complete_download(&store, "commit-task", 2048, &temp, &output, false)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), contents);
+        assert!(!temp.exists());
+    }
+
+    #[tokio::test]
+    async fn complete_download_rejects_incomplete_chunk_maps() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("tasks.sqlite"))
+            .await
+            .unwrap();
+        let output = dir.path().join("partial.bin");
+        store
+            .create(&record("partial-task", &output))
+            .await
+            .unwrap();
+        chunk_writer::configure_chunk_map(&store, "partial-task", 2048, 1024)
+            .await
+            .unwrap();
+        let temp = temporary_output_path(&output, "partial-task");
+        tokio::fs::write(&temp, vec![1_u8; 2048]).await.unwrap();
+        store
+            .complete_chunk(
+                "partial-task",
+                0,
+                blake3::hash(&[1_u8; 1024]).to_hex().as_str(),
+            )
+            .await
+            .unwrap();
+
+        let error = complete_download(&store, "partial-task", 2048, &temp, &output, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("分块未完成"));
+        assert!(!output.exists());
+        assert!(temp.exists());
+    }
+
+    #[tokio::test]
+    async fn complete_download_recovers_an_already_committed_target() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("tasks.sqlite"))
+            .await
+            .unwrap();
+        let output = dir.path().join("recovered.bin");
+        let contents = (0..2048)
+            .map(|value| (value % 97) as u8)
+            .collect::<Vec<_>>();
+        let temp = seed_complete_task(&store, "recover-task", &output, &contents, 1024).await;
+        // 上一次已完成提交(目标文件就位),但状态尚未落库时重入。
+        tokio::fs::write(&output, &contents).await.unwrap();
+
+        complete_download(&store, "recover-task", 2048, &temp, &output, false)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), contents);
+        assert!(!temp.exists());
+    }
+
+    #[tokio::test]
+    async fn complete_download_refuses_to_overwrite_an_unrelated_target() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("tasks.sqlite"))
+            .await
+            .unwrap();
+        let output = dir.path().join("occupied.bin");
+        let contents = (0..2048)
+            .map(|value| (value % 31) as u8)
+            .collect::<Vec<_>>();
+        let temp = seed_complete_task(&store, "occupied-task", &output, &contents, 1024).await;
+        tokio::fs::write(&output, b"someone else's file")
+            .await
+            .unwrap();
+
+        let error = complete_download(&store, "occupied-task", 2048, &temp, &output, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("目标文件已存在"));
+        assert_eq!(
+            tokio::fs::read(&output).await.unwrap(),
+            b"someone else's file"
+        );
+        assert!(temp.exists());
+    }
 }

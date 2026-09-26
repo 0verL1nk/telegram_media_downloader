@@ -1,9 +1,16 @@
 fn main() {
-    tauri_build::try_build(
-        tauri_build::Attributes::new().app_manifest(
-            tauri_build::AppManifest::new().commands(&["submit_download_from_webview"]),
-        ),
-    )
+    // These commands are granted to the remote Telegram WebView capability: it may start a
+    // page-fetch download, plan/push/finish/fail it, and query task state by file name.
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "start_webview_download",
+            "plan_chunks",
+            "push_chunk",
+            "finish_download",
+            "fail_download",
+            "webview_query_task_state",
+        ]),
+    ))
     .expect("failed to generate Tauri permissions");
 
     build_webview_inject();

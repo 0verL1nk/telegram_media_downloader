@@ -2,24 +2,25 @@
 //!
 //! Tauri's child [`WebviewBuilder`] API is still marked `unstable` in Tauri
 //! 2.11.6. Keep all use of that API and the remote-page boundary in this
-//! module. The host command exposed to the `telegram` capability must still
-//! re-check the invoking webview label and current URL, parse this module's
-//! narrow request schema. It must create a native task waiting for Telegram
-//! Web's own visible download action; it must not resolve media through a
-//! Telegram API or inspect page credentials/media URLs.
+//! module. Every host command exposed to the `telegram` capability must still
+//! re-check the invoking webview label and current URL; see
+//! `commands::start_webview_download` for the pattern. Those commands must
+//! never resolve media through a Telegram API and never accept URLs, cookies,
+//! or filesystem paths from the remote document: the page fetches the bytes
+//! itself and pushes them to `push_chunk`.
 //! Tauri 2.11.6 has no per-`WebviewBuilder` `with_global_tauri` method;
 //! `app.withGlobalTauri` is an app-level config option. Enable it in the
 //! application config if this script is to use the public `window.__TAURI__`
-//! API, and keep the remote webview's capability restricted to the one
-//! submission command.
+//! API, and keep the remote webview's capability restricted to the download
+//! pipeline commands.
 //!
 //! The injected script (built from `webview-inject/` and embedded below)
 //! polls Telegram Web for the media viewer / story viewer / pinned audio,
-//! injects a download button into the native toolbar, and on click sends
-//! `{ mediaUrl, fileName, fileType, source }` to `submit_download_from_webview`,
-//! which validates the URL and hands the download to the Rust task manager.
-//! The script never reads cookies or storage; it reads only the media element
-//! the user opened.
+//! injects a download button into the native toolbar, and on click runs the
+//! page-fetch download pipeline (`start_webview_download` → `plan_chunks` →
+//! `push_chunk` → `finish_download`), handing the fetched bytes to the Rust
+//! task manager while the media URL stays in the page. The script never reads
+//! cookies or storage; it reads only the media element the user opened.
 
 use std::path::PathBuf;
 use tauri::{

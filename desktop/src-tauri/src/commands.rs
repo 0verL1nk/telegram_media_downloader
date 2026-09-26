@@ -2,16 +2,18 @@
 //!
 //! Every value crossing this module is treated as untrusted. Telegram
 //! messages are re-read through the MTProto adapter before a task is created;
-//! remote WebView input is restricted to chat/message/type identifiers and
-//! can never choose a filesystem path or supply media bytes/URLs.
+//! the remote Telegram WebView may only start page-fetch download tasks and
+//! push the bytes it fetched itself — it can never choose a filesystem path or
+//! a download URL.
 
 use crate::{
     app_state::AppState,
-    credentials, downloader,
+    credentials,
+    downloader::PlanInfo,
     legacy_config::{self, MigrationReport},
     models::{
         AppStateDto, ChatInfo, LogEntry, MessageInfo, SessionSummary, Settings, TaskRecord,
-        TelegramTransferRecord, UploadTaskRecord,
+        TaskStateMatch, TelegramTransferRecord, UploadTaskRecord,
     },
     secure_session::EncryptedSession,
     storage::{self, StorageLayout},
@@ -28,11 +30,20 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tauri::{AppHandle, Emitter, Manager, State, Webview, Window, Wry};
+use tauri::{
+    AppHandle, Manager, State, Webview, Window, Wry,
+    ipc::{InvokeBody, Request},
+};
+
+/// 单个 IPC 分块请求头中的任务 ID 与偏移。
+const CHUNK_TASK_ID_HEADER: &str = "x-task-id";
+const CHUNK_OFFSET_HEADER: &str = "x-offset";
 
 const MAX_PAGE_SIZE: usize = 100;
 const MAX_TASKS_PER_LIST: usize = 2_000;
 const MAX_LOG_ENTRIES: usize = 500;
+/// 注入脚本按文件名查询状态时允许的最大字符数(与下载文件名校验一致)。
+const MAX_WEBVIEW_FILE_NAME_CHARS: usize = 512;
 const MAX_LEGACY_CONFIG_BYTES: u64 = 1024 * 1024;
 const CHAT_ID_MAX_CHARS: usize = 21;
 const MAX_TEMPLATE_LENGTH: usize = 256;
@@ -101,14 +112,6 @@ impl ChatIdInput {
         validate_chat_id(&value)?;
         Ok(value)
     }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WebviewDownloadRequest {
-    pub chat_id: String,
-    pub message_id: i64,
-    pub media_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -594,92 +597,6 @@ pub async fn get_chat_messages(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn create_download_task(
-    state: State<'_, AppState>,
-    chat_id: ChatIdInput,
-    message_id: i64,
-    media_type: String,
-    // These legacy UI fields are intentionally ignored. The backend derives
-    // filename, caption and album id from the re-fetched MTProto message.
-    file_name: Option<String>,
-    caption: Option<String>,
-    group_id: Option<String>,
-) -> Result<TaskRecord, String> {
-    let chat_id = chat_id.into_validated()?;
-    validate_message_id(message_id)?;
-    validate_media_type(&media_type)?;
-    if file_name.as_ref().is_some_and(|value| value.len() > 1_024)
-        || caption.as_ref().is_some_and(|value| value.len() > 16_384)
-        || group_id.as_ref().is_some_and(|value| value.len() > 128)
-    {
-        return Err("消息附带的客户端元数据超过允许长度".into());
-    }
-    let _untrusted_metadata = (file_name, caption, group_id);
-    create_message_task(&state, &chat_id, message_id, &media_type).await
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn create_chat_download(
-    state: State<'_, AppState>,
-    chat_id: ChatIdInput,
-    start_message_id: Option<i64>,
-    end_message_id: Option<i64>,
-    media_types: Vec<String>,
-    file_formats: BTreeMap<String, Vec<String>>,
-    filter: Option<String>,
-) -> Result<usize, String> {
-    let chat_id = chat_id.into_validated()?;
-    for id in start_message_id.into_iter().chain(end_message_id) {
-        validate_message_id(id)?;
-    }
-    if let (Some(start), Some(end)) = (start_message_id, end_message_id) {
-        if start > end {
-            return Err("消息范围的起始 ID 不能大于结束 ID".into());
-        }
-    }
-    validate_media_filters(&media_types, &file_formats)?;
-    let requested_filter = filter.filter(|query| !query.trim().is_empty());
-    let legacy_filter = state
-        .shared
-        .settings
-        .read()
-        .await
-        .chat_filters
-        .get(&chat_id)
-        .cloned();
-    let effective_filter = requested_filter
-        .map(|query| query.trim().to_owned())
-        .or(legacy_filter);
-    if let Some(query) = effective_filter.as_deref() {
-        if query.len() > 4096 || query.chars().any(char::is_control) {
-            return Err("筛选表达式超过 4096 字节或包含控制字符".into());
-        }
-        crate::filter::validate(query).map_err(command_error)?;
-    }
-
-    // downloader::create_chat_tasks expects an inclusive lower and upper
-    // bound. Supplying explicit defaults fixes one-sided ranges from the UI.
-    let (start, end) = match (start_message_id, end_message_id) {
-        (None, None) => (Some(1), Some(i64::from(i32::MAX))),
-        (Some(start), None) => (Some(start), Some(i64::from(i32::MAX))),
-        (None, Some(end)) => (Some(1), Some(end)),
-        (Some(start), Some(end)) => (Some(start), Some(end)),
-    };
-    downloader::create_chat_tasks(
-        &state.shared,
-        &state.downloads,
-        &chat_id,
-        start,
-        end,
-        &media_types,
-        &file_formats,
-        effective_filter.as_deref(),
-    )
-    .await
-    .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
 pub async fn list_tasks(
     state: State<'_, AppState>,
     status: Option<String>,
@@ -1107,45 +1024,160 @@ pub async fn change_storage_root(
     })
 }
 
-/// This command is granted only to the `telegram` remote capability. It still
-/// re-checks the invoking WebView's label and origin and accepts no title,
-/// filename, media URL, cookie, or path from the remote document.
+/// WebView 页面抓取下载的命令面。这些命令只授予 `telegram` 远程能力:
+/// 页面自己发起 fetch,把分块字节经 IPC 交给 Rust 落盘;Rust 端不接收 URL,
+/// 也从不读取页面凭据。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn submit_download_from_webview(
+pub async fn start_webview_download(
     webview: Webview<Wry>,
     state: State<'_, AppState>,
-    request: WebviewDownloadRequest,
+    file_name: String,
+    file_type: String,
+    source: String,
 ) -> Result<TaskRecord, String> {
     if !webview_bridge::is_trusted_telegram_webview(&webview) {
         return Err("下载请求必须来自受信任的 Telegram WebView 页面".into());
     }
-    let chat_id = validate_chat_id(&request.chat_id)?;
-    validate_message_id(request.message_id)?;
-    validate_media_type(&request.media_type)?;
-    let task =
-        create_message_task(&state, &chat_id, request.message_id, &request.media_type).await?;
-    let _ = state
-        .shared
-        .app
-        .emit("webview-download-submitted", task.clone());
-    Ok(task)
+    state
+        .downloads
+        .create(&file_name, &file_type, &source)
+        .await
+        .map_err(command_error)
 }
 
-async fn create_message_task(
-    state: &AppState,
-    chat_id: &str,
-    message_id: i64,
-    media_type: &str,
+/// 页面探明文件大小后排定分块计划;幂等,可重复调用以续传。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn plan_chunks(
+    state: State<'_, AppState>,
+    task_id: String,
+    total_bytes: u64,
+) -> Result<PlanInfo, String> {
+    validate_task_id(&task_id)?;
+    state
+        .downloads
+        .plan(&task_id, total_bytes)
+        .await
+        .map_err(command_error)
+}
+
+/// 接收页面 fetch 到的分块(`taskId`/`offset` 走请求头,body 是分块字节)。
+///
+/// 首选通道是 Tauri 的 `ipc://localhost` 自定义协议,body 以 raw bytes 到达
+/// (`InvokeBody::Raw`);若页面侧该通道被拦截,Tauri 会回退到 postMessage,
+/// body 变成 JSON 数字数组,这里同样接受(仅作兼容,吞吐按前者设计)。
+#[tauri::command]
+pub async fn push_chunk(state: State<'_, AppState>, request: Request<'_>) -> Result<(), String> {
+    let task_id = required_header(&request, CHUNK_TASK_ID_HEADER)?;
+    let offset = required_header(&request, CHUNK_OFFSET_HEADER)?
+        .parse::<u64>()
+        .map_err(|_| format!("{CHUNK_OFFSET_HEADER} 必须是非负整数"))?;
+    validate_task_id(&task_id)?;
+    let bytes = match request.body() {
+        InvokeBody::Raw(bytes) => bytes.clone(),
+        InvokeBody::Json(value) => decode_json_chunk_body(value)?,
+    };
+    state
+        .downloads
+        .push(&task_id, offset, bytes)
+        .await
+        .map_err(command_error)
+}
+
+/// 全部分块接收完成:校验分块完整并原子提交。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn finish_download(
+    state: State<'_, AppState>,
+    task_id: String,
 ) -> Result<TaskRecord, String> {
-    downloader::create_task_for_message(
-        &state.shared,
-        &state.downloads,
-        chat_id,
-        message_id,
-        Some(media_type),
-    )
-    .await
-    .map_err(command_error)
+    validate_task_id(&task_id)?;
+    state
+        .downloads
+        .finish(&task_id)
+        .await
+        .map_err(command_error)
+}
+
+/// 页面侧失败(URL 过期、块级重试耗尽等):保留已校验分块并标记 `failed`。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fail_download(
+    state: State<'_, AppState>,
+    task_id: String,
+    error: String,
+) -> Result<TaskRecord, String> {
+    validate_task_id(&task_id)?;
+    state
+        .downloads
+        .fail(&task_id, &error)
+        .await
+        .map_err(command_error)
+}
+
+/// 注入脚本按文件名查询任务状态,驱动查看器里的下载按钮。
+///
+/// `resumable` 为真表示已有任务记录了分块(queued/downloading/paused),
+/// 页面重开媒体时应走 `plan_chunks` 只补缺块而不是重新开始。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebviewTaskState {
+    pub state: String,
+    pub task_id: Option<String>,
+    pub progress: Option<f64>,
+    pub file_size: Option<u64>,
+    pub completed_at: Option<String>,
+    pub resumable: bool,
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn webview_query_task_state(
+    state: State<'_, AppState>,
+    file_name: String,
+) -> Result<WebviewTaskState, String> {
+    let file_name = file_name.trim();
+    if file_name.is_empty()
+        || file_name.chars().count() > MAX_WEBVIEW_FILE_NAME_CHARS
+        || file_name.chars().any(char::is_control)
+    {
+        return Err("文件名无效".into());
+    }
+    let found: TaskStateMatch = state
+        .shared
+        .store
+        .find_latest_by_file_name(file_name)
+        .await
+        .map_err(command_error)?;
+    let resumable = matches!(found.state.as_str(), "queued" | "downloading");
+    Ok(WebviewTaskState {
+        state: found.state,
+        task_id: found.task_id,
+        progress: found.progress,
+        file_size: found.file_size,
+        completed_at: found.completed_at,
+        resumable,
+    })
+}
+
+fn required_header(request: &Request<'_>, name: &str) -> Result<String, String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("缺少 {name} 请求头"))
+}
+
+/// postMessage 回退通道把字节数组序列化成 JSON 数字数组,这里还原成字节。
+fn decode_json_chunk_body(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| "push_chunk 需要二进制请求体".to_owned())?;
+    let mut bytes = Vec::with_capacity(items.len());
+    for item in items {
+        let number = item
+            .as_u64()
+            .ok_or_else(|| "push_chunk 分块数据格式无效".to_owned())?;
+        bytes.push(u8::try_from(number).map_err(|_| "push_chunk 分块数据格式无效".to_owned())?);
+    }
+    Ok(bytes)
 }
 
 async fn telegram_adapter(state: &AppState) -> Result<Arc<TelegramAdapter>, String> {

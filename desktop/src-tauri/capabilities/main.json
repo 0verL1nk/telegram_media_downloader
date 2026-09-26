@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-local-ui",
+  "description": "Capabilities for the trusted local React interface",
+  "webviews": ["main"],
+  "local": true,
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:default",
+    "allow-main-commands"
+  ]
+}

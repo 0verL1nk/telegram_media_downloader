@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fail-download"
+description = "Enables the fail_download command without any pre-configured scope."
+commands.allow = ["fail_download"]
+
+[[permission]]
+identifier = "deny-fail-download"
+description = "Denies the fail_download command without any pre-configured scope."
+commands.deny = ["fail_download"]

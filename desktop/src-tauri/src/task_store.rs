@@ -475,6 +475,25 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Persist the file size discovered by the page-side probe. WebView tasks are created
+    /// without a total (the page learns it from `Content-Range` only when the viewer opens),
+    /// so `plan_chunks` records it here before the chunk map is used for resume decisions.
+    pub async fn set_total_bytes(&self, id: &str, total_bytes: u64) -> Result<()> {
+        if total_bytes > i64::MAX as u64 {
+            bail!("媒体文件长度超出任务数据库可表示范围");
+        }
+        task::Entity::update_many()
+            .filter(task::Column::Id.eq(id))
+            .col_expr(task::Column::TotalBytes, Expr::value(total_bytes as i64))
+            .col_expr(
+                task::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().to_rfc3339()),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_chunks(&self, id: &str, total_bytes: u64, chunk_size: u64) -> Result<()> {
         if total_bytes > i64::MAX as u64 || chunk_size == 0 || chunk_size > i64::MAX as u64 {
             bail!("任务分块尺寸无效");
@@ -864,6 +883,33 @@ mod tests {
         store.set_status("t1", "downloading", None).await.unwrap();
         store.set_status("t1", "completed", None).await.unwrap();
         assert_eq!(store.get("t1").await.unwrap().unwrap().status, "completed");
+    }
+
+    #[tokio::test]
+    async fn webview_task_records_the_probed_total_after_creation() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        let mut probe_task = record("w1");
+        probe_task.total_bytes = None;
+        probe_task.remaining_bytes = None;
+        store.create(&probe_task).await.unwrap();
+        assert!(
+            store
+                .get("w1")
+                .await
+                .unwrap()
+                .unwrap()
+                .total_bytes
+                .is_none()
+        );
+
+        store.set_total_bytes("w1", 4096).await.unwrap();
+
+        let stored = store.get("w1").await.unwrap().unwrap();
+        assert_eq!(stored.total_bytes, Some(4096));
+        assert_eq!(stored.remaining_bytes, Some(4096));
     }
 
     #[tokio::test]

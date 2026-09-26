@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "telegram-webview-download-pipeline",
+  "description": "Telegram Web may run the page-fetch download pipeline: start, plan, push chunks, finish/fail, and query task state",
+  "webviews": ["telegram"],
+  "local": false,
+  "remote": {
+    "urls": ["https://web.telegram.org/*"]
+  },
+  "permissions": [
+    "allow-start-webview-download",
+    "allow-plan-chunks",
+    "allow-push-chunk",
+    "allow-finish-download",
+    "allow-fail-download",
+    "allow-webview-query-task-state",
+    "core:event:allow-listen"
+  ]
+}

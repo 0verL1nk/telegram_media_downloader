@@ -51,8 +51,12 @@ pub fn run() {
             commands::logout_session,
             commands::list_chats,
             commands::get_chat_messages,
-            commands::create_download_task,
-            commands::create_chat_download,
+            commands::start_webview_download,
+            commands::plan_chunks,
+            commands::push_chunk,
+            commands::finish_download,
+            commands::fail_download,
+            commands::webview_query_task_state,
             commands::list_tasks,
             commands::task_action,
             commands::open_task_location,
@@ -68,7 +72,6 @@ pub fn run() {
             commands::set_telegram_webview_visible,
             commands::set_telegram_webview_bounds,
             commands::change_storage_root,
-            commands::submit_download_from_webview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

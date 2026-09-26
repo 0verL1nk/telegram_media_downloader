@@ -1,0 +1,27 @@
+[[permission]]
+identifier = "allow-main-commands"
+description = "Allow the trusted local React interface to call the desktop application commands"
+commands.allow = [
+  "get_app_state",
+  "save_settings",
+  "import_legacy_config",
+  "login_request_code",
+  "login_submit_code",
+  "login_submit_password",
+  "logout_session",
+  "list_chats",
+  "get_chat_messages",
+  "list_tasks",
+  "task_action",
+  "open_task_location",
+  "get_logs",
+  "list_cloud_uploads",
+  "queue_cloud_upload",
+  "cloud_upload_action",
+  "upload_completed_download",
+  "forward_telegram_message",
+  "ensure_telegram_webview",
+  "set_telegram_webview_visible",
+  "set_telegram_webview_bounds",
+  "change_storage_root"
+]
