@@ -170,10 +170,18 @@ interface Detected {
 
 **按钮样式 — 融入原生 UI**(验证脚本的做法):
 
-- webk:元素 `<button class="btn-icon tgico-download tel-download">`,内嵌 `<span class="tgico">` 图标;插入 `.media-viewer-buttons` 最前(prepend)
+- webk:元素 `<button class="btn-icon tgico-download tel-download">`,内嵌 `<span class="tgico button-icon">` 图标(字形 ``);插入 `.media-viewer-buttons` 最前(prepend);视频控制条变体为 `btn-icon default__button tgico-download tel-download`,插到 `.bottom-controls .right-controls` 最前
 - webz:元素 `<button class="Button smaller translucent-white round tel-download">`,内嵌 `<i class="icon icon-download">`;`prepend` 进 `.MediaViewerActions`,视频时插到 `.VideoPlayerControls .buttons` 内 `.spacer` 之后
-- Story:同风格,插头部按钮区
-- 置顶音频:webk `btn-icon tgico-download _tel_download_button_pinned`
+- Story:同风格,插头部按钮区(webk `btn-icon rp tel-download` + ripple;webz `Button TkphaPyQ tiny translucent-white round tel-download`)
+- 置顶音频:webk `btn-icon tgico-download _tel_download_button_pinned_container`(脚本自带防重类,另加 `tel-download`)
+
+**官方按钮接管 — 受限媒体(禁存频道)的核心路径**(脚本 L740-752 的检测逻辑 + 我们的克隆接管):
+
+- 检测:webk 官方按钮是 `button.btn-icon`,受限时带 `.hide` 且按字形文本匹配(`textContent === ""`,脚本 L743-749);可见态带 `tgico-download` 类(脚本查重条件,L789)。webz 按 `button[title="Download"]` 识别(脚本 L582/L597)
+- 接管(webk 与 webz 同策略):解除 `.hide`(脚本 L744)→ `cloneNode(true)`(克隆不携带 Telegram 的内联事件监听)→ 克隆加 `tel-download` 标记、绑定我们的点击 → 插到原按钮之后 → 原按钮 `style.display = 'none'` 隐藏。位置与外观 100% 保持官方
+- **绝不**执行脚本的 `btn.click()`(L750-753):克隆与新建按钮的点击一律 `onDownload`/`onRetry` → Tauri IPC → Rust,不触发官方/浏览器下载
+- 回退路径:未找到官方按钮(或 Story/置顶音频)→ 按上述原生标记新建(插入位置同上)
+- 幂等:每轮先查 `scope.querySelector('.tel-download')`(检测容器 + 官方按钮实际所在的顶栏/Actions 条);Telegram 重渲染清掉克隆时,下一轮自动重新接管(自愈)
 
 **状态机**(我们的增强,验证脚本只有浏览器原生进度条):
 
