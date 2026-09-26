@@ -1024,6 +1024,16 @@ pub async fn change_storage_root(
     })
 }
 
+/// 远程命令的运行时二次校验:能力(capability)之外再确认调用方确实是 `telegram`
+/// 子视图,且当前地址仍在 `https://web.telegram.org` 上;见 `webview_bridge`。
+fn ensure_trusted_telegram_webview(webview: &Webview<Wry>) -> Result<(), String> {
+    if webview_bridge::is_trusted_telegram_webview(webview) {
+        Ok(())
+    } else {
+        Err("下载请求必须来自受信任的 Telegram WebView 页面".into())
+    }
+}
+
 /// WebView 页面抓取下载的命令面。这些命令只授予 `telegram` 远程能力:
 /// 页面自己发起 fetch,把分块字节经 IPC 交给 Rust 落盘;Rust 端不接收 URL,
 /// 也从不读取页面凭据。
@@ -1035,9 +1045,7 @@ pub async fn start_webview_download(
     file_type: String,
     source: String,
 ) -> Result<TaskRecord, String> {
-    if !webview_bridge::is_trusted_telegram_webview(&webview) {
-        return Err("下载请求必须来自受信任的 Telegram WebView 页面".into());
-    }
+    ensure_trusted_telegram_webview(&webview)?;
     state
         .downloads
         .create(&file_name, &file_type, &source)
@@ -1048,10 +1056,12 @@ pub async fn start_webview_download(
 /// 页面探明文件大小后排定分块计划;幂等,可重复调用以续传。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn plan_chunks(
+    webview: Webview<Wry>,
     state: State<'_, AppState>,
     task_id: String,
     total_bytes: u64,
 ) -> Result<PlanInfo, String> {
+    ensure_trusted_telegram_webview(&webview)?;
     validate_task_id(&task_id)?;
     state
         .downloads
@@ -1066,7 +1076,12 @@ pub async fn plan_chunks(
 /// (`InvokeBody::Raw`);若页面侧该通道被拦截,Tauri 会回退到 postMessage,
 /// body 变成 JSON 数字数组,这里同样接受(仅作兼容,吞吐按前者设计)。
 #[tauri::command]
-pub async fn push_chunk(state: State<'_, AppState>, request: Request<'_>) -> Result<(), String> {
+pub async fn push_chunk(
+    webview: Webview<Wry>,
+    state: State<'_, AppState>,
+    request: Request<'_>,
+) -> Result<(), String> {
+    ensure_trusted_telegram_webview(&webview)?;
     let task_id = required_header(&request, CHUNK_TASK_ID_HEADER)?;
     let offset = required_header(&request, CHUNK_OFFSET_HEADER)?
         .parse::<u64>()
@@ -1086,9 +1101,11 @@ pub async fn push_chunk(state: State<'_, AppState>, request: Request<'_>) -> Res
 /// 全部分块接收完成:校验分块完整并原子提交。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn finish_download(
+    webview: Webview<Wry>,
     state: State<'_, AppState>,
     task_id: String,
 ) -> Result<TaskRecord, String> {
+    ensure_trusted_telegram_webview(&webview)?;
     validate_task_id(&task_id)?;
     state
         .downloads
@@ -1100,10 +1117,12 @@ pub async fn finish_download(
 /// 页面侧失败(URL 过期、块级重试耗尽等):保留已校验分块并标记 `failed`。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fail_download(
+    webview: Webview<Wry>,
     state: State<'_, AppState>,
     task_id: String,
     error: String,
 ) -> Result<TaskRecord, String> {
+    ensure_trusted_telegram_webview(&webview)?;
     validate_task_id(&task_id)?;
     state
         .downloads
@@ -1129,9 +1148,11 @@ pub struct WebviewTaskState {
 
 #[tauri::command(rename_all = "camelCase")]
 pub async fn webview_query_task_state(
+    webview: Webview<Wry>,
     state: State<'_, AppState>,
     file_name: String,
 ) -> Result<WebviewTaskState, String> {
+    ensure_trusted_telegram_webview(&webview)?;
     let file_name = file_name.trim();
     if file_name.is_empty()
         || file_name.chars().count() > MAX_WEBVIEW_FILE_NAME_CHARS

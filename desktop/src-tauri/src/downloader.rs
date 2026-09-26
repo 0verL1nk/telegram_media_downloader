@@ -227,14 +227,22 @@ impl DownloadManager {
                 ..parameters
             });
         }
-        // 排队中的任务在这里等待空闲槽位;取消/暂停会由随后的状态复查拦截。
+        // 排队中的任务在这里等待空闲槽位。
         let slot = Arc::clone(&self.slots)
             .acquire_owned()
             .await
             .map_err(|_| anyhow!("下载槽位已关闭;任务保留在本机,可重启客户端恢复"))?;
+        let requested_resume = record.status == "paused";
         let record = self.require_record(task_id).await?;
-        if !matches!(record.status.as_str(), "queued" | "paused" | "downloading") {
-            bail!("任务当前状态不允许开始下载:{}", record.status);
+        // 等槽位期间任务可能已被暂停/取消;只有“调用前就是 paused”的续传重入才继续,
+        // 否则释放槽位干净退出,不再偷偷启动一个用户已经停下的任务。
+        let startable = match record.status.as_str() {
+            "queued" | "downloading" => true,
+            "paused" => requested_resume,
+            _ => false,
+        };
+        if !startable {
+            bail!("任务在等待下载槽位期间已暂停或取消:{}", record.status);
         }
         ensure_total_matches(record.total_bytes, total_bytes)?;
         let output = PathBuf::from(record.output_path.as_deref().context("任务目标路径为空")?);
@@ -275,6 +283,18 @@ impl DownloadManager {
                     .await?;
             }
         }
+        // 检查与插入必须一次持锁完成:并发的第二次 plan 若在此前通过检查,会启动第二个
+        // writer 覆盖同一个临时文件,并让槽位重复释放。锁只覆盖同步的 spawn 与插入,
+        // 槽位获取在锁外。
+        let mut active = self.active.lock().await;
+        if active.contains_key(task_id) {
+            drop(active);
+            let missing = missing_chunk_ranges(&self.shared.store, task_id).await?;
+            return Ok(PlanInfo {
+                missing,
+                ..parameters
+            });
+        }
         let (sender, receiver) =
             mpsc::channel(chunk_queue_depth(settings.concurrency.per_file_chunks));
         let (progress_events, progress_receiver) = broadcast::channel(PROGRESS_EVENT_BUFFER);
@@ -298,7 +318,7 @@ impl DownloadManager {
             total_bytes,
             progress_receiver,
         );
-        self.active.lock().await.insert(
+        active.insert(
             task_id.to_owned(),
             ActiveDownload {
                 sender,
@@ -309,6 +329,7 @@ impl DownloadManager {
                 _slot: slot,
             },
         );
+        drop(active);
         // writer 首轮刷新与 350ms 节流器会立即补上 `webview-task-updated`。
         self.shared.publish_task(task_id).await;
         self.shared
@@ -376,7 +397,7 @@ impl DownloadManager {
             bail!("任务不在活动状态,无法完成:{task_id}");
         };
         let total = active.total;
-        let writer_result = join_download_children(active.writer, active.watcher).await;
+        let writer_result = drain_active(active).await;
         let output = match self.output_path(task_id).await {
             Ok(output) => output,
             Err(error) => {
@@ -444,7 +465,8 @@ impl DownloadManager {
     /// 页面侧失败(URL 过期、块级重试耗尽等):保留已校验分块,标记 `failed`。
     pub async fn fail(&self, task_id: &str, error: &str) -> Result<TaskRecord> {
         if let Some(active) = self.detach(task_id).await {
-            stop_active(active).await;
+            // writer 的错误只反映本地收尾细节;页面侧已给出更准确的失败原因。
+            let _ = drain_active(active).await;
         }
         self.mark_failed(task_id, error).await
     }
@@ -599,7 +621,7 @@ async fn pause_task(
 ) -> Result<TaskRecord> {
     let detached = active.lock().await.remove(task_id);
     if let Some(entry) = detached {
-        stop_active(entry).await;
+        let _ = drain_active(entry).await;
     }
     let record = require_record(shared, task_id).await?;
     match record.status.as_str() {
@@ -633,7 +655,7 @@ async fn cancel_task(
     }
     let detached = active.lock().await.remove(task_id);
     if let Some(entry) = detached {
-        stop_active(entry).await;
+        let _ = drain_active(entry).await;
     }
     shared.store.set_status(task_id, "cancelled", None).await?;
     announce_abort(shared, task_id);
@@ -663,10 +685,21 @@ async fn require_record(shared: &SharedState, task_id: &str) -> Result<TaskRecor
         .with_context(|| format!("未找到下载任务:{task_id}"))
 }
 
-/// 停止一个活动下载:关闭分块通道并等待 writer/进度监视退出(槽位随结构体释放)。
-async fn stop_active(active: ActiveDownload) {
-    drop(active.sender);
-    let _ = join_download_children(active.writer, active.watcher).await;
+/// 分离在途下载:先丢弃发送端让 writer 观察到通道关闭,再等 writer 落盘完毕;
+/// 槽位保持到收尾结束才随结构体释放。
+///
+/// 不变式:sender 必须在 join writer 之前丢弃,且每条分离路径(finish/fail/pause/
+/// cancel/看门狗)都只经过这里 —— 否则 writer 会一直阻塞在 `recv()` 上,join 永不返回。
+async fn drain_active(active: ActiveDownload) -> Result<u64> {
+    let ActiveDownload {
+        sender,
+        writer,
+        watcher,
+        _slot,
+        ..
+    } = active;
+    drop(sender);
+    join_download_children(writer, watcher).await
 }
 
 fn announce_abort(shared: &SharedState, task_id: &str) {
@@ -1076,6 +1109,36 @@ mod tests {
             partial.file_name().unwrap().to_str().unwrap(),
             ".telegram-media-task-123.part"
         );
+    }
+
+    /// 回归测试:finish/fail/pause 共用的分离路径必须先丢弃发送端,否则 writer 会一直
+    /// 阻塞在 `recv()` 上,`drain_active` 永不返回(整个下载队列随之挂死)。
+    #[tokio::test]
+    async fn drain_active_closes_the_chunk_channel_before_joining_the_writer() {
+        let (sender, mut receiver) = mpsc::channel::<IncomingChunk>(1);
+        let writer = tokio::spawn(async move {
+            // 与 chunk_writer 相同:只有发送端全部丢弃后 writer 才会退出。
+            while receiver.recv().await.is_some() {}
+            Ok::<u64, anyhow::Error>(2048)
+        });
+        let watcher = tokio::spawn(async { std::future::pending::<()>().await });
+        let slots = Arc::new(Semaphore::new(1));
+        let slot = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let active = ActiveDownload {
+            sender,
+            writer,
+            watcher,
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            total: 2048,
+            _slot: slot,
+        };
+
+        let drained = tokio::time::timeout(Duration::from_secs(5), drain_active(active))
+            .await
+            .expect("drain_active 必须先丢弃发送端让 writer 退出,而不是等满超时");
+
+        assert_eq!(drained.unwrap(), 2048);
+        assert_eq!(slots.available_permits(), 1, "槽位必须随分离一起释放");
     }
 
     #[tokio::test]
