@@ -74,7 +74,7 @@ pub struct StorageChangeResult {
 pub async fn get_app_state(state: State<'_, AppState>) -> Result<AppStateDto, String> {
     let layout = state.shared.layout.read().await.clone();
     let mut settings = state.shared.settings.read().await.clone();
-    settings.data_root = layout.root.to_string_lossy().into_owned();
+    settings.data_root = storage::display_path(&layout.root);
     let stats = state.shared.store.stats().await.map_err(command_error)?;
     let fallback = state
         .shared
@@ -98,7 +98,7 @@ pub async fn save_settings(
 ) -> Result<(), String> {
     let layout = state.shared.layout.read().await.clone();
     let mut current_settings = state.shared.settings.write().await;
-    settings.data_root = layout.root.to_string_lossy().into_owned();
+    settings.data_root = storage::display_path(&layout.root);
     normalize_and_validate_settings(&mut settings)?;
     storage::save_settings(&layout, &settings).map_err(command_error)?;
     *current_settings = settings;
@@ -167,16 +167,14 @@ pub async fn open_task_location(state: State<'_, AppState>, task_id: String) -> 
     let download_root = PathBuf::from(settings.download_root)
         .canonicalize()
         .map_err(command_error)?;
-    if !target.starts_with(&download_root) {
-        return Err("任务路径不在配置的下载目录中，已拒绝打开".into());
-    }
-
-    let reveal = if target.exists() {
-        let canonical = target.canonicalize().map_err(command_error)?;
-        if !canonical.starts_with(&download_root) {
-            return Err("任务文件解析到下载目录之外，已拒绝打开".into());
-        }
-        canonical
+    // 任务记录里的 output_path 可能来自旧版本(带 `\\?\` 前缀),而设置里的下载目录
+    // 现在是干净形式;比较前统一解析为 canonical:文件已存在时解析文件本身,否则
+    // 解析最近的已存在父目录(reveal 目标即该父目录)。
+    let (resolved, outside_message) = if target.exists() {
+        (
+            target.canonicalize().map_err(command_error)?,
+            "任务文件解析到下载目录之外，已拒绝打开",
+        )
     } else {
         let mut parent = target
             .parent()
@@ -188,13 +186,15 @@ pub async fn open_task_location(state: State<'_, AppState>, task_id: String) -> 
                 .ok_or_else(|| "任务目标目录不存在".to_owned())?
                 .to_path_buf();
         }
-        let parent = parent.canonicalize().map_err(command_error)?;
-        if !parent.starts_with(&download_root) {
-            return Err("任务目录解析到下载目录之外，已拒绝打开".into());
-        }
-        parent
+        (
+            parent.canonicalize().map_err(command_error)?,
+            "任务目录解析到下载目录之外，已拒绝打开",
+        )
     };
-    tauri_plugin_opener::reveal_item_in_dir(reveal).map_err(command_error)
+    if !resolved.starts_with(&download_root) {
+        return Err(outside_message.into());
+    }
+    tauri_plugin_opener::reveal_item_in_dir(resolved).map_err(command_error)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -245,6 +245,38 @@ pub async fn ensure_telegram_webview(
         )
         .await;
     Ok(())
+}
+
+/// 诊断:向 Telegram WebView 注入一次性探测脚本,回报注入脚本标记与页面状态。
+///
+/// 由本地主窗口(或托盘菜单)调用,而非远程页面;探测结果经 `webview_log`
+/// 写入应用日志的 `inject` 目标,用于区分「脚本没跑」与「脚本跑了但检测失败」。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn probe_telegram_inject(state: State<'_, AppState>) -> Result<(), String> {
+    let webview = state
+        .shared
+        .app
+        .get_webview(webview_bridge::TELEGRAM_WEBVIEW_LABEL)
+        .ok_or_else(|| "Telegram WebView 尚未创建".to_owned())?;
+    webview
+        .eval(
+            r#"
+      (function () {
+        try {
+          var invoke = window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke;
+          var marker = document.documentElement.getAttribute('data-tmd-inject') || 'none';
+          var hasTauri = typeof window.__TAURI__ !== 'undefined';
+          var viewerK = !!document.querySelector('.media-viewer-whole');
+          var viewerZ = !!document.querySelector('#MediaViewer');
+          var msg = 'probe: marker=' + marker + ' hasTauri=' + hasTauri + ' origin=' + location.origin + ' path=' + location.pathname + ' viewerK=' + viewerK + ' viewerZ=' + viewerZ;
+          if (invoke) { invoke('webview_log', { message: msg }).catch(function () {}); }
+        } catch (e) {
+          try { window.__TAURI__.core.invoke('webview_log', { message: 'probe error: ' + (e && e.message) }).catch(function(){}); } catch (_e2) {}
+        }
+      })();
+    "#,
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -300,7 +332,7 @@ pub async fn change_storage_root(
     if new_root == old_root {
         let settings = state.shared.settings.read().await;
         return Ok(StorageChangeResult {
-            data_root: old_root.to_string_lossy().into_owned(),
+            data_root: storage::display_path(&old_root),
             download_root: settings.download_root.clone(),
             restart_required: false,
         });
@@ -337,10 +369,15 @@ pub async fn change_storage_root(
 
     let mut migrated_settings = settings_guard.clone();
     let previous_download_root = PathBuf::from(&migrated_settings.download_root);
-    let mapped_download_root = if previous_download_root.starts_with(&old_root) {
+    // 设置里的下载目录是干净形式,old_root 是 canonical(带 `\\?\` 前缀);统一解析
+    // 后再比较/截取,解析失败(目录不存在)时退回词法比较。
+    let previous_canonical = previous_download_root
+        .canonicalize()
+        .unwrap_or_else(|_| previous_download_root.clone());
+    let mapped_download_root = if previous_canonical.starts_with(&old_root) {
         Some(
             new_root.join(
-                previous_download_root
+                previous_canonical
                     .strip_prefix(&old_root)
                     .map_err(command_error)?,
             ),
@@ -361,9 +398,9 @@ pub async fn change_storage_root(
         })?;
 
     if let Some(download_root) = mapped_download_root {
-        migrated_settings.download_root = download_root.to_string_lossy().into_owned();
+        migrated_settings.download_root = storage::display_path(&download_root);
     }
-    migrated_settings.data_root = new_root.to_string_lossy().into_owned();
+    migrated_settings.data_root = storage::display_path(&new_root);
     if let Some(parent) = state.shared.root_pointer.parent() {
         fs::create_dir_all(parent).map_err(command_error)?;
     }
@@ -385,7 +422,7 @@ pub async fn change_storage_root(
         )
         .await;
     Ok(StorageChangeResult {
-        data_root: new_root.to_string_lossy().into_owned(),
+        data_root: storage::display_path(&new_root),
         download_root: migrated_settings.download_root,
         restart_required: true,
     })
@@ -511,6 +548,24 @@ pub struct WebviewTaskState {
     pub file_size: Option<u64>,
     pub completed_at: Option<String>,
     pub resumable: bool,
+}
+
+/// 诊断通道:注入脚本把运行日志写入应用日志(client.jsonl 的 `inject` 目标)。
+///
+/// 只接受受信任 Telegram WebView 页面发来的消息;消息截断到 500 字符,
+/// 避免页面故障时刷爆日志。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn webview_log(
+    webview: Webview<Wry>,
+    state: State<'_, AppState>,
+    message: String,
+) -> Result<(), String> {
+    if !webview_bridge::is_trusted_telegram_webview(&webview) {
+        return Err("诊断日志必须来自受信任的 Telegram WebView 页面".into());
+    }
+    let message: String = message.chars().take(500).collect();
+    state.shared.log("info", "inject", message).await;
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -643,11 +698,8 @@ fn normalize_and_validate_settings(settings: &mut Settings) -> Result<(), String
         return Err("下载目录必须是绝对路径".into());
     }
     fs::create_dir_all(&root).map_err(command_error)?;
-    settings.download_root = root
-        .canonicalize()
-        .map_err(command_error)?
-        .to_string_lossy()
-        .into_owned();
+    // 校验用 canonical 路径,但持久化的是去掉 Windows `\\?\` 前缀的干净形式。
+    settings.download_root = storage::display_path(&root.canonicalize().map_err(command_error)?);
     Ok(())
 }
 

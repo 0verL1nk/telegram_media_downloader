@@ -1,6 +1,8 @@
 // desktop/src-tauri/webview-inject/src/downloader.js
 // 页面内分块抓取管线:探测大小 → 计划 → 并发 fetch(与脚本 #446342 同款 Range 方式)
 // → IPC 推送分块 → 完成。落盘/记账/提交全部在 Rust。
+// 诊断:每个阶段经 diag 上报(见 diag.js)。
+import { diag } from './diag.js';
 import { queryTaskState } from './task-state.js';
 
 const RETRY_BASE_MS = 300;
@@ -121,6 +123,7 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
   const existing = await queryTaskState(fileName, cfg).catch(() => null);
   if (existing && existing.taskId && existing.resumable) {
     taskId = existing.taskId;
+    diag(`pipeline: resume task=${taskId}`);
   } else {
     const record = await window.__TAURI__.core.invoke('start_webview_download', {
       fileName,
@@ -128,6 +131,7 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
       source,
     });
     taskId = record.taskId;
+    diag(`pipeline: created task=${taskId}`);
   }
   onTaskId?.(taskId);
 
@@ -135,10 +139,14 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
   controllers.set(taskId, controller);
   try {
     const totalBytes = await probeTotal(url, controller.signal);
+    diag(`pipeline: total=${totalBytes}`);
     const plan = await window.__TAURI__.core.invoke('plan_chunks', { taskId, totalBytes });
+    const missingCount = plan.missing ? plan.missing.length : 0;
+    diag(`pipeline: missing=${missingCount} concurrency=${plan.concurrency}`);
 
     if (!plan.missing || plan.missing.length === 0) {
       await window.__TAURI__.core.invoke('finish_download', { taskId });
+      diag(`pipeline: finished task=${taskId} (no missing chunks)`);
       return taskId;
     }
 
@@ -148,20 +156,28 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
         retries: plan.retries,
         signal: controller.signal,
       });
-      await window.__TAURI__.core.invoke('push_chunk', new Uint8Array(buffer), {
-        headers: { 'x-task-id': taskId, 'x-offset': String(offset) },
-      });
+      try {
+        await window.__TAURI__.core.invoke('push_chunk', new Uint8Array(buffer), {
+          headers: { 'x-task-id': taskId, 'x-offset': String(offset) },
+        });
+      } catch (pushError) {
+        diag(`pipeline: push failed offset=${offset} — ${pushError && pushError.message ? pushError.message : String(pushError)}`);
+        throw pushError;
+      }
     });
 
     await window.__TAURI__.core.invoke('finish_download', { taskId });
+    diag(`pipeline: finished task=${taskId}`);
     return taskId;
   } catch (error) {
     if (controller.signal.aborted || error?.name === 'AbortError') {
       // Rust 侧已暂停/取消(收到 abort 事件);不要覆盖它的状态
+      diag(`pipeline: aborted task=${taskId}`);
       throw new DOMException('已中止', 'AbortError');
     }
     controller.abort(); // 停止其余在途 fetch,避免向已失败任务继续推送
     const message = error instanceof Error ? error.message : String(error);
+    diag(`pipeline: failed — ${message}`);
     await window.__TAURI__.core.invoke('fail_download', { taskId, error: message }).catch(() => {});
     throw error;
   } finally {

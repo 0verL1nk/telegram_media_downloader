@@ -6,7 +6,7 @@ use crate::{
     task_store::TaskStore,
 };
 use anyhow::{Context, Result};
-use std::{collections::VecDeque, path::PathBuf, sync::Arc};
+use std::{collections::VecDeque, path::Path, path::PathBuf, sync::Arc};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Mutex, RwLock};
 
@@ -42,9 +42,14 @@ impl AppState {
         let layout = StorageLayout::under(root);
         layout.ensure()?;
         let mut settings = storage::load_settings(&layout)?;
-        settings.data_root = layout.root.to_string_lossy().into_owned();
+        settings.data_root = storage::display_path(&layout.root);
         if settings.download_root.trim().is_empty() {
-            settings.download_root = layout.downloads.to_string_lossy().into_owned();
+            settings.download_root = storage::display_path(&layout.downloads);
+        } else if settings.download_root.starts_with(r"\\?\") {
+            // 旧版本可能把 canonicalize 的 verbatim 前缀写进了设置文件;就地归一化
+            // 并回写,避免 `\\?\E:\...` 继续出现在界面与设置文件里。
+            settings.download_root = storage::display_path(Path::new(&settings.download_root));
+            storage::save_settings(&layout, &settings)?;
         }
         let store = TaskStore::open(&layout.database_file).await?;
         let (persistent_logs, recovered_logs) = PersistentLogs::open(&layout.logs, 500).await?;

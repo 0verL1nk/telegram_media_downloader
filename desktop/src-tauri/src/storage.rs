@@ -44,9 +44,21 @@ impl StorageLayout {
             &self.root.join("Cache"),
         ] {
             fs::create_dir_all(path)
-                .with_context(|| format!("无法创建数据目录：{}", path.display()))?;
+                .with_context(|| format!("无法创建数据目录：{}", display_path(path)))?;
         }
         Ok(())
+    }
+}
+
+/// 去掉 Windows canonicalize 产生的 `\\?\` 前缀;仅用于展示/持久化,不用于文件 IO。
+pub fn display_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
     }
 }
 
@@ -60,7 +72,7 @@ pub fn resolve_active_root(pointer_file: &Path, fallback: &Path) -> Result<PathB
             if !configured.is_dir() {
                 bail!(
                     "客户端数据目录当前不可用：{}。请连接该磁盘后重试，或通过恢复流程选择数据目录。",
-                    configured.display()
+                    display_path(&configured)
                 );
             }
             return Ok(configured);
@@ -71,7 +83,7 @@ pub fn resolve_active_root(pointer_file: &Path, fallback: &Path) -> Result<PathB
     }
     let chosen = choose_default_root(fallback);
     fs::create_dir_all(&chosen)
-        .with_context(|| format!("无法创建数据目录：{}", chosen.display()))?;
+        .with_context(|| format!("无法创建数据目录：{}", display_path(&chosen)))?;
     if let Some(parent) = pointer_file.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -176,9 +188,9 @@ pub fn load_settings(layout: &StorageLayout) -> Result<Settings> {
         // Desktop versions before schemaVersion stored Settings as a flat JSON object.
         serde_json::from_value(value).context("旧版设置格式无法读取")?
     };
-    settings.data_root = layout.root.to_string_lossy().into_owned();
+    settings.data_root = display_path(&layout.root);
     if settings.download_root.trim().is_empty() {
-        settings.download_root = layout.downloads.to_string_lossy().into_owned();
+        settings.download_root = display_path(&layout.downloads);
     }
     Ok(settings)
 }
@@ -239,6 +251,18 @@ fn file_digest(path: &Path) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_path_strips_windows_verbatim_prefixes() {
+        let cases = [
+            (r"E:\Media\Downloads", r"E:\Media\Downloads"),
+            (r"\\?\E:\Media\Downloads", r"E:\Media\Downloads"),
+            (r"\\?\UNC\server\share\dir", r"\\server\share\dir"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(display_path(Path::new(input)), expected);
+        }
+    }
 
     #[test]
     fn flat_legacy_json_loads_and_next_save_is_versioned() {

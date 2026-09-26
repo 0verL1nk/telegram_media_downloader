@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-webview-log"
+description = "Enables the webview_log command without any pre-configured scope."
+commands.allow = ["webview_log"]
+
+[[permission]]
+identifier = "deny-webview-log"
+description = "Denies the webview_log command without any pre-configured scope."
+commands.deny = ["webview_log"]

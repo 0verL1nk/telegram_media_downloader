@@ -13,6 +13,7 @@ const distDir = resolve(here, 'dist');
 const config = JSON.parse(readFileSync(resolve(here, 'config.json'), 'utf-8'));
 
 const ORDER = [
+  'diag.js',
   'icons.js',
   'extract.js',
   'detect.js',

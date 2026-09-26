@@ -9,6 +9,7 @@ fn main() {
             "finish_download",
             "fail_download",
             "webview_query_task_state",
+            "webview_log",
         ]),
     ))
     .expect("failed to generate Tauri permissions");

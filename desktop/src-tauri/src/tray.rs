@@ -1,4 +1,4 @@
-//! 系统托盘：显示主窗口、打开下载目录、退出。
+//! 系统托盘：显示主窗口、打开下载目录、诊断注入、退出。
 //!
 //! 关闭主窗口时只隐藏到托盘（见 `lib.rs` 的 `on_window_event`），后台下载继续
 //! 运行；真正的退出只通过托盘菜单「退出」触发。
@@ -18,6 +18,7 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_ICON_ID: &str = "main-tray";
 const MENU_SHOW_MAIN: &str = "tray-show-main";
 const MENU_OPEN_DOWNLOADS: &str = "tray-open-downloads";
+const MENU_PROBE_INJECT: &str = "tray-probe-inject";
 const MENU_QUIT: &str = "tray-quit";
 
 const TRAY_TOOLTIP: &str = "Telegram Media Downloader";
@@ -29,8 +30,15 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let show_main = MenuItem::with_id(app, MENU_SHOW_MAIN, "显示主窗口", true, None::<&str>)?;
     let open_downloads =
         MenuItem::with_id(app, MENU_OPEN_DOWNLOADS, "打开下载目录", true, None::<&str>)?;
+    let probe_inject = MenuItem::with_id(
+        app,
+        MENU_PROBE_INJECT,
+        "诊断注入(输出到日志)",
+        true,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show_main, &open_downloads, &quit])?;
+    let menu = Menu::with_items(app, &[&show_main, &open_downloads, &probe_inject, &quit])?;
 
     let builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
         .tooltip(TRAY_TOOLTIP)
@@ -68,6 +76,7 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
     match id {
         MENU_SHOW_MAIN => show_main_window(app),
         MENU_OPEN_DOWNLOADS => open_downloads_dir(app),
+        MENU_PROBE_INJECT => probe_telegram_inject(app),
         MENU_QUIT => app.exit(0),
         _ => {}
     }
@@ -140,5 +149,29 @@ fn open_downloads_dir(app: &AppHandle) {
                 format!("已打开下载目录：{}", directory.display()),
             )
             .await;
+    });
+}
+
+/// 诊断:向 Telegram WebView 注入一次性探测脚本,把注入标记与页面状态写回日志。
+///
+/// 与「打开下载目录」一样,菜单回调是同步的,命令调用是异步的,整体放进异步
+/// 运行时;结果(`inject` 目标日志)与触发结果都写入应用日志,不弹对话框。
+fn probe_telegram_inject(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let shared = state.shared.clone();
+        match crate::commands::probe_telegram_inject(state).await {
+            Ok(()) => {
+                shared
+                    .log("info", "tray", "已发出注入诊断探测，结果见 inject 日志")
+                    .await;
+            }
+            Err(error) => {
+                shared
+                    .log("warn", "tray", format!("注入诊断探测失败：{error}"))
+                    .await;
+            }
+        }
     });
 }

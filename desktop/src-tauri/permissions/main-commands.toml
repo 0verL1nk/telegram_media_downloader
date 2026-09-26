@@ -9,6 +9,7 @@ commands.allow = [
   "open_task_location",
   "get_logs",
   "ensure_telegram_webview",
+  "probe_telegram_inject",
   "set_telegram_webview_visible",
   "set_telegram_webview_bounds",
   "change_storage_root"
