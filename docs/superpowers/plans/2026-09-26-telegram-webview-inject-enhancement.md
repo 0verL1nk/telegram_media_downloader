@@ -2,29 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-> ## ⚠️ 2026-09-26 修订(第二次)
+> ## ⚠️ 2026-09-26 修订(第三次)
 >
-> 第一版计划(聊天列表消息按钮 + MTProto)已作废。原因:
-> 1. 聊天列表只有缩略图,拿不到原图 URL — 技术不可行
-> 2. 验证过的油猴脚本(#446342,23.9 万安装)全程只做**媒体查看器路径**
-> 3. 下载后端改为 HTTP(Telegram Web 文件 URL + Range 分块),不再走 MTProto
+> 1. 第一版(聊天列表消息按钮 + MTProto)作废:聊天列表只有缩略图,拿不到原图 URL;验证脚本(#446342,23.9 万安装)全程只做**媒体查看器路径**
+> 2. 第二版(Rust reqwest 拉取)作废:下载的网络请求必须**在页面里做**(与脚本逐字节一致),Rust 只收字节做管理
+> 3. **URL 永不进 Rust**;reqwest / url_validator / MTProto 全部不保留
 >
 > **不做单元测试**(JS 侧)。验证 = 真机 `npx tauri dev` 手工逐项确认。
-> Rust 侧保留 `cargo test` 惯例(纯逻辑 + 本地 mock server)。
+> Rust 侧保留 `cargo test` 惯例(纯逻辑)。
 >
-> 已完成且保留:
-> - Task A(旧):脚手架 `webview-inject/` 目录 ✅
-> - `icons.js`(11 个内联 SVG)✅
-> - 已删除:vitest 基础设施、media.js(消息检测,方案作废)、fixtures
+> 已完成且保留:脚手架、icons.js、extract.js、detect.js、button.js(含隐藏按钮接管)、state.js、task-state.js、watcher.js、inject.js、build.mjs、webview_bridge 打包嵌入、task_store 状态查询
 >
 > 规范: `docs/superpowers/specs/2026-09-26-telegram-webview-inject-enhancement-design.md`(注入脚本)
->       `docs/superpowers/specs/2026-09-26-webview-http-downloader-design.md`(下载后端)
+>       `docs/superpowers/specs/2026-09-26-webview-http-downloader-design.md`(下载管线:页面抓取 + IPC 分块)
 
-**Goal:** 把验证过的油猴脚本做法(#446342)搬进桌面客户端:查看器工具栏按钮 → 抓原始文件 URL → Rust HTTP 分块下载(任务队列/断点续传/并发/校验)。
+**Goal:** 把验证过的油猴脚本做法(#446342)搬进桌面客户端:查看器工具栏按钮 → 页面内抓取分块 → IPC 交给 Rust 落盘/记账/提交(任务队列/断点续传/并发/校验由 Rust 管理)。
 
-**Architecture:** 注入脚本 500ms 轮询检测媒体查看器/Story/置顶音频,向原生工具栏注入下载按钮;点击时读取媒体元素 `src`/`currentSrc` 与文件名,经 Tauri IPC 交给 Rust;Rust 用 reqwest + Range 头分块下载,复用现有 chunk_writer/task_store;事件回灌按钮状态。
+**Architecture:** 注入脚本 500ms 轮询检测媒体查看器/Story/置顶音频,向原生工具栏注入下载按钮;点击后 JS 探测大小 → 向 Rust 申请分块计划 → 页面内并发 `fetch` Range → 分块二进制经 Tauri IPC 推送 → Rust 用现有 chunk_writer 落盘、事件回灌按钮状态。
 
-**Tech Stack:** Rust(edition 2024)+ Tauri 2.11.6 + tokio + SeaORM + reqwest;vanilla JavaScript(ES2022);Node + terser(仅打包)。
+**Tech Stack:** Rust(edition 2024)+ Tauri 2.11.6 + tokio + SeaORM(无 HTTP 客户端);vanilla JavaScript(ES2022);Node + terser(仅打包)。
 
 ---
 
@@ -53,16 +49,15 @@
 
 | 路径 | 改动 | 说明 |
 |---|---|---|
-| `downloader.rs` | 改造 | 保留调度骨架(TaskControl/限流/分块编排/进度事件);`fetch_chunk` 换 reqwest;删 `refresh_location`/`verify_telegram_hashes`;任务创建改为 URL 基 |
-| `commands.rs` | 重构 | `submit_download_from_webview` 新 payload;删 batch/upload/forward/cloud/login 命令 |
-| `task_store.rs` | 扩展 | 新增 `media_url` / `file_name` 列 + `find_latest_by_file_name`(返回状态+taskId+进度) |
-| `db_migration.rs` | 扩展 | 新列迁移 |
-| `app_state.rs` | 调整 | 删 `telegram()`;接线新下载器 |
-| `webview_bridge.rs` | 调整 | `include_str!` 打包后的 inject.js |
-| `build.rs` | 扩展 | 调 `node webview-inject/build.mjs` |
-| `url_validator.rs` | 新建 | https + 白名单 + 拒私有 IP |
-| 删除 | — | `telegram.rs`、`secure_session.rs`、`transfers.rs`、`cloud_upload.rs`、`credentials.rs`、`legacy_config.rs`(迁移逻辑依赖旧配置,删除) |
-| `Cargo.toml` | 依赖 | +reqwest;−grammers-client/−grammers-session/−chacha20poly1305/−keyring |
+| `downloader.rs` | 重写 | 删 MTProto 拉取机制;新:槽位/通道/writer/看门狗(见 R2) |
+| `commands.rs` | 重构 | 新命令集(start/plan/push/finish/fail);删 batch/upload/forward/cloud/login/chats |
+| `task_store.rs` | ✅ 已有 | `find_latest_by_file_name`(状态查询)已落地 |
+| `db_migration.rs` | R1 | 000005 drop `media_url`(页面抓取不存 URL) |
+| `app_state.rs` | R2/R4 | 接线新管理器;R4 删 telegram/uploads/transfers 字段 |
+| `webview_bridge.rs` | ✅ 已有 | `include_str!` 打包后的 inject.js |
+| `build.rs` | ✅ 已有 | 调 `node webview-inject/build.mjs` |
+| 删除 | R4 | `telegram.rs`、`secure_session.rs`、`transfers.rs`、`cloud_upload.rs`、`credentials.rs`、`legacy_config.rs`、`filter.rs` |
+| `Cargo.toml` | R1+R4 | R1 删 reqwest/url_validator;R4 删 grammers-*/chacha20poly1305/keyring |
 
 ### 前端(desktop/src/)
 
@@ -585,403 +580,83 @@ if build_mjs.exists() {
 
 ---
 
-## Part 2 — Rust HTTP 下载
-
-### Task 8: reqwest 依赖 + url_validator.rs
-
-**Files:**
-- Modify: `desktop/src-tauri/Cargo.toml`
-- Create: `desktop/src-tauri/src/url_validator.rs`
-
-- [ ] **Step 1: Cargo.toml**
-
-```toml
-reqwest = { version = "=0.12.9", default-features = false, features = ["stream", "rustls-tls"] }
-```
-
-(其余 MTProto 依赖此阶段先保留,Task 12 统一删。)
-
-- [ ] **Step 2: url_validator.rs**
-
-```rust
-//! 媒体 URL 白名单校验。仅允许 https + Telegram 域;拒绝私网地址(SSRF 兜底)。
-
-use anyhow::{bail, Result};
-use url::Url;
-
-const ALLOWED_SUFFIXES: &[&str] = &[
-    ".telegram.org",
-    ".cdn-telegram.org",
-];
-
-pub fn validate_media_url(raw: &str) -> Result<Url> {
-    let url = Url::parse(raw).map_err(|e| anyhow::anyhow!("URL 无法解析:{e}"))?;
-    if url.scheme() != "https" {
-        bail!("仅允许 https URL");
-    }
-    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("URL 缺少主机名"))?;
-    let host_lower = host.to_ascii_lowercase();
-    let allowed = host_lower == "telegram.org"
-        || ALLOWED_SUFFIXES.iter().any(|suffix| host_lower.ends_with(suffix));
-    if !allowed {
-        bail!("URL 域名不在 Telegram 白名单内:{host}");
-    }
-    if is_private_host(&host_lower) {
-        bail!("拒绝私网地址");
-    }
-    Ok(url)
-}
-
-fn is_private_host(host: &str) -> bool {
-    if host == "localhost" || host == "::1" { return true; }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-    }
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test] fn accepts_telegram_https() {
-        assert!(validate_media_url("https://web.telegram.org/file/x").is_ok());
-        assert!(validate_media_url("https://cdn-telegram.org/a/b").is_ok());
-        assert!(validate_media_url("https://abc.cdn-telegram.org/a/b").is_ok());
-    }
-    #[test] fn rejects_non_telegram() {
-        assert!(validate_media_url("https://evil.com/x").is_err());
-        assert!(validate_media_url("https://telegram.org.evil.com/x").is_err());
-    }
-    #[test] fn rejects_non_https_and_private() {
-        assert!(validate_media_url("http://web.telegram.org/x").is_err());
-        assert!(validate_media_url("https://127.0.0.1/x").is_err());
-        assert!(validate_media_url("file:///etc/passwd").is_err());
-    }
-}
-```
-
-- [ ] **Step 3: 测试通过**:`cd desktop/src-tauri && cargo test --locked url_validator`
-- [ ] **Step 4: Commit**
-
----
-
-### Task 9: downloader.rs 换 HTTP(S)(改造现有调度骨架)
-
-**Files:**
-- Modify: `desktop/src-tauri/src/downloader.rs`
-
-保留:dispatch、TaskControl、pause/cancel/resume/retry、RequestLimiter、BandwidthLimiter、FloodGate、chunk 编排、进度事件、原子提交、BLAKE3 缺块恢复。
-替换:`fetch_chunk` 的协议实现;删除 `refresh_location`、`verify_telegram_hashes`、`is_file_reference_error`、`flood_wait_seconds`(MTProto 专属);任务创建改为 URL 基。
-
-- [ ] **Step 1: 新 fetch_chunk(HTTP Range)**
-
-```rust
-async fn fetch_chunk_http(
-    client: &reqwest::Client,
-    url: &str,
-    offset: u64,
-    length: u64,
-    retries: u32,
-    timeout: Duration,
-    token: &CancellationToken,
-    limiter: &Arc<RequestLimiter>,
-) -> Result<Vec<u8>> {
-    let end = offset + length - 1;
-    let mut attempt = 0_u32;
-    loop {
-        if token.is_cancelled() { bail!("任务已取消"); }
-        let _permit = limiter.acquire(token).await?;
-        let response = tokio::select! {
-            _ = token.cancelled() => bail!("任务已取消"),
-            r = tokio::time::timeout(timeout, client
-                .get(url)
-                .header(reqwest::header::RANGE, format!("bytes={offset}-{end}"))
-                .send()) => match r {
-                    Ok(result) => result,
-                    Err(_) => { attempt += 1; if attempt > retries { bail!("HTTP 请求超时(偏移 {offset})"); } tokio::time::sleep(backoff(attempt)).await; continue; }
-                }
-        };
-        match response {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 206 || status == 200 {
-                    let bytes = resp.bytes().await.context("读取响应体失败")?.to_vec();
-                    limiter.success();
-                    return Ok(bytes);
-                }
-                if status == 401 || status == 403 {
-                    bail!("URL 已过期或无权限,请重新打开该媒体后再试");
-                }
-                if status == 404 || status == 410 {
-                    bail!("文件已删除或 URL 失效");
-                }
-                if status == 416 {
-                    return Ok(Vec::new()); // 已到文件尾
-                }
-                attempt += 1;
-                if attempt > retries { bail!("HTTP 下载失败(状态 {status},偏移 {offset})"); }
-                tokio::time::sleep(backoff(attempt)).await;
-            }
-            Err(error) => {
-                attempt += 1;
-                if attempt > retries { bail!("HTTP 网络错误(偏移 {offset}):{error}"); }
-                tokio::time::sleep(backoff(attempt)).await;
-            }
-        }
-    }
-}
-```
-
-- [ ] **Step 2: 探测函数(HEAD / Range 探测)**
-
-```rust
-pub async fn probe_remote(client: &reqwest::Client, url: &str, timeout: Duration) -> Result<u64> {
-    let resp = client.head(url).timeout(timeout).send().await.context("HEAD 请求失败")?;
-    if !resp.status().is_success() {
-        bail!("URL 探测失败(状态 {})", resp.status());
-    }
-    let len = resp.content_length().context("服务器未返回 Content-Length")?;
-    Ok(len)
-}
-```
-
-Range 不支持(HEAD 无 `accept-ranges: bytes` 且首块返回 200 整文件)时,退化为单流整文件写入(单 worker、chunk_size = 总长)。
-
-- [ ] **Step 3: 任务创建改 URL 基**
-
-```rust
-pub async fn create_http_task(
-    shared: &Arc<SharedState>,
-    manager: &DownloadManager,
-    media_url: &str,
-    file_name: &str,
-    file_type: &str,
-    source: &str,
-) -> Result<TaskRecord> { /* validate url → probe → insert task_store(media_url, file_name, file_type, total) → enqueue */ }
-```
-
-- [ ] **Step 4: 全文件检索,删除所有 MTProto 调用与 `grammers_client::` 引用**
-
-`cd desktop/src-tauri && cargo check --locked`(此时 telegram.rs 仍在,会报未使用,属预期;Task 12 删除)
-
-- [ ] **Step 5: Commit**
-
----
-
-### Task 10: task_store.rs 新增列 + 任务状态查询
-
-**Files:**
-- Modify: `desktop/src-tauri/src/task_store.rs`
-- Modify: `desktop/src-tauri/src/db_migration.rs`
-- Modify: `desktop/src-tauri/src/models.rs`
-
-- [ ] **Step 1: 迁移新增列**
-
-`tasks` 表加 `media_url TEXT`、`file_name TEXT`;`chat_id`/`message_id` 保留列定义(避免 SQLite 迁移复杂度),新任务不写入。
-
-- [ ] **Step 2: `find_latest_by_file_name`**
-
-```rust
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskStateMatch {
-    pub state: String,          // "queued" | "downloading" | "completed" | "failed" | "none"
-    pub task_id: Option<String>,
-    pub progress: Option<f64>,  // 0..1,downloading 时
-    pub file_size: Option<u64>,
-    pub completed_at: Option<String>,
-}
-
-pub async fn find_latest_by_file_name(&self, file_name: &str) -> Result<TaskStateMatch> {
-    // SELECT task_id, status, downloaded_bytes, total_bytes, file_size, completed_at
-    //   FROM tasks
-    //  WHERE file_name = ? AND status != 'cancelled'
-    //  ORDER BY updated_at DESC LIMIT 1
-    // 无记录 → TaskStateMatch { state: "none", .. }
-    // progress = downloaded_bytes / total_bytes(downloading 时)
-}
-```
-
-- [ ] **Step 3: `cargo test --locked` + Commit**
-
----
-
-### Task 11: commands.rs 新 payload + app_state 接线
-
-**Files:**
-- Modify: `desktop/src-tauri/src/commands.rs`
-- Modify: `desktop/src-tauri/src/app_state.rs`
-- Modify: `desktop/src-tauri/src/lib.rs`
-
-- [ ] **Step 1: 新 `WebviewDownloadRequest`**
-
-```rust
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebviewDownloadRequest {
-    pub media_url: String,
-    pub file_name: Option<String>,
-    pub file_type: String,
-    pub source: String,
-}
-```
-
-- [ ] **Step 2: `submit_download_from_webview` 重写**
-
-```rust
-#[tauri::command(rename_all = "camelCase")]
-pub async fn submit_download_from_webview(
-    webview: Webview<Wry>,
-    state: State<'_, AppState>,
-    request: WebviewDownloadRequest,
-) -> Result<TaskRecord, String> {
-    if !webview_bridge::is_trusted_telegram_webview(&webview) {
-        return Err("下载请求必须来自受信任的 Telegram WebView 页面".into());
-    }
-    crate::url_validator::validate_media_url(&request.media_url).map_err(command_error)?;
-    let file_name = request.file_name.unwrap_or_else(|| "telegram_media.bin".into());
-    downloader::create_http_task(&state.shared, &state.downloads, &request.media_url,
-        &file_name, &request.file_type, &request.source)
-        .await.map_err(command_error)
-}
-```
-
-- [ ] **Step 3: 新命令 `webview_query_task_state`**
-
-```rust
-#[tauri::command(rename_all = "camelCase")]
-pub async fn webview_query_task_state(
-    state: State<'_, AppState>,
-    file_name: String,
-) -> Result<crate::task_store::TaskStateMatch, String> {
-    if file_name.trim().is_empty() || file_name.len() > 512 {
-        return Err("文件名无效".into());
-    }
-    state.shared.store
-        .find_latest_by_file_name(&file_name)
-        .await
-        .map_err(command_error)
-}
-```
-
-(替代旧的 `webview_query_downloaded`;payload 字段 `fileName`。)
-
-- [ ] **Step 4: 删除命令**:`submit_batch_download_from_webview`、全部 `*_upload*`/`*_forward*`/`*_transfer*`/`*_cloud*`/login 命令;`app_state.rs` 删 `telegram` 字段与 `telegram()`;`lib.rs` invoke_handler 同步。
-
-- [ ] **Step 5: build.rs AppManifest 命令列表同步**(删 batch 等)
-
-- [ ] **Step 6: `cargo check --locked`(暂时会有 telegram.rs 未使用警告)+ Commit**
-
----
-
-### Task 12: 删除 MTProto 模块 + Cargo 依赖清理
-
-**Files:**
-- Delete: `telegram.rs`、`secure_session.rs`、`transfers.rs`、`cloud_upload.rs`、`credentials.rs`、`legacy_config.rs`
-- Modify: `Cargo.toml`、`lib.rs`、`models.rs`(删关联类型)
-
-- [ ] **Step 1: 删文件 + 清理引用**
-
-```bash
-git rm desktop/src-tauri/src/telegram.rs \
-       desktop/src-tauri/src/secure_session.rs \
-       desktop/src-tauri/src/transfers.rs \
-       desktop/src-tauri/src/cloud_upload.rs \
-       desktop/src-tauri/src/credentials.rs \
-       desktop/src-tauri/src/legacy_config.rs
-```
-
-- [ ] **Step 2: Cargo.toml 删依赖**
-
-删:`grammers-client`、`grammers-session`、`chacha20poly1305`、`keyring`、`glass_pumpkin`(如无其他使用)。
-
-- [ ] **Step 3: 全量编译 + 测试**
-
-```bash
-cd desktop/src-tauri && cargo check --locked && cargo test --locked && cargo clippy --locked --all-targets
-```
-
-预期:全部通过;`grep -ri grammers src/` 为空。
-
-- [ ] **Step 4: Commit**
-
----
-
-### Task 13: 前端清理(api.ts / App.tsx)
-
-**Files:**
-- Modify: `desktop/src/lib/api.ts`
-- Modify: `desktop/src/App.tsx`
-
-- [ ] **Step 1: api.ts**
-
-删:upload/transfer/cloud 相关类型与函数、`ChatSummary`/`ChatMessage`、login 系列、`submitBatchDownloadFromWebview`。
-改:`webviewQueryTaskState(fileName)` 返回 `TaskStateMatch`(state/taskId/progress/fileSize/completedAt)。
-加:`DownloadTask` 增 `fileName?: string | null`。
-
-- [ ] **Step 2: App.tsx**
-
-删:上传页、云盘上传页、聊天浏览页、Telegram 登录卡片、设置页内的 API ID/Hash/代理/上传/云盘区块。
-保留:总览、Telegram Web(内嵌窗口)、下载任务、日志状态、设置(下载目录/命名/并发/限速/存储迁移)。
-
-- [ ] **Step 3: 类型检查 + 构建**
-
-```bash
-cd desktop && npm run check && npm run build
-```
-
-- [ ] **Step 4: Commit**
-
----
-
-### Task 14: 真机端到端验收
-
-**Files:** 无(纯验证)
-
-- [ ] **Step 1: 启动**
-
-```bash
-cd desktop && npx tauri dev
-```
-
-- [ ] **Step 2: 登录 Telegram Web**(WebView 内扫描二维码)
-
-- [ ] **Step 3: 逐项验收**(每项通过打勾)
-
-- [ ] 图片查看器 → 按钮出现在工具栏 → 点击 → 下载完成,文件可打开
-- [ ] 视频查看器 → 大文件(>10MB)→ Range 分块下载 → 文件可播放
-- [ ] GIF → 按钮 → 下载完成
-- [ ] 语音(置顶音频)→ 按钮 → 下载完成
-- [ ] Story → 按钮 → 下载完成
-- [ ] 禁保存频道的内容 → 可下载
-- [ ] 已下载文件重新打开 → 按钮显示已完成状态
-- [ ] 下载中杀掉客户端 → 重启 → 任务从断点恢复
-- [ ] webk(/k/)与 webz(/a/)两个版本各验证一遍
-- [ ] Rust 端:`grep -ri grammers desktop/src-tauri/src/` 为空
-
-- [ ] **Step 4: 记录失败项并修复**(逐项循环,不通过不结项)
-
-- [ ] **Step 5: 最终提交**
-
-```bash
-git add -A
-git commit -m "chore(desktop): finalize HTTP viewer downloader E2E verification"
-```
-
----
+## Part 2 — Rust 下载管线(页面 fetch + IPC 分块,2026-09-26 二次修订)
+
+规范:`docs/superpowers/specs/2026-09-26-webview-http-downloader-design.md`。要点:**下载的网络请求在页面里做(与脚本 #446342 一致),Rust 只收字节、落盘、记账、提交;URL 永不进 Rust;reqwest/url_validator 撤销;MTProto 不保留**。
+
+### Task R1: 清 reqwest/url_validator + drop media_url 迁移
+
+**Files:** `Cargo.toml`、`Cargo.lock`、`src/db_migration.rs`、`src/lib.rs`(+`src/entities.rs` 检查)
+
+- 删 `reqwest` 依赖;`cargo check`(不加 --locked,刷新锁文件)
+- `git rm src/url_validator.rs`;lib.rs 删 `mod url_validator;`
+- 新迁移 `m20260926_000005_drop_tasks_media_url`(drop column,按现有迁移模块样式)
+- 验证:`cargo check --locked` + `cargo test --locked`(评测数变化)+ fmt
+- Commit: `chore(desktop): drop reqwest and url_validator; add migration dropping tasks.media_url`
+
+### Task R2: downloader.rs 重写 + commands 新命令集
+
+**Files:** `src/downloader.rs`(重写主体)、`src/commands.rs`、`src/app_state.rs`、`src/lib.rs`、`build.rs`
+
+**删除**(MTProto 拉取机制不再适用):dispatch/TaskControl/RequestLimiter/BandwidthLimiter/FloodGate/fetch_chunk/refresh_location/verify_telegram_hashes/save_text_task/create_task_for_message*/create_text_task*/create_chat_tasks/batch_limit_reached/write_sidecars/matches_file_format
+**保留复用**:chunk_writer 全部、atomic_file、task_store、`output_path`(简化为 download_root + 净化文件名)、`apply_duplicate_policy`、`temporary_output_path`、`verified_final_file_matches_chunks`、`chunk_map_is_complete`、`join_download_children`、`safe_component`
+
+**新增管理面**(spec §4):
+- `slots: Semaphore(max_files)`;`channels: Map<taskId, mpsc::Sender<IncomingChunk>>`;`writers: Map<taskId, JoinHandle>`;`last_activity: Map<taskId, Instant>`
+- watchdog:10s 一跳;`downloading` 且 30s 无活动 → 标 paused + 发 `webview-download-abort`
+
+**新命令**(spec §3):
+- `start_webview_download {fileName, fileType, source} → {taskId}`(文件名净化/长度校验、重复策略)
+- `plan_chunks {taskId, totalBytes} → {chunkSizeBytes, concurrency, timeoutSeconds, retries, missing[]}`(幂等;total 不符报错;占槽位;启 writer)
+- `push_chunk`(taskId+offset + **raw bytes** body)→ mpsc 入队(背压)
+- `finish_download {taskId} → TaskRecord`;`fail_download {taskId, error} → TaskRecord`
+- `webview_query_task_state` 扩展 `resumable` 字段;`task_action` 重写(pause/cancel → abort 事件;retry → queued)
+- 事件:`webview-task-submitted/updated/completed/failed` + 新 `webview-download-abort`
+- **常量命名**(消灭魔法数字):`PROGRESS_TICK`(350ms)、`WATCHDOG_TICK`(10s)、`ACTIVITY_TIMEOUT`(30s)、`SLOT_WAIT_*`
+
+**删除的旧命令**:`submit_download_from_webview`(旧 payload)、`create_download_task`、`create_chat_download`(依赖已删的 downloader 函数)
+
+- 验证:`cargo test --locked`(新命令测试:文件名校验、plan 幂等/total 不符、push 乱序/越界/背压、finish 缺块拒绝/原子提交、watchdog 超时)+ fmt + clippy
+- Commit: `feat(desktop): rewrite downloader as webview page-fetch manager with IPC chunk ingest`
+
+### Task R3: JS downloader.js + watcher/state 接线
+
+**Files:** `webview-inject/src/downloader.js`(新)、`watcher.js`、`state.js`、`build.mjs`
+
+- downloader.js(spec §5):`probeTotal`(Range 0-0 → Content-Range total)、`fetchChunk`(206/200/416 处理)、`runDownload`(并发闸/块级重试退避/AbortController/带宽节流近似)→ `push_chunk`(二进制)→ `finish`/`fail_download`
+- 响应 `webview-download-abort` → abort 对应任务的全部在途 fetch
+- watcher 点击流程:start → probe → plan → run;state.js 增加 abort 订阅
+- build.mjs ORDER 插入 downloader.js;`node build.mjs` 重打包 + 冒烟
+- Commit: `feat(desktop): page-context chunked fetcher pushing bytes to Rust over IPC`
+
+### Task R4: 删 MTProto 模块 + 依赖 + 残留
+
+**Files:** 删除 `telegram.rs`、`secure_session.rs`、`transfers.rs`、`cloud_upload.rs`、`credentials.rs`、`legacy_config.rs`、`filter.rs`(确认为孤儿后);`Cargo.toml`(−grammers-client/−grammers-session/−chacha20poly1305/−keyring/−glass_pumpkin);`app_state.rs`、`commands.rs`、`lib.rs`、`models.rs`、`storage.rs`(如引用)
+
+- 删除命令:`login_*`/`logout_session`/`list_chats`/`get_chat_messages`/`upload_completed_download`/`forward_telegram_message`/`list_telegram_transfers`/`telegram_transfer_action`/`queue_cloud_upload`/`list_cloud_uploads`/`cloud_upload_action`/`import_legacy_config`
+- 保留面(硬约束):任务页/设置(下载目录+迁移)/日志/WebView;`change_storage_root` 清掉对已删 manager 的等待
+- 验证:`cargo check --locked` + `cargo test --locked` + clippy + fmt;`grep -ri grammers src/ Cargo.toml` 为空
+- Commit: `refactor(desktop): remove MTProto, transfers, cloud upload, and credentials modules`
+
+### Task R5: 前端清理
+
+**Files:** `src/lib/api.ts`、`src/App.tsx`、`src/app.css`
+
+- 删:上传页/云盘页/聊天浏览页/登录卡片与相关类型、调用
+- 保留:总览、Telegram Web 窗口、下载任务页(队列/进度/速度/暂停/继续/取消/重试/历史/打开位置)、日志、设置(下载目录选择+存储迁移、并发/分块/超时/重试/限速、WebView2 profile)
+- 验证:`npm run check` + `npm run build`
+- Commit: `refactor(desktop): remove dead pages and types from the client UI`
+
+### Task R6: 真机端到端验收
+
+- `npx tauri dev`:登录 Telegram Web → 六类媒体 + Story + 置顶音频 下载 → 大文件 IPC 吞吐 → 杀客户端续传 → 关 WebView 看门狗恢复 → 暂停/取消/重试 → 禁保存 + URL 过期
+- 客户端可用性清单(硬约束):任务页全功能、设置生效、无死页面
+- 失败逐项修复,通过后提交
 
 ## 依赖关系
 
 ```
-Task 1 (清理+config)
-Task 2 (extract) ─┬─ Task 3 (detect) ─ Task 4 (button) ─ Task 5 (state+dedupe) ─ Task 6 (watcher+inject+build) ─ Task 7 (bridge+build.rs)
-Task 8 (reqwest+validator) ─ Task 9 (downloader HTTP) ─ Task 10 (store) ─ Task 11 (commands) ─ Task 12 (删 MTProto)
-Task 13 (前端) 依赖 Task 11
-Task 14 (E2E) 依赖全部
+已完成:Task 1-7(注入脚本全部)+ Task 10(store 状态查询)
+R1(清依赖/迁移) ─ R2(下载管理器+命令) ─ R3(JS 抓取接线) ─ R4(删 MTProto) ─ R5(前端清理) ─ R6(真机验收)
+R4 依赖 R2(命令形态定稿);R5 依赖 R4(API 集合定稿);R6 依赖全部
 ```
-
-JS 链(Task 1-7)与 Rust 链(Task 8-12)可并行推进;Task 14 需两者都完成。

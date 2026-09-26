@@ -161,6 +161,19 @@ WebviewDownloadManager
 | JS 并发抓取触发 Telegram 限流 | 并发数默认保守(4);块级退避 |
 | 看门狗误判慢速下载为中断 | "活动"定义 = 收到任意 push/finish;30s 阈值 + 慢速场景下进度事件也算活动 |
 
+## 11.5 后续(v2,不做进本批)— 自适应并发
+
+固定默认 4 路 + 手动设置是 v1 方案。v2 加自适应(算法有文献背书,见下),作为设置页的"自动并发"开关:
+
+- 初始并发 `c₀ = 2`;采样周期 `T = 5s`;每周期用 Rust 端已有 `speed_bytes_per_second` 测聚合吞吐
+- 提升 ≥ 10% → 增(×1.5);持平 → 保持;**下降 → 回退(×0.5)**;上限 = 用户设置的最大值
+- 收敛一般 2-3 个周期(约 10-15 秒);因 HTTP/2 多路复用收益曲线较平,增量设保守
+- 文献依据:
+  - Yildirim/Kosar et al., *Dynamically Tuning Level of Parallelism in Wide Area Data Transfers*(DADC'07)—"逐步加大并发、不再提升即停,收敛到近似最优"
+  - Balman et al., *Adaptive Transfer Adjustment*(LBL PDCS'10)—用历史传输记录推算参数
+  - ADAPT(LBL/NSF 2014)—参数化自适应框架(初始并发/增因子/减因子/采样周期)
+  - Zhang et al., *Reasons Not to Parallelize TCP*(IEICE'05)—并行连接会互相竞争,必须带上限与回退
+
 ## 12. 验收标准
 
 - [ ] `cargo test --locked` 全绿(含新管理器测试)
