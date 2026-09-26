@@ -43,7 +43,7 @@ Telegram Web 子 WebView (web.telegram.org/k 或 /a)
 │  ├─ detect.js   在打开的查看器里找到媒体元素与类型     │
 │  ├─ button.js   向查看器工具栏注入按钮 + 5 状态机      │
 │  ├─ extract.js  从媒体元素读 URL;从 URL 解析文件名     │
-│  ├─ dedupe.js   已下载查询(按文件名)+ TTL 缓存       │
+│  ├─ task-state.js  任务状态查询(按文件名)+ TTL 缓存      │
 │  ├─ state.js    Tauri 事件订阅 → 按钮状态             │
 │  ├─ icons.js    内联 SVG(已完成)                    │
 │  └─ config.json webk/webz 两套 selector + 参数        │
@@ -195,12 +195,23 @@ ready → submitting → queued → downloading → completed
 - 点击时实时 `extract` 当前媒体 → `invoke` → 记录 `taskId → button` 映射
 - 重复点击(ready 时)= 强制重下,由 Rust 端 `duplicatePolicy` 决定落地行为
 
-### 4.6 dedupe.js
+### 4.6 task-state.js(任务状态感知)
 
-- 查看器路径拿不到 messageId,去重键 = **文件名**(`extract` 解析出的 `metadata.fileName`)
-- 文件名拿不到时跳过去重(按钮直接 ready)
-- `invoke('webview_query_downloaded', {fileName})` → 5s TTL 缓存
-- 命中的按钮初始状态显示 ✓(已完成样式)
+**目的**:打开查看器时,用户立刻看到这个文件在 Rust 里的状态 — 从没下过 / 正在下载 / 已下载过 / 上次失败。
+
+- 查询键 = **文件名**(`extract` 解析出的 `metadata.fileName`);查不到文件名时跳过查询,按钮直接 ready
+- `invoke('webview_query_task_state', {fileName})` → `{ state, taskId?, progress?, fileSize?, completedAt? }`
+  - `state`: `'queued' | 'downloading' | 'completed' | 'failed' | 'none'`(取该文件名**最近一条**任务;已取消视为 none)
+- 5s TTL 缓存(同一文件名查过一次短时间内不重复查)
+- 按结果设置按钮初始状态:
+  | Rust 状态 | 按钮初始状态 |
+  |---|---|
+  | `queued` | `queued`(已加入队列) |
+  | `downloading` | `downloading` + 进度 |
+  | `completed` | `completed`(✓) |
+  | `failed` | `failed`(可点击重试) |
+  | `none` / 查询失败 | `ready` |
+- **关键**:若状态为 `queued`/`downloading`,必须把 `taskId` 注册进 `state.js` 的映射(`registerTask`),这样后续进度/完成事件能继续更新这个按钮 — 即"重开查看器仍能看到实时进度"
 
 ### 4.7 state.js
 
@@ -262,12 +273,20 @@ window.__TAURI__.core.invoke('submit_download_from_webview', {
 → 返回 TaskRecord(含 taskId)
 ```
 
-### 5.2 查询已下载
+### 5.2 查询任务状态
 
 ```ts
-window.__TAURI__.core.invoke('webview_query_downloaded', { fileName })
-→ DownloadedMatch | null
+window.__TAURI__.core.invoke('webview_query_task_state', { fileName })
+→ {
+    state: 'queued' | 'downloading' | 'completed' | 'failed' | 'none',
+    taskId?: string,      // queued/downloading 时必填(注册给 state.js 用)
+    progress?: number,    // downloading 时 0..1
+    fileSize?: number | null,
+    completedAt?: string | null,
+  }
 ```
+
+取该文件名**最近一条**任务的状态;已取消(cancelled)的任务视为 `none`。
 
 ### 5.3 任务事件(反向)
 
