@@ -70,3 +70,7 @@ config.yaml
 data.yaml
 *.scss
 *.css.map
+
+# Desktop client TS sources live under src/lib（覆盖上面的 Python 打包规则 lib/）
+!desktop/src/lib/
+.playwright-mcp/

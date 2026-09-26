@@ -1,0 +1,61 @@
+name: Desktop client
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "desktop/**"
+      - "docs/**"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "desktop/**"
+      - "docs/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    name: Windows x64 checks and installers
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+      - name: Install frontend packages
+        working-directory: desktop
+        run: npm ci
+      - name: Type-check and build React UI
+        working-directory: desktop
+        run: npm run build
+      - name: Check Rust formatting
+        working-directory: desktop/src-tauri
+        run: cargo fmt --all -- --check
+      - name: Test Rust core
+        working-directory: desktop/src-tauri
+        run: cargo test --locked
+      - name: Build MSI and NSIS installers
+        working-directory: desktop
+        run: npx tauri build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-media-downloader-windows-x64
+          path: |
+            desktop/src-tauri/target/release/bundle/msi/*.msi
+            desktop/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+# To extend the matrix, add macos-latest/Linux runners with their required
+# Tauri system libraries, keep the same npm/cargo check steps, and enable the
+# corresponding Tauri bundle targets in tauri.conf.json.
