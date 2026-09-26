@@ -3,10 +3,11 @@
 // 5s TTL 缓存,避免查看器轮询重复查询。
 
 const cache = new Map();
+const DEFAULT_TTL_MS = 5000;
 
 export async function queryTaskState(fileName, cfg) {
   if (!fileName) return { state: 'none' };
-  const ttl = (cfg && cfg.dedupeCacheTtlMs) ?? 5000;
+  const ttl = (cfg && cfg.dedupeCacheTtlMs) ?? DEFAULT_TTL_MS;
   const now = Date.now();
   const hit = cache.get(fileName);
   if (hit && now - hit.at < ttl) return hit.value;

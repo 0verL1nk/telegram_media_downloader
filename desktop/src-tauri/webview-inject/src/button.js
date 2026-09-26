@@ -57,6 +57,11 @@ export function ensureButton(version, cfg, detected, onDownload, onRetry) {
   return btn;
 }
 
+// 状态视觉常量(done/failed 覆盖原生按钮颜色)
+const DONE_COLOR = '#4dcd5e';
+const FAILED_COLOR = '#e53935';
+const PULSE_OPACITY = 0.5;
+
 export function setButtonState(btn, state, payload) {
   if (!btn) return;
   btn.dataset.telState = state;
@@ -80,9 +85,9 @@ export function injectButtonStyles() {
   style.id = 'tel-download-style';
   style.textContent = `
     .tel-download[data-tel-state="downloading"] { animation: tel-pulse 1s infinite; }
-    .tel-download.tel-download-done { color: #4dcd5e !important; }
-    .tel-download.tel-download-failed { color: #e53935 !important; }
-    @keyframes tel-pulse { 50% { opacity: .5; } }
+    .tel-download.tel-download-done { color: ${DONE_COLOR} !important; }
+    .tel-download.tel-download-failed { color: ${FAILED_COLOR} !important; }
+    @keyframes tel-pulse { 50% { opacity: ${PULSE_OPACITY}; } }
   `;
   (document.head || document.documentElement).appendChild(style);
 }
