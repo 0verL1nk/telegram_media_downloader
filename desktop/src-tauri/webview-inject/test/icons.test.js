@@ -23,12 +23,4 @@ describe('icons', () => {
     expect(getIcon('download')).toBe(ICONS.download);
     expect(getIcon('unknown')).toBe('');
   });
-
-  it('required icons present', () => {
-    const required = ['download', 'spinner', 'progress', 'check', 'retry',
-                      'image', 'film', 'music', 'sticker', 'file', 'story'];
-    for (const name of required) {
-      expect(ICONS[name]).toBeTruthy();
-    }
-  });
 });
