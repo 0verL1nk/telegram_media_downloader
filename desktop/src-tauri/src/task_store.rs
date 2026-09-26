@@ -62,14 +62,6 @@ impl TaskStore {
     }
 
     pub async fn create(&self, record: &TaskRecord) -> Result<()> {
-        self.create_with_source(record, "mtproto").await
-    }
-
-    pub async fn create_webview(&self, record: &TaskRecord) -> Result<()> {
-        self.create_with_source(record, "webview").await
-    }
-
-    async fn create_with_source(&self, record: &TaskRecord, source: &str) -> Result<()> {
         let total = record.total_bytes.unwrap_or(0);
         if total > i64::MAX as u64 {
             bail!("媒体文件长度超出任务数据库可表示范围");
@@ -94,99 +86,10 @@ impl TaskStore {
             completed_at: Set(None),
             group_id: Set(record.group_id.clone()),
             retry_count: Set(0),
-            download_source: Set(source.to_owned()),
         }
         .insert(&self.db)
         .await
         .context("无法创建下载任务")?;
-        Ok(())
-    }
-
-    pub async fn is_webview_download(&self, id: &str) -> Result<bool> {
-        Ok(task::Entity::find_by_id(id)
-            .one(&self.db)
-            .await?
-            .is_some_and(|row| row.download_source == "webview"))
-    }
-
-    pub async fn list_mtproto_queued(&self, limit: usize) -> Result<Vec<TaskRecord>> {
-        Ok(task::Entity::find()
-            .filter(task::Column::Status.eq("queued"))
-            .filter(task::Column::DownloadSource.ne("webview"))
-            .order_by_asc(task::Column::CreatedAt)
-            .limit(limit.clamp(1, 2_000) as u64)
-            .all(&self.db)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect())
-    }
-
-    pub async fn set_webview_started(
-        &self,
-        id: &str,
-        file_name: &str,
-        target_path: &str,
-        total_bytes: Option<u64>,
-    ) -> Result<()> {
-        if total_bytes.is_some_and(|total| total > i64::MAX as u64) {
-            bail!("WebView 下载文件长度超出任务数据库可表示范围");
-        }
-        let transaction = self.db.begin().await?;
-        let row = task::Entity::find_by_id(id)
-            .one(&transaction)
-            .await?
-            .with_context(|| format!("未找到 WebView 下载任务：{id}"))?;
-        if row.download_source != "webview"
-            || !matches!(row.status.as_str(), "queued" | "downloading")
-        {
-            bail!("WebView 下载任务当前状态不能开始");
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        let mut active: task::ActiveModel = row.clone().into();
-        active.file_name = Set(file_name.to_owned());
-        active.target_path = Set(target_path.to_owned());
-        active.total_bytes = Set(total_bytes.unwrap_or(0) as i64);
-        active.status = Set("downloading".to_owned());
-        active.error = Set(None);
-        active.updated_at = Set(now.clone());
-        if row.started_at.is_none() {
-            active.started_at = Set(Some(now));
-        }
-        active.update(&transaction).await?;
-        transaction.commit().await?;
-        Ok(())
-    }
-
-    pub async fn update_webview_progress(
-        &self,
-        id: &str,
-        completed: u64,
-        total: Option<u64>,
-        speed: u64,
-    ) -> Result<()> {
-        if total.is_some_and(|value| value > i64::MAX as u64) {
-            bail!("WebView 下载文件长度超出任务数据库可表示范围");
-        }
-        let row = task::Entity::find_by_id(id)
-            .one(&self.db)
-            .await?
-            .with_context(|| format!("未找到 WebView 下载任务：{id}"))?;
-        if row.download_source != "webview" || row.status != "downloading" {
-            return Ok(());
-        }
-        let total_value = total.map(|value| value.min(i64::MAX as u64) as i64);
-        let completed = total_value
-            .filter(|value| *value > 0)
-            .map_or(completed, |value| completed.min(value as u64));
-        let mut active: task::ActiveModel = row.into();
-        active.completed_bytes = Set(completed.min(i64::MAX as u64) as i64);
-        if let Some(total) = total_value {
-            active.total_bytes = Set(total);
-        }
-        active.speed_bytes_per_second = Set(speed.min(i64::MAX as u64) as i64);
-        active.updated_at = Set(chrono::Utc::now().to_rfc3339());
-        active.update(&self.db).await?;
         Ok(())
     }
 
@@ -747,12 +650,6 @@ impl TaskStore {
     async fn recover_interrupted(&self) -> Result<()> {
         let interrupted = task::Entity::find()
             .filter(task::Column::Status.eq("downloading"))
-            .filter(task::Column::DownloadSource.ne("webview"))
-            .all(&self.db)
-            .await?;
-        let interrupted_webview = task::Entity::find()
-            .filter(task::Column::DownloadSource.eq("webview"))
-            .filter(task::Column::Status.is_in(["queued", "downloading", "paused"]))
             .all(&self.db)
             .await?;
         let interrupted_uploads = upload_task::Entity::find()
@@ -768,7 +665,6 @@ impl TaskStore {
             .all(&self.db)
             .await?;
         if interrupted.is_empty()
-            && interrupted_webview.is_empty()
             && interrupted_uploads.is_empty()
             && interrupted_transfers.is_empty()
         {
@@ -781,17 +677,6 @@ impl TaskStore {
             active.error = Set(Some("应用意外退出，任务已恢复".into()));
             active.speed_bytes_per_second = Set(0);
             active.updated_at = Set(chrono::Utc::now().to_rfc3339());
-            active.update(&transaction).await?;
-        }
-        for model in interrupted_webview {
-            let mut active: task::ActiveModel = model.into();
-            active.status = Set("failed".into());
-            active.error = Set(Some(
-                "WebView2 下载操作在应用关闭后已无法恢复；请回到原消息再次点击下载，不支持重启后断点续传".into(),
-            ));
-            active.speed_bytes_per_second = Set(0);
-            active.updated_at = Set(chrono::Utc::now().to_rfc3339());
-            active.completed_at = Set(Some(chrono::Utc::now().to_rfc3339()));
             active.update(&transaction).await?;
         }
         for model in interrupted_uploads {
@@ -1129,82 +1014,5 @@ mod tests {
         assert_eq!(downloading.progress, Some(0.25));
         assert_eq!(downloading.file_size, Some(1024));
         assert!(downloading.completed_at.is_none());
-    }
-
-    #[tokio::test]
-    async fn webview_tasks_track_unknown_length_and_are_not_mtp_dispatch_candidates() {
-        let dir = tempdir().unwrap();
-        let store = TaskStore::open(&dir.path().join("db.sqlite"))
-            .await
-            .unwrap();
-        store.create_webview(&record("webview-1")).await.unwrap();
-        store.create(&record("mtproto-1")).await.unwrap();
-        store
-            .set_webview_started(
-                "webview-1",
-                "suggested.mp4",
-                r"C:\Media\suggested.mp4",
-                None,
-            )
-            .await
-            .unwrap();
-        store
-            .update_webview_progress("webview-1", 512, None, 128)
-            .await
-            .unwrap();
-
-        let webview = store.get("webview-1").await.unwrap().unwrap();
-        assert_eq!(webview.status, "downloading");
-        assert_eq!(webview.file_name.as_deref(), Some("suggested.mp4"));
-        assert_eq!(
-            webview.output_path.as_deref(),
-            Some(r"C:\Media\suggested.mp4")
-        );
-        assert_eq!(webview.downloaded_bytes, 512);
-        assert_eq!(webview.total_bytes, None);
-        assert_eq!(webview.speed_bytes_per_second, 128);
-        assert!(store.is_webview_download("webview-1").await.unwrap());
-
-        let queued = store.list_mtproto_queued(20).await.unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].task_id, "mtproto-1");
-    }
-
-    #[tokio::test]
-    async fn webview_operations_are_not_marked_resumable_after_restart() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("db.sqlite");
-        let store = TaskStore::open(&path).await.unwrap();
-        store
-            .create_webview(&record("webview-restart"))
-            .await
-            .unwrap();
-        store
-            .set_webview_started(
-                "webview-restart",
-                "sample.mp4",
-                r"C:\Media\sample.mp4",
-                Some(1024),
-            )
-            .await
-            .unwrap();
-        store
-            .set_status("webview-restart", "paused", None)
-            .await
-            .unwrap();
-        drop(store);
-
-        let reopened = TaskStore::open(&path).await.unwrap();
-        let record = reopened.get("webview-restart").await.unwrap().unwrap();
-        assert_eq!(record.status, "failed");
-        assert!(record.error.as_deref().unwrap().contains("再次点击下载"));
-        assert!(
-            record
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("不支持重启后断点续传")
-        );
-        assert!(reopened.list_mtproto_queued(20).await.unwrap().is_empty());
     }
 }
