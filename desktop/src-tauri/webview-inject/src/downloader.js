@@ -160,6 +160,7 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
       // Rust 侧已暂停/取消(收到 abort 事件);不要覆盖它的状态
       throw new DOMException('已中止', 'AbortError');
     }
+    controller.abort(); // 停止其余在途 fetch,避免向已失败任务继续推送
     const message = error instanceof Error ? error.message : String(error);
     await window.__TAURI__.core.invoke('fail_download', { taskId, error: message }).catch(() => {});
     throw error;

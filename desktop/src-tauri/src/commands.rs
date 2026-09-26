@@ -1166,7 +1166,7 @@ pub async fn webview_query_task_state(
         .find_latest_by_file_name(file_name)
         .await
         .map_err(command_error)?;
-    let resumable = matches!(found.state.as_str(), "queued" | "downloading");
+    let resumable = matches!(found.state.as_str(), "queued" | "downloading" | "paused");
     Ok(WebviewTaskState {
         state: found.state,
         task_id: found.task_id,
