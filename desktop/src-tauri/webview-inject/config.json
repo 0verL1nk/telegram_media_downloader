@@ -1,0 +1,27 @@
+{
+  "observerDebounceMs": 50,
+  "observerAttributeFilter": [
+    "data-mid",
+    "data-peer-id",
+    "data-protected",
+    "class",
+    "aria-disabled"
+  ],
+  "messageSelectors": [
+    ".message[data-mid]",
+    ".Message[data-mid]",
+    "[data-mid][data-peer-id]"
+  ],
+  "storySelectors": [
+    "[data-story-viewer]",
+    ".StoryViewer"
+  ],
+  "duplicateWindowBytes": 5120,
+  "dedupeCacheTtlMs": 5000,
+  "batchMaxSize": 32,
+  "buttonStackPosition": "top-right",
+  "iconSize": 16,
+  "spinnerSize": 12,
+  "visibleMinWidth": 100,
+  "protectedAncestorDepth": 5
+}
