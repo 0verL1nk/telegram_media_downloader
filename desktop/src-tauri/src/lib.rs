@@ -9,6 +9,7 @@ mod log_store;
 mod models;
 mod storage;
 mod task_store;
+mod tray;
 mod webview_bridge;
 
 use app_state::AppState;
@@ -34,7 +35,17 @@ pub fn run() {
             let state = tauri::async_runtime::block_on(AppState::initialize(handle.clone()))
                 .map_err(|error| std::io::Error::other(format!("初始化客户端失败：{error:#}")))?;
             app.manage(state);
+            tray::build_tray(app.handle())?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 关闭主窗口只隐藏到托盘，后台下载继续；真正的退出走托盘菜单「退出」。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && window.label() == tray::MAIN_WINDOW_LABEL
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_state,
