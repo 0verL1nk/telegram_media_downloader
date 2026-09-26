@@ -13,6 +13,14 @@ export function registerTask(taskId, btn) {
   activeTaskByButton.set(btn, taskId);
 }
 
+export function releaseButton(btn) {
+  const prev = activeTaskByButton.get(btn);
+  if (prev) {
+    byTask.delete(prev);
+    activeTaskByButton.delete(btn);
+  }
+}
+
 export function bindEvents() {
   const listen = window.__TAURI__.event.listen;
 
