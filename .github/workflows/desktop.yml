@@ -7,6 +7,8 @@ on:
       - "desktop/**"
       - "docs/**"
       - ".github/workflows/desktop.yml"
+    # 打 v* 标签时自动打包并发布 Release(路径过滤不作用于标签推送)
+    tags: ["v*"]
   pull_request:
     branches: [master]
     paths:
@@ -16,7 +18,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  windows-x64:
+  checks:
     name: Windows x64 checks and installers
     runs-on: windows-latest
     steps:
@@ -44,10 +46,13 @@ jobs:
       - name: Test Rust core
         working-directory: desktop/src-tauri
         run: cargo test --locked
+      # 标签推送时由 release 任务统一构建并签名,这里跳过以免重复出包
       - name: Build MSI and NSIS installers
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         working-directory: desktop
         run: npx tauri build
       - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           name: telegram-media-downloader-windows-x64
           path: |
@@ -56,6 +61,55 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  release:
+    name: Publish signed release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: checks
+    runs-on: windows-latest
+    permissions:
+      contents: write # 创建 Release 并上传安装包、签名与 latest.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+      - name: Install frontend packages
+        working-directory: desktop
+        run: npm ci
+      # tauri-action 负责 `tauri build`、创建同名 Release、上传安装包与 `.sig` 签名,
+      # 并生成 updater 的 latest.json(应用内“检查更新”读取的清单)。
+      # createUpdaterArtifacts 只在此处以 --config 打开:若写进 tauri.conf.json,
+      # 本地 `npx tauri build` 会因为没有 TAURI_SIGNING_PRIVATE_KEY 而直接失败。
+      # updaterJsonPreferNsis: NSIS 默认按当前用户安装,更新时无需 UAC 提权。
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          releaseBody: "" # 留空,使用自动生成的发行说明
+          releaseDraft: false
+          prerelease: false
+          generateReleaseNotes: true
+          updaterJsonPreferNsis: true
+          args: --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+# 发布流程:更新 desktop/src-tauri/tauri.conf.json 与 desktop/package.json 的版本,
+# 提交后打标签并推送:`git tag v0.2.1 && git push origin v0.2.1`
+# 打标签会触发 checks 再进入 release:tauri-action 构建 MSI/NSIS 安装包(附带 .sig 签名),
+# 创建同名 GitHub Release,并上传 latest.json 供应用内自动更新使用。
+# 注意:只有内置了 updater 插件的版本(≥ 本次发布)才能自动更新;更早的手动安装版本
+# 需要用户自行下载安装一次带 updater 的版本。
+#
 # To extend the matrix, add macos-latest/Linux runners with their required
 # Tauri system libraries, keep the same npm/cargo check steps, and enable the
 # corresponding Tauri bundle targets in tauri.conf.json.

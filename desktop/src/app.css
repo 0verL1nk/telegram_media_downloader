@@ -375,6 +375,13 @@
   .check-box { display: grid; width: 16px; height: 16px; flex: 0 0 auto; place-items: center; color: transparent; border: 1px solid #dce6df; border-radius: 5px; background: #fff; }
   .settings-note { display: flex; align-items: flex-start; gap: 7px; padding: 9px; color: #8e9f96; border-radius: 7px; background: #f7faf7; font-size: 8px; line-height: 1.55; }
   .settings-note svg { flex: 0 0 auto; color: #83a397; }
+  .update-status-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+  .update-status-copy { display: grid; min-width: 0; gap: 4px; }
+  .update-status-copy strong { color: #60766e; font-size: 10px; font-weight: 620; }
+  .update-status-copy small { color: #a0aca5; font-size: 8px; font-weight: 400; line-height: 1.55; }
+  .update-actions { display: flex; align-items: center; gap: 8px; }
+  .update-progress { display: grid; gap: 6px; }
+  .update-progress small { color: #8e9f96; font-size: 8px; }
   .settings-side-column { display: grid; gap: 12px; }
   .settings-side-card { padding: 15px; }
   .settings-side-icon { display: grid; width: 31px; height: 31px; place-items: center; margin-bottom: 12px; color: #4b8b76; border-radius: 9px; background: #edf6ee; }

@@ -1,6 +1,8 @@
 import { startTransition, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   api,
   friendlyError,
@@ -21,6 +23,7 @@ import { Tabs, TabsList, TabsTrigger } from "./components/ui/tabs";
 type PageKey = "telegram" | "downloads" | "logs" | "settings";
 type TaskFilter = "all" | "downloading" | "queued" | "paused" | "completed" | "failed";
 type Toast = { kind: "success" | "error" | "info"; message: string };
+type UpdatePhase = "idle" | "checking" | "current" | "available" | "installing" | "ready";
 
 const navigation: { id: "telegram" | "downloads"; label: string; icon: string }[] = [
   { id: "telegram", label: "Telegram Web", icon: "telegram" },
@@ -122,6 +125,10 @@ function App() {
   const [storageConfirm, setStorageConfirm] = useState(false);
   const [logLevel, setLogLevel] = useState("all");
   const [webviewError, setWebviewError] = useState("");
+  const [updatePhase, setUpdatePhase] = useState<UpdatePhase>("idle");
+  const [updateRelease, setUpdateRelease] = useState<{ version: string } | null>(null);
+  const [updateProgress, setUpdateProgress] = useState(0);
+  const pendingUpdateRef = useRef<Update | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stats = appState?.stats ?? null;
@@ -544,6 +551,74 @@ function App() {
     }
   }
 
+  async function checkForUpdates() {
+    if (updatePhase === "checking" || updatePhase === "installing") return;
+    setUpdatePhase("checking");
+    try {
+      const update = await check();
+      if (!update) {
+        setUpdateRelease(null);
+        setUpdatePhase("current");
+        return;
+      }
+      const previous = pendingUpdateRef.current;
+      pendingUpdateRef.current = update;
+      if (previous) void previous.close().catch(() => undefined);
+      setUpdateRelease({ version: update.version });
+      setUpdatePhase("available");
+    } catch (error) {
+      setUpdatePhase("idle");
+      notify(`检查更新失败：${friendlyError(error)}`, "error");
+    }
+  }
+
+  function dismissUpdate() {
+    const pending = pendingUpdateRef.current;
+    pendingUpdateRef.current = null;
+    if (pending) void pending.close().catch(() => undefined);
+    setUpdateRelease(null);
+    setUpdatePhase("idle");
+  }
+
+  async function installUpdate() {
+    const update = pendingUpdateRef.current;
+    if (!update || updatePhase === "installing") return;
+    setUpdatePhase("installing");
+    setUpdateProgress(0);
+    let totalBytes = 0;
+    let receivedBytes = 0;
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          totalBytes = event.data.contentLength ?? 0;
+          receivedBytes = 0;
+          setUpdateProgress(0);
+        } else if (event.event === "Progress") {
+          receivedBytes += event.data.chunkLength;
+          setUpdateProgress(totalBytes > 0 ? Math.min(100, Math.round((receivedBytes / totalBytes) * 100)) : 0);
+        } else {
+          setUpdateProgress(100);
+        }
+      });
+      // Windows 下安装程序接管后会直接结束当前进程并自动启动新版本；
+      // 若进程仍存活（例如安装器未自动重启），则提示用户手动重启。
+      pendingUpdateRef.current = null;
+      setUpdatePhase("ready");
+      notify("更新已安装，重启后生效。");
+    } catch (error) {
+      setUpdatePhase("available");
+      notify(`安装更新失败：${friendlyError(error)}`, "error");
+    }
+  }
+
+  async function restartForUpdate() {
+    try {
+      await relaunch();
+    } catch (error) {
+      notify(`无法自动重启：${friendlyError(error)}，请手动关闭并重新打开应用。`, "error");
+    }
+  }
+
   function updateSettings(update: Partial<Settings>) {
     setEditableSettings((current) => current ? { ...current, ...update } : current);
   }
@@ -657,6 +732,31 @@ function App() {
                   <Card className="settings-panel"><div className="panel-heading"><div><span className="eyebrow">下载队列</span><h2>队列管理</h2></div><span className="settings-heading-icon"><Icon name="bolt" size={18} /></span></div><div className="settings-two-col"><label>最多同时下载<input type="number" min="1" max="64" value={editableSettings.concurrency.maxFiles} onChange={(event) => updateConcurrency({ maxFiles: Number(event.target.value) })} /><small>同时抓取的文件数量，最多 64。</small></label><label>每文件分块并发<input type="number" min="1" max="32" value={editableSettings.concurrency.perFileChunks} onChange={(event) => updateConcurrency({ perFileChunks: Number(event.target.value) })} /><small>单个文件内部并发抓取的分块数量。</small></label></div><div className="settings-two-col"><label>分块大小（KiB）<input type="number" min="64" max="4096" step="64" value={editableSettings.concurrency.chunkSizeKib} onChange={(event) => updateConcurrency({ chunkSizeKib: Number(event.target.value) })} /><small>抓取时会就近对齐到 64 / 128 / 256 / 512 / 1024 KiB。</small></label><label>请求超时（秒）<input type="number" min="5" max="600" value={editableSettings.concurrency.requestTimeoutSeconds} onChange={(event) => updateConcurrency({ requestTimeoutSeconds: Number(event.target.value) })} /><small>单个分块请求的最长等待时间，5–600 秒。</small></label></div><div className="settings-two-col"><label>自动重试次数<input type="number" min="0" max="20" value={editableSettings.concurrency.retries} onChange={(event) => updateConcurrency({ retries: Number(event.target.value) })} /></label><label>带宽上限（KiB/s）<input type="number" min="0" value={editableSettings.concurrency.maxBandwidthKib} onChange={(event) => updateConcurrency({ maxBandwidthKib: Number(event.target.value) })} /><small>0 表示不限速。</small></label></div><div className="settings-note"><Icon name="info" size={15} /><span>{webviewLifecycleNote}</span></div></Card>
 
                   <Card className="settings-panel"><div className="panel-heading"><div><span className="eyebrow">界面</span><h2>语言偏好</h2></div><span className="settings-heading-icon"><Icon name="message" size={18} /></span></div><label htmlFor="ui-language">界面语言<select id="ui-language" value={editableSettings.language} onChange={(event) => updateSettings({ language: event.target.value })}><option value="zh-CN">简体中文</option><option value="en-US">English</option></select><small>语言偏好会随设置保存；当前界面文案为简体中文。</small></label></Card>
+
+                  <Card className="settings-panel"><div className="panel-heading"><div><span className="eyebrow">软件更新</span><h2>版本与更新</h2></div><span className="settings-heading-icon"><Icon name="refresh" size={18} /></span></div>
+                    <div className="update-status-row">
+                      <div className="update-status-copy">
+                        <strong>当前版本 {appState?.appVersion ?? "—"}</strong>
+                        <small>
+                          {updatePhase === "idle" && "从 GitHub Releases 检查并安装新版本。"}
+                          {updatePhase === "checking" && "正在检查更新，请稍候…"}
+                          {updatePhase === "current" && "已是最新版本。"}
+                          {updatePhase === "available" && `发现新版本 ${updateRelease?.version ?? ""}，可立即下载并安装。`}
+                          {updatePhase === "installing" && `正在下载并安装 ${updateRelease?.version ?? ""}…安装完成后应用会自动重启。`}
+                          {updatePhase === "ready" && "更新已安装，重启应用后生效。"}
+                        </small>
+                      </div>
+                      <div className="update-actions">
+                        {(updatePhase === "idle" || updatePhase === "current") && <Button type="button" variant="secondary" onClick={() => void checkForUpdates()}><Icon name="refresh" size={14} />检查更新</Button>}
+                        {updatePhase === "checking" && <Button type="button" variant="secondary" disabled><span className="spinner small" />正在检查…</Button>}
+                        {updatePhase === "available" && <><Button type="button" variant="subtle" onClick={dismissUpdate}>稍后</Button><Button type="button" onClick={() => void installUpdate()}><Icon name="download" size={14} />下载并安装</Button></>}
+                        {updatePhase === "installing" && <Button type="button" disabled><span className="spinner small" />正在安装…</Button>}
+                        {updatePhase === "ready" && <Button type="button" onClick={() => void restartForUpdate()}><Icon name="refresh" size={14} />立即重启</Button>}
+                      </div>
+                    </div>
+                    {updatePhase === "installing" && <div className="update-progress"><div className="progress-track"><i style={{ width: `${updateProgress}%` }} /></div><small>{updateProgress}%</small></div>}
+                    <div className="settings-note"><Icon name="info" size={15} /><span>更新包由 GitHub Releases 提供，并已用应用内置公钥校验签名；校验失败时不会安装。</span></div>
+                  </Card>
 
                 </div>
 
