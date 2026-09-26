@@ -39,7 +39,7 @@ const taskFilters: { id: TaskFilter; label: string }[] = [
   { id: "failed", label: "失败" },
 ];
 
-const webviewLifecycleNote = "WebView2 下载由 Telegram 页面中的浏览器操作持有。只有该操作仍存在时，暂停或继续才有效；应用关闭、崩溃或操作结束后，任务记录不代表下载可从断点恢复。无法继续时，请返回同一条 Telegram 消息重新点击下载。";
+const webviewLifecycleNote = "下载由 Telegram 页面内的抓取持续进行:媒体保持打开时,暂停/继续立即生效。应用关闭或页面中断后,任务与已下载分块会保留——重新打开该媒体再点下载即可从已完成分块继续;若提示链接过期,同样重新打开媒体刷新后重试。";
 
 
 function formatBytes(value?: number | null): string {
@@ -639,7 +639,7 @@ function App() {
         <div className="window-controls">
           <button type="button" className="window-control" aria-label="最小化" title="最小化" onClick={() => void nativeWindow.minimize().catch((error) => notify(friendlyError(error), "error"))}><Icon name="minimize" size={15} /></button>
           <button type="button" className="window-control" aria-label={windowMaximized ? "还原" : "最大化"} title={windowMaximized ? "还原" : "最大化"} onClick={() => void toggleWindowMaximize()}><Icon name={windowMaximized ? "restore" : "maximize"} size={14} /></button>
-          <button type="button" className="window-control window-control-close" aria-label="关闭" title="关闭" onClick={() => void nativeWindow.close().catch((error) => notify(friendlyError(error), "error"))}><Icon name="close" size={15} /></button>
+          <button type="button" className="window-control window-control-close" aria-label="隐藏到托盘" title="隐藏到托盘(退出请用托盘菜单)" onClick={() => void nativeWindow.close().catch((error) => notify(friendlyError(error), "error"))}><Icon name="close" size={15} /></button>
         </div>
       </header>
       <aside className="sidebar">
