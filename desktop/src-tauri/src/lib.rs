@@ -1,21 +1,14 @@
 mod app_state;
 mod atomic_file;
 mod chunk_writer;
-mod cloud_upload;
 mod commands;
-mod credentials;
 mod db_migration;
 mod downloader;
 mod entities;
-pub(crate) mod filter;
-mod legacy_config;
 mod log_store;
 mod models;
-mod secure_session;
 mod storage;
 mod task_store;
-mod telegram;
-mod transfers;
 mod webview_bridge;
 
 use app_state::AppState;
@@ -44,13 +37,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_state,
             commands::save_settings,
-            commands::import_legacy_config,
-            commands::login_request_code,
-            commands::login_submit_code,
-            commands::login_submit_password,
-            commands::logout_session,
-            commands::list_chats,
-            commands::get_chat_messages,
             commands::start_webview_download,
             commands::plan_chunks,
             commands::push_chunk,
@@ -61,13 +47,6 @@ pub fn run() {
             commands::task_action,
             commands::open_task_location,
             commands::get_logs,
-            commands::list_cloud_uploads,
-            commands::queue_cloud_upload,
-            commands::cloud_upload_action,
-            commands::upload_completed_download,
-            commands::forward_telegram_message,
-            commands::list_telegram_transfers,
-            commands::telegram_transfer_action,
             commands::ensure_telegram_webview,
             commands::set_telegram_webview_visible,
             commands::set_telegram_webview_bounds,

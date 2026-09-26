@@ -1,35 +1,22 @@
 //! Tauri command boundary for the desktop UI.
 //!
-//! Every value crossing this module is treated as untrusted. Telegram
-//! messages are re-read through the MTProto adapter before a task is created;
-//! the remote Telegram WebView may only start page-fetch download tasks and
-//! push the bytes it fetched itself — it can never choose a filesystem path or
-//! a download URL.
+//! Every value crossing this module is treated as untrusted. The trusted local
+//! interface manages download tasks, settings, logs, and the Telegram Web child
+//! view; the remote Telegram WebView may only start page-fetch download tasks
+//! and push the bytes it fetched itself — it can never choose a filesystem path
+//! or a download URL.
 
 use crate::{
     app_state::AppState,
-    credentials,
     downloader::PlanInfo,
-    legacy_config::{self, MigrationReport},
-    models::{
-        AppStateDto, ChatInfo, LogEntry, MessageInfo, SessionSummary, Settings, TaskRecord,
-        TaskStateMatch, TelegramTransferRecord, UploadTaskRecord,
-    },
-    secure_session::EncryptedSession,
+    models::{AppStateDto, LogEntry, Settings, TaskRecord, TaskStateMatch},
     storage::{self, StorageLayout},
     task_store::TaskStore,
-    telegram::TelegramAdapter,
     webview_bridge::{self, TelegramWebviewBounds},
 };
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Display,
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use serde::Serialize;
+use std::{fmt::Display, fs, path::PathBuf};
 use tauri::{
     AppHandle, Manager, State, Webview, Window, Wry,
     ipc::{InvokeBody, Request},
@@ -39,24 +26,11 @@ use tauri::{
 const CHUNK_TASK_ID_HEADER: &str = "x-task-id";
 const CHUNK_OFFSET_HEADER: &str = "x-offset";
 
-const MAX_PAGE_SIZE: usize = 100;
 const MAX_TASKS_PER_LIST: usize = 2_000;
 const MAX_LOG_ENTRIES: usize = 500;
 /// 注入脚本按文件名查询状态时允许的最大字符数(与下载文件名校验一致)。
 const MAX_WEBVIEW_FILE_NAME_CHARS: usize = 512;
-const MAX_LEGACY_CONFIG_BYTES: u64 = 1024 * 1024;
-const CHAT_ID_MAX_CHARS: usize = 21;
 const MAX_TEMPLATE_LENGTH: usize = 256;
-const ALLOWED_MEDIA_TYPES: &[&str] = &[
-    "photo",
-    "video",
-    "document",
-    "audio",
-    "voice",
-    "video_note",
-    "animation",
-    "sticker",
-];
 const ALLOWED_TASK_STATUSES: &[&str] = &[
     "queued",
     "downloading",
@@ -90,32 +64,6 @@ impl Drop for RestartAfterStorageClose {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Page<T> {
-    pub items: Vec<T>,
-    pub next_offset: Option<i64>,
-    pub has_more: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum ChatIdInput {
-    String(String),
-    Number(i64),
-}
-
-impl ChatIdInput {
-    fn into_validated(self) -> Result<String, String> {
-        let value = match self {
-            Self::String(value) => value,
-            Self::Number(value) => value.to_string(),
-        };
-        validate_chat_id(&value)?;
-        Ok(value)
-    }
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct StorageChangeResult {
     pub data_root: String,
     pub download_root: String,
@@ -127,16 +75,6 @@ pub async fn get_app_state(state: State<'_, AppState>) -> Result<AppStateDto, St
     let layout = state.shared.layout.read().await.clone();
     let mut settings = state.shared.settings.read().await.clone();
     settings.data_root = layout.root.to_string_lossy().into_owned();
-    settings.api_hash.clear();
-    settings.proxy.password.clear();
-    settings.api_hash_configured = credentials::read("telegram-api-hash")
-        .map_err(command_error)?
-        .is_some_and(|secret| !secret.trim().is_empty());
-    settings.proxy.password_configured = credentials::read("telegram-proxy-password")
-        .map_err(command_error)?
-        .is_some_and(|secret| !secret.trim().is_empty());
-
-    let session = current_session_summary(&state, &layout).await;
     let stats = state.shared.store.stats().await.map_err(command_error)?;
     let fallback = state
         .shared
@@ -148,7 +86,6 @@ pub async fn get_app_state(state: State<'_, AppState>) -> Result<AppStateDto, St
     Ok(AppStateDto {
         app_version: state.shared.app.package_info().version.to_string(),
         settings,
-        session,
         storage_options: storage::enumerate_storage(&fallback),
         stats,
     })
@@ -161,439 +98,13 @@ pub async fn save_settings(
 ) -> Result<(), String> {
     let layout = state.shared.layout.read().await.clone();
     let mut current_settings = state.shared.settings.write().await;
-    let mut service_slot = state.shared.telegram.write().await;
-    let previous = current_settings.clone();
-    let old_api_hash = credentials::read("telegram-api-hash").map_err(command_error)?;
-    let old_proxy_password = credentials::read("telegram-proxy-password").map_err(command_error)?;
-
-    let submitted_api_hash = settings.api_hash.trim().to_owned();
-    let next_api_hash = if submitted_api_hash.is_empty() {
-        old_api_hash.clone()
-    } else {
-        validate_api_hash(&submitted_api_hash)?;
-        Some(submitted_api_hash.clone())
-    };
-    let submitted_proxy_password = settings.proxy.password.clone();
-    let next_proxy_password = if submitted_proxy_password.trim().is_empty() {
-        old_proxy_password.clone()
-    } else {
-        Some(submitted_proxy_password.clone())
-    };
-
     settings.data_root = layout.root.to_string_lossy().into_owned();
-    settings.api_hash.clear();
-    settings.proxy.password = next_proxy_password.clone().unwrap_or_default();
-    settings.api_hash_configured = next_api_hash.is_some();
-    settings.proxy.password_configured = next_proxy_password.is_some();
     normalize_and_validate_settings(&mut settings)?;
-
-    let old_proxy_password_value = old_proxy_password.clone().unwrap_or_default();
-    let new_proxy_password_value = next_proxy_password.clone().unwrap_or_default();
-    let connection_changed = previous.api_id.trim() != settings.api_id.trim()
-        || old_api_hash.as_deref().unwrap_or_default()
-            != next_api_hash.as_deref().unwrap_or_default()
-        || previous.proxy.enabled != settings.proxy.enabled
-        || previous.proxy.scheme != settings.proxy.scheme
-        || previous.proxy.host != settings.proxy.host
-        || previous.proxy.port != settings.proxy.port
-        || previous.proxy.username != settings.proxy.username
-        || old_proxy_password_value != new_proxy_password_value;
-
-    if connection_changed {
-        ensure_no_active_or_queued_downloads(&state.shared.store).await?;
-        if service_slot
-            .as_ref()
-            .is_some_and(|service| Arc::strong_count(service) > 1)
-        {
-            return Err("Telegram 连接仍有操作正在进行；请稍后再修改 API 或代理设置".into());
-        }
-        if telegram_session_is_authorized_in_slot(&service_slot, &layout).await? {
-            return Err("请先注销 Telegram MTProto 会话，再修改 API 或代理连接设置".into());
-        }
-        if let Some(service) = service_slot.as_ref() {
-            service.shutdown().await.map_err(command_error)?;
-        }
-        service_slot.take();
-    }
-
-    let mut wrote_api_hash = false;
-    let mut wrote_proxy_password = false;
-    if !submitted_api_hash.is_empty() {
-        credentials::write("telegram-api-hash", &submitted_api_hash).map_err(command_error)?;
-        wrote_api_hash = true;
-    }
-    if !submitted_proxy_password.trim().is_empty() {
-        if settings.proxy.username.trim().is_empty() {
-            if wrote_api_hash {
-                restore_credential("telegram-api-hash", old_api_hash.as_deref());
-            }
-            return Err("填写代理密码时也必须填写代理用户名".into());
-        }
-        if let Err(error) = credentials::write("telegram-proxy-password", &submitted_proxy_password)
-        {
-            if wrote_api_hash {
-                restore_credential("telegram-api-hash", old_api_hash.as_deref());
-            }
-            return Err(command_error(error));
-        }
-        wrote_proxy_password = true;
-    }
-
-    if let Err(error) = storage::save_settings(&layout, &settings) {
-        if wrote_api_hash {
-            restore_credential("telegram-api-hash", old_api_hash.as_deref());
-        }
-        if wrote_proxy_password {
-            restore_credential("telegram-proxy-password", old_proxy_password.as_deref());
-        }
-        return Err(command_error(error));
-    }
-
+    storage::save_settings(&layout, &settings).map_err(command_error)?;
     *current_settings = settings;
-    drop(service_slot);
     drop(current_settings);
-    state
-        .shared
-        .log(
-            "info",
-            "settings",
-            "设置已保存；敏感凭据保存在系统凭据管理器",
-        )
-        .await;
+    state.shared.log("info", "settings", "设置已保存").await;
     Ok(())
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn import_legacy_config(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<MigrationReport, String> {
-    let requested = PathBuf::from(path.trim());
-    if !requested.is_absolute() {
-        return Err("旧配置文件路径必须是绝对路径".into());
-    }
-    let path = requested.canonicalize().map_err(command_error)?;
-    if !path.is_file() {
-        return Err("请选择现有的 config.yaml 或 data.yaml 文件".into());
-    }
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if extension != "yaml" && extension != "yml" {
-        return Err("旧配置只接受 YAML 文件（.yaml 或 .yml）".into());
-    }
-    if fs::metadata(&path).map_err(command_error)?.len() > MAX_LEGACY_CONFIG_BYTES {
-        return Err("旧配置文件超过 1 MiB，已拒绝导入".into());
-    }
-
-    let layout = state.shared.layout.read().await.clone();
-    ensure_no_active_or_queued_downloads(&state.shared.store).await?;
-    let mut current_settings = state.shared.settings.write().await;
-    let mut service_slot = state.shared.telegram.write().await;
-    if service_slot
-        .as_ref()
-        .is_some_and(|service| Arc::strong_count(service) > 1)
-    {
-        return Err("Telegram 连接仍有操作正在进行；请稍后再导入旧配置".into());
-    }
-    let prior_settings = current_settings.clone();
-    let prior_api_hash = credentials::read("telegram-api-hash").map_err(command_error)?;
-    let prior_proxy_password =
-        credentials::read("telegram-proxy-password").map_err(command_error)?;
-
-    let mut report =
-        match legacy_config::import_legacy_config(&path, &layout, &state.shared.store).await {
-            Ok(report) => report,
-            Err(error) => {
-                rollback_import(
-                    &layout,
-                    &prior_settings,
-                    prior_api_hash.as_deref(),
-                    prior_proxy_password.as_deref(),
-                );
-                return Err(command_error(error));
-            }
-        };
-    let imported_api_hash = match credentials::read("telegram-api-hash") {
-        Ok(secret) => secret,
-        Err(error) => {
-            rollback_import(
-                &layout,
-                &prior_settings,
-                prior_api_hash.as_deref(),
-                prior_proxy_password.as_deref(),
-            );
-            return Err(command_error(error));
-        }
-    };
-    let imported_proxy_password = match credentials::read("telegram-proxy-password") {
-        Ok(secret) => secret,
-        Err(error) => {
-            rollback_import(
-                &layout,
-                &prior_settings,
-                prior_api_hash.as_deref(),
-                prior_proxy_password.as_deref(),
-            );
-            return Err(command_error(error));
-        }
-    };
-    let mut imported_settings = report.settings;
-    imported_settings.data_root = layout.root.to_string_lossy().into_owned();
-    imported_settings.api_hash.clear();
-    imported_settings.proxy.password = imported_proxy_password.clone().unwrap_or_default();
-    imported_settings.api_hash_configured = imported_api_hash.is_some();
-    imported_settings.proxy.password_configured = imported_proxy_password.is_some();
-
-    let validation = imported_api_hash
-        .as_deref()
-        .map(validate_api_hash)
-        .unwrap_or(Ok(()))
-        .and_then(|_| normalize_and_validate_settings(&mut imported_settings));
-    if let Err(error) = validation {
-        rollback_import(
-            &layout,
-            &prior_settings,
-            prior_api_hash.as_deref(),
-            prior_proxy_password.as_deref(),
-        );
-        return Err(error);
-    }
-    let connection_changed = prior_settings.api_id.trim() != imported_settings.api_id.trim()
-        || prior_api_hash.as_deref().unwrap_or_default()
-            != imported_api_hash.as_deref().unwrap_or_default()
-        || prior_settings.proxy.enabled != imported_settings.proxy.enabled
-        || prior_settings.proxy.scheme != imported_settings.proxy.scheme
-        || prior_settings.proxy.host != imported_settings.proxy.host
-        || prior_settings.proxy.port != imported_settings.proxy.port
-        || prior_settings.proxy.username != imported_settings.proxy.username
-        || prior_proxy_password.as_deref().unwrap_or_default()
-            != imported_proxy_password.as_deref().unwrap_or_default();
-    if connection_changed {
-        let no_active_tasks = ensure_no_active_or_queued_downloads(&state.shared.store)
-            .await
-            .is_ok();
-        let no_live_operations = service_slot
-            .as_ref()
-            .is_none_or(|service| Arc::strong_count(service) == 1);
-        let session_authorized = telegram_session_is_authorized_in_slot(&service_slot, &layout)
-            .await
-            .unwrap_or(true);
-        if !no_active_tasks || !no_live_operations || session_authorized {
-            rollback_import(
-                &layout,
-                &prior_settings,
-                prior_api_hash.as_deref(),
-                prior_proxy_password.as_deref(),
-            );
-            return Err(
-                "活动任务或已登录 Session 阻止导入新的 API/代理连接设置；请先停止任务并注销".into(),
-            );
-        }
-        if let Some(service) = service_slot.as_ref() {
-            if let Err(error) = service.shutdown().await {
-                rollback_import(
-                    &layout,
-                    &prior_settings,
-                    prior_api_hash.as_deref(),
-                    prior_proxy_password.as_deref(),
-                );
-                return Err(command_error(error));
-            }
-        }
-        service_slot.take();
-    }
-
-    imported_settings.api_hash.clear();
-    imported_settings.proxy.password = imported_proxy_password.clone().unwrap_or_default();
-    imported_settings.api_hash_configured = imported_api_hash.is_some();
-    imported_settings.proxy.password_configured = imported_proxy_password.is_some();
-    if let Err(error) = storage::save_settings(&layout, &imported_settings) {
-        rollback_import(
-            &layout,
-            &prior_settings,
-            prior_api_hash.as_deref(),
-            prior_proxy_password.as_deref(),
-        );
-        return Err(command_error(error));
-    }
-    *current_settings = imported_settings.clone();
-    drop(service_slot);
-    drop(current_settings);
-    report.settings = imported_settings;
-    state
-        .shared
-        .log(
-            "info",
-            "migration",
-            "旧版 YAML 设置已导入；Bot 专属字段已忽略",
-        )
-        .await;
-    Ok(report)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn login_request_code(
-    state: State<'_, AppState>,
-    phone: String,
-) -> Result<SessionSummary, String> {
-    let phone = phone.trim();
-    if phone.is_empty() || phone.len() > 40 || phone.chars().any(char::is_control) {
-        return Err("手机号格式无效；请包含国家/地区代码".into());
-    }
-    let api_hash = credentials::read("telegram-api-hash")
-        .map_err(command_error)?
-        .filter(|value| valid_api_hash(value))
-        .ok_or_else(|| "请先在设置中填写有效的 Telegram API Hash".to_owned())?;
-    let service = telegram_adapter(&state).await?;
-    service
-        .request_code(phone, &api_hash)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn login_submit_code(
-    state: State<'_, AppState>,
-    code: String,
-) -> Result<SessionSummary, String> {
-    if code.trim().is_empty() || code.len() > 32 || code.chars().any(char::is_control) {
-        return Err("验证码格式无效".into());
-    }
-    telegram_adapter(&state)
-        .await?
-        .submit_code(&code)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn login_submit_password(
-    state: State<'_, AppState>,
-    password: String,
-) -> Result<SessionSummary, String> {
-    if password.is_empty() || password.len() > 1024 || password.chars().any(char::is_control) {
-        return Err("两步验证密码格式无效".into());
-    }
-    telegram_adapter(&state)
-        .await?
-        .submit_password(&password)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn logout_session(
-    state: State<'_, AppState>,
-    remove_session: bool,
-) -> Result<SessionSummary, String> {
-    ensure_no_active_or_queued_downloads(&state.shared.store).await?;
-    let layout = state.shared.layout.read().await.clone();
-    let settings_guard = state.shared.settings.read().await;
-    let current_settings = settings_guard.clone();
-    let mut service_slot = state.shared.telegram.write().await;
-
-    if let Some(service) = service_slot.as_ref() {
-        if Arc::strong_count(service) != 1 {
-            return Err("Telegram 会话仍有操作正在进行；请稍后再注销".into());
-        }
-        service.logout().await.map_err(command_error)?;
-        service.shutdown().await.map_err(command_error)?;
-    } else if layout.session_file.exists() {
-        let api_id = current_settings
-            .api_id
-            .trim()
-            .parse::<i32>()
-            .map_err(|_| "注销已有 Session 前需要有效的 Telegram API ID".to_owned())?;
-        if api_id <= 0 {
-            return Err("注销已有 Session 前需要有效的 Telegram API ID".into());
-        }
-        let mut proxy = current_settings.proxy.clone();
-        proxy.password = credentials::read("telegram-proxy-password")
-            .map_err(command_error)?
-            .unwrap_or_default();
-        let service = TelegramAdapter::open(&layout, api_id, &proxy).map_err(command_error)?;
-        service.logout().await.map_err(command_error)?;
-        service.shutdown().await.map_err(command_error)?;
-    }
-
-    let stopped_service = service_slot.take();
-    drop(stopped_service);
-    drop(service_slot);
-    drop(settings_guard);
-
-    if remove_session {
-        if layout.session_file.exists() {
-            fs::remove_file(&layout.session_file).map_err(command_error)?;
-        }
-        credentials::remove("mtproto-session-encryption-key").map_err(command_error)?;
-    }
-    state
-        .shared
-        .log(
-            "info",
-            "session",
-            if remove_session {
-                "Telegram Session 已注销并清理"
-            } else {
-                "Telegram Session 已注销"
-            },
-        )
-        .await;
-    Ok(signed_out_summary())
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn list_chats(
-    state: State<'_, AppState>,
-    query: String,
-    offset: usize,
-    limit: usize,
-) -> Result<Page<ChatInfo>, String> {
-    if query.len() > 256 || query.chars().any(char::is_control) {
-        return Err("聊天搜索内容过长或包含控制字符".into());
-    }
-    if offset > 1_000_000 {
-        return Err("聊天分页偏移超出允许范围".into());
-    }
-    let limit = validate_page_limit(limit)?;
-    let service = telegram_adapter(&state).await?;
-    let (items, has_more) = service
-        .chats(&query, offset, limit)
-        .await
-        .map_err(command_error)?;
-    let next_offset = has_more.then(|| offset.saturating_add(items.len()) as i64);
-    Ok(Page {
-        items,
-        next_offset,
-        has_more,
-    })
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn get_chat_messages(
-    state: State<'_, AppState>,
-    chat_id: ChatIdInput,
-    offset: i64,
-    limit: usize,
-) -> Result<Page<MessageInfo>, String> {
-    let chat_id = chat_id.into_validated()?;
-    if offset < 0 || offset > i64::from(i32::MAX) {
-        return Err("消息分页游标必须是有效的 Telegram 消息 ID".into());
-    }
-    let limit = validate_page_limit(limit)?;
-    let service = telegram_adapter(&state).await?;
-    let (items, next_offset, has_more) = service
-        .messages(&chat_id, offset, limit)
-        .await
-        .map_err(command_error)?;
-    Ok(Page {
-        items,
-        next_offset,
-        has_more,
-    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -698,139 +209,6 @@ pub async fn get_logs(state: State<'_, AppState>, limit: usize) -> Result<Vec<Lo
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub async fn list_cloud_uploads(
-    state: State<'_, AppState>,
-    status: Option<String>,
-    limit: usize,
-) -> Result<Vec<UploadTaskRecord>, String> {
-    if let Some(status) = status.as_deref() {
-        if !["queued", "uploading", "completed", "failed", "cancelled"].contains(&status) {
-            return Err("云上传状态筛选值无效".into());
-        }
-    }
-    state
-        .uploads
-        .list(status.as_deref(), limit.min(MAX_TASKS_PER_LIST))
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn queue_cloud_upload(
-    state: State<'_, AppState>,
-    task_id: String,
-) -> Result<UploadTaskRecord, String> {
-    if task_id.len() > 64 || task_id.chars().any(char::is_control) {
-        return Err("下载任务 ID 格式无效".into());
-    }
-    state
-        .uploads
-        .queue_completed_download(&task_id)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn cloud_upload_action(
-    state: State<'_, AppState>,
-    upload_task_id: String,
-    action: String,
-) -> Result<UploadTaskRecord, String> {
-    if upload_task_id.len() > 64 || upload_task_id.chars().any(char::is_control) {
-        return Err("云上传任务 ID 格式无效".into());
-    }
-    state
-        .uploads
-        .action(&upload_task_id, &action)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn upload_completed_download(
-    state: State<'_, AppState>,
-    task_id: String,
-    target_chat_id: Option<String>,
-) -> Result<TelegramTransferRecord, String> {
-    validate_task_id(&task_id)?;
-    let target_chat_id = target_chat_id
-        .map(|value| validate_chat_id(value.trim()))
-        .transpose()?;
-    state
-        .telegram_transfers
-        .queue_upload(&task_id, target_chat_id.as_deref())
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn forward_telegram_message(
-    state: State<'_, AppState>,
-    source_chat_id: ChatIdInput,
-    source_message_id: i64,
-    target_chat_id: Option<String>,
-) -> Result<TelegramTransferRecord, String> {
-    let source_chat_id = source_chat_id.into_validated()?;
-    validate_message_id(source_message_id)?;
-    let target_chat_id = target_chat_id
-        .map(|value| validate_chat_id(value.trim()))
-        .transpose()?;
-    state
-        .telegram_transfers
-        .queue_forward(
-            &source_chat_id,
-            source_message_id,
-            target_chat_id.as_deref(),
-        )
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn list_telegram_transfers(
-    state: State<'_, AppState>,
-    status: Option<String>,
-    limit: usize,
-) -> Result<Vec<TelegramTransferRecord>, String> {
-    if let Some(status) = status.as_deref()
-        && ![
-            "queued",
-            "preparing",
-            "uploading",
-            "sending",
-            "completed",
-            "failed",
-            "cancelled",
-            "uncertain",
-        ]
-        .contains(&status)
-    {
-        return Err("Telegram 传输任务状态筛选值无效".into());
-    }
-    state
-        .telegram_transfers
-        .list(status.as_deref(), limit.min(MAX_TASKS_PER_LIST))
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn telegram_transfer_action(
-    state: State<'_, AppState>,
-    transfer_task_id: String,
-    action: String,
-) -> Result<TelegramTransferRecord, String> {
-    if transfer_task_id.len() > 64 || transfer_task_id.chars().any(char::is_control) {
-        return Err("Telegram 传输任务 ID 格式无效".into());
-    }
-    state
-        .telegram_transfers
-        .action(&transfer_task_id, &action)
-        .await
-        .map_err(command_error)
-}
-
-#[tauri::command(rename_all = "camelCase")]
 pub async fn ensure_telegram_webview(
     window: Window<Wry>,
     state: State<'_, AppState>,
@@ -931,7 +309,6 @@ pub async fn change_storage_root(
         return Err("新旧数据目录不能相互包含".into());
     }
     ensure_no_active_or_queued_downloads(&state.shared.store).await?;
-    ensure_no_active_or_queued_uploads(&state).await?;
     if fs::read_dir(&new_root)
         .map_err(command_error)?
         .next()
@@ -941,16 +318,7 @@ pub async fn change_storage_root(
     }
 
     let mut settings_guard = state.shared.settings.write().await;
-    let mut service_slot = state.shared.telegram.write().await;
     ensure_no_active_or_queued_downloads(&state.shared.store).await?;
-    ensure_no_active_or_queued_uploads(&state).await?;
-    if let Some(service) = service_slot.as_ref() {
-        if Arc::strong_count(service) != 1 {
-            return Err("Telegram 会话仍有请求在运行；请稍后重试数据迁移".into());
-        }
-        service.shutdown().await.map_err(command_error)?;
-        service_slot.take();
-    }
 
     let child_webview = state
         .shared
@@ -1006,7 +374,6 @@ pub async fn change_storage_root(
     )
     .map_err(command_error)?;
     *settings_guard = migrated_settings.clone();
-    drop(service_slot);
     drop(settings_guard);
 
     state
@@ -1201,85 +568,10 @@ fn decode_json_chunk_body(value: &serde_json::Value) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
-async fn telegram_adapter(state: &AppState) -> Result<Arc<TelegramAdapter>, String> {
-    let proxy_password = credentials::read("telegram-proxy-password").map_err(command_error)?;
-    {
-        let mut settings = state.shared.settings.write().await;
-        settings.proxy.password = proxy_password.unwrap_or_default();
-        settings.proxy.password_configured = !settings.proxy.password.is_empty();
-    }
-    state.telegram().await.map_err(command_error)
-}
-
-async fn current_session_summary(state: &AppState, layout: &StorageLayout) -> SessionSummary {
-    if let Some(service) = state.shared.telegram.read().await.as_ref() {
-        return service.summary().await;
-    }
-    if !layout.session_file.exists() {
-        return signed_out_summary();
-    }
-    match EncryptedSession::open(&layout.session_file) {
-        Ok(session) => {
-            let authorized = session.is_authorized();
-            SessionSummary {
-                authorized,
-                status: if authorized {
-                    "storedSession"
-                } else {
-                    "signedOut"
-                }
-                .into(),
-                display_name: None,
-                phone: None,
-                user_id: None,
-                error: None,
-            }
-        }
-        Err(error) => SessionSummary {
-            authorized: false,
-            status: "error".into(),
-            display_name: None,
-            phone: None,
-            user_id: None,
-            error: Some(command_error(error)),
-        },
-    }
-}
-
-async fn telegram_session_is_authorized_in_slot(
-    service_slot: &Option<Arc<TelegramAdapter>>,
-    layout: &StorageLayout,
-) -> Result<bool, String> {
-    if let Some(service) = service_slot.as_ref() {
-        return service.is_authorized().await.map_err(command_error);
-    }
-    if !layout.session_file.exists() {
-        return Ok(false);
-    }
-    EncryptedSession::open(&layout.session_file)
-        .map(|session| session.is_authorized())
-        .map_err(command_error)
-}
-
 async fn ensure_no_active_or_queued_downloads(store: &TaskStore) -> Result<(), String> {
     let stats = store.stats().await.map_err(command_error)?;
     if stats.active_downloads > 0 || stats.queued_downloads > 0 {
         return Err("请先暂停或完成活动/排队任务，再执行此操作".into());
-    }
-    Ok(())
-}
-
-async fn ensure_no_active_or_queued_uploads(state: &AppState) -> Result<(), String> {
-    for status in ["queued", "uploading"] {
-        if !state
-            .uploads
-            .list(Some(status), MAX_TASKS_PER_LIST)
-            .await
-            .map_err(command_error)?
-            .is_empty()
-        {
-            return Err("请先完成或取消云端上传任务，再迁移数据目录".into());
-        }
     }
     Ok(())
 }
@@ -1313,127 +605,13 @@ fn validate_bounds_in_main_window(
     Ok(())
 }
 
-fn validate_page_limit(limit: usize) -> Result<usize, String> {
-    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
-        return Err(format!("分页大小必须在 1 到 {MAX_PAGE_SIZE} 之间"));
-    }
-    Ok(limit)
-}
-
-fn validate_chat_id(value: &str) -> Result<String, String> {
-    if value.is_empty() || value.len() > CHAT_ID_MAX_CHARS || value == "0" {
-        return Err("Telegram 聊天 ID 格式无效".into());
-    }
-    let digits = value.strip_prefix('-').unwrap_or(value);
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Telegram 聊天 ID 只能包含可选负号和十进制数字".into());
-    }
-    let parsed = value
-        .parse::<i64>()
-        .map_err(|_| "Telegram 聊天 ID 超出允许范围".to_owned())?;
-    if parsed == 0 {
-        return Err("Telegram 聊天 ID 不能为 0".into());
-    }
-    Ok(parsed.to_string())
-}
-
-fn validate_message_id(message_id: i64) -> Result<(), String> {
-    if !(1..=i64::from(i32::MAX)).contains(&message_id) {
-        return Err("Telegram 消息 ID 必须是正整数且不超过协议范围".into());
-    }
-    Ok(())
-}
-
-fn validate_media_type(media_type: &str) -> Result<(), String> {
-    if !ALLOWED_MEDIA_TYPES.contains(&media_type) {
-        return Err("此媒体类型不受支持".into());
-    }
-    Ok(())
-}
-
-fn validate_media_filters(
-    media_types: &[String],
-    file_formats: &BTreeMap<String, Vec<String>>,
-) -> Result<(), String> {
-    if media_types.len() > ALLOWED_MEDIA_TYPES.len() {
-        return Err("媒体类型筛选项过多".into());
-    }
-    let mut unique_types = BTreeSet::new();
-    for media_type in media_types {
-        validate_media_type(media_type)?;
-        if !unique_types.insert(media_type) {
-            return Err("媒体类型筛选项不能重复".into());
-        }
-    }
-    if file_formats.len() > ALLOWED_MEDIA_TYPES.len() {
-        return Err("文件格式筛选项过多".into());
-    }
-    for (media_type, formats) in file_formats {
-        validate_media_type(media_type)?;
-        if formats.len() > 64 {
-            return Err("单种媒体的文件格式筛选项过多".into());
-        }
-        for extension in formats {
-            let extension = extension.trim().trim_start_matches('.');
-            if extension.is_empty()
-                || extension.len() > 16
-                || !extension
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+'))
-            {
-                return Err("文件扩展名筛选格式无效".into());
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_task_id(task_id: &str) -> Result<(), String> {
     uuid::Uuid::parse_str(task_id)
         .map(|_| ())
         .map_err(|_| "下载任务 ID 格式无效".to_owned())
 }
 
-fn validate_api_hash(api_hash: &str) -> Result<(), String> {
-    if !valid_api_hash(api_hash) {
-        return Err("Telegram API Hash 必须是 32 位十六进制字符串".into());
-    }
-    Ok(())
-}
-
-fn valid_api_hash(api_hash: &str) -> bool {
-    api_hash.len() == 32 && api_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 fn normalize_and_validate_settings(settings: &mut Settings) -> Result<(), String> {
-    let api_id = settings.api_id.trim();
-    if !api_id.is_empty() {
-        let parsed = api_id
-            .parse::<i32>()
-            .map_err(|_| "Telegram API ID 必须是正整数".to_owned())?;
-        if parsed <= 0 {
-            return Err("Telegram API ID 必须是正整数".into());
-        }
-        settings.api_id = parsed.to_string();
-    } else {
-        settings.api_id.clear();
-    }
-    if !settings.api_hash.is_empty() {
-        validate_api_hash(&settings.api_hash)?;
-    }
-
-    validate_media_filters(&settings.media_types, &settings.file_formats)?;
-    if settings.chat_filters.len() > 10_000 {
-        return Err("每聊天筛选规则最多支持 10000 项".into());
-    }
-    for (chat_id, expression) in &settings.chat_filters {
-        validate_chat_id(chat_id)?;
-        if expression.len() > 4096 || expression.chars().any(char::is_control) {
-            return Err(format!("聊天 {chat_id} 的筛选表达式超过限制"));
-        }
-        crate::filter::validate(expression)
-            .map_err(|error| format!("聊天 {chat_id} 的筛选表达式无效：{error}"))?;
-    }
     if !["skip", "rename", "overwrite"].contains(&settings.duplicate_policy.as_str()) {
         return Err("重复文件策略必须是跳过、重命名或覆盖".into());
     }
@@ -1453,56 +631,6 @@ fn normalize_and_validate_settings(settings: &mut Settings) -> Result<(), String
         return Err("并发、分块、超时或重试设置超出允许范围".into());
     }
 
-    if settings.proxy.scheme != "socks5" {
-        return Err("当前 MTProto 下载核心只支持 SOCKS5 代理".into());
-    }
-    if settings.proxy.enabled {
-        if settings.proxy.host.trim().is_empty() || settings.proxy.host.len() > 253 {
-            return Err("请填写有效的 SOCKS5 代理主机".into());
-        }
-        if settings.proxy.port == 0 {
-            return Err("SOCKS5 代理端口必须在 1 到 65535 之间".into());
-        }
-    }
-    if settings.proxy.host.chars().any(char::is_control)
-        || settings.proxy.username.len() > 255
-        || settings.proxy.username.chars().any(char::is_control)
-        || settings.proxy.password.len() > 1024
-        || settings.proxy.password.chars().any(char::is_control)
-    {
-        return Err("代理主机或凭据格式无效".into());
-    }
-
-    if settings.cloud_upload.adapter != "rclone" {
-        return Err("当前桌面客户端只支持 rclone 云盘上传；请选择 rclone".into());
-    }
-    if settings.cloud_upload.executable_path.len() > 4096
-        || settings.cloud_upload.remote_dir.len() > 1024
-        || settings
-            .cloud_upload
-            .remote_dir
-            .chars()
-            .any(char::is_control)
-    {
-        return Err("云端上传路径或远端目录无效".into());
-    }
-    if !settings.cloud_upload.executable_path.trim().is_empty()
-        && !Path::new(&settings.cloud_upload.executable_path).is_absolute()
-    {
-        return Err("rclone 可执行文件路径必须是绝对路径".into());
-    }
-    if settings.telegram_upload_enabled {
-        validate_chat_id(&settings.telegram_upload_target_chat_id)?;
-    } else if !settings.telegram_upload_target_chat_id.is_empty() {
-        validate_chat_id(&settings.telegram_upload_target_chat_id)?;
-    }
-    if settings.telegram_upload_chat_targets.len() > 2_000 {
-        return Err("Telegram 来源聊天目标映射最多保存 2000 条".into());
-    }
-    for (source_chat_id, target_chat_id) in &settings.telegram_upload_chat_targets {
-        validate_chat_id(source_chat_id)?;
-        validate_chat_id(target_chat_id)?;
-    }
     if settings.language.trim().is_empty()
         || settings.language.len() > 16
         || settings.language.chars().any(char::is_control)
@@ -1566,40 +694,6 @@ fn validate_template(template: &str, allow_directories: bool) -> Result<(), Stri
         }
     }
     Ok(())
-}
-
-fn restore_credential(name: &str, value: Option<&str>) {
-    let result = match value {
-        Some(value) => credentials::write(name, value),
-        None => credentials::remove(name),
-    };
-    if let Err(error) = result {
-        tracing::error!(target: "desktop::credentials", "无法回滚凭据变更：{error:#}");
-    }
-}
-
-fn rollback_import(
-    layout: &StorageLayout,
-    previous_settings: &Settings,
-    previous_api_hash: Option<&str>,
-    previous_proxy_password: Option<&str>,
-) {
-    restore_credential("telegram-api-hash", previous_api_hash);
-    restore_credential("telegram-proxy-password", previous_proxy_password);
-    if let Err(error) = storage::save_settings(layout, previous_settings) {
-        tracing::error!(target: "desktop::migration", "无法回滚旧设置：{error:#}");
-    }
-}
-
-fn signed_out_summary() -> SessionSummary {
-    SessionSummary {
-        authorized: false,
-        status: "signedOut".into(),
-        display_name: None,
-        phone: None,
-        user_id: None,
-        error: None,
-    }
 }
 
 fn command_error(error: impl Display) -> String {

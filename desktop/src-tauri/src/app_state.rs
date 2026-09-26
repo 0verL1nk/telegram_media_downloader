@@ -1,18 +1,14 @@
 use crate::{
-    cloud_upload::CloudUploadManager,
-    credentials,
     downloader::DownloadManager,
     log_store::{self, PersistentLogs},
     models::{LogEntry, Settings},
     storage::{self, StorageLayout},
     task_store::TaskStore,
-    telegram::TelegramAdapter,
-    transfers::TelegramTransferManager,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
 
 pub struct SharedState {
     pub app: AppHandle,
@@ -20,8 +16,6 @@ pub struct SharedState {
     pub layout: RwLock<StorageLayout>,
     pub settings: RwLock<Settings>,
     pub store: TaskStore,
-    pub telegram: RwLock<Option<Arc<TelegramAdapter>>>,
-    pub upload_sender: RwLock<Option<mpsc::Sender<String>>>,
     pub webview_init: Mutex<()>,
     pub logs: Mutex<VecDeque<LogEntry>>,
     pub persistent_logs: PersistentLogs,
@@ -30,8 +24,6 @@ pub struct SharedState {
 pub struct AppState {
     pub shared: Arc<SharedState>,
     pub downloads: DownloadManager,
-    pub uploads: CloudUploadManager,
-    pub telegram_transfers: TelegramTransferManager,
 }
 
 impl AppState {
@@ -50,9 +42,6 @@ impl AppState {
         let layout = StorageLayout::under(root);
         layout.ensure()?;
         let mut settings = storage::load_settings(&layout)?;
-        settings.api_hash_configured = credentials::read("telegram-api-hash")?.is_some();
-        settings.proxy.password_configured =
-            credentials::read("telegram-proxy-password")?.is_some();
         settings.data_root = layout.root.to_string_lossy().into_owned();
         if settings.download_root.trim().is_empty() {
             settings.download_root = layout.downloads.to_string_lossy().into_owned();
@@ -65,15 +54,11 @@ impl AppState {
             layout: RwLock::new(layout),
             settings: RwLock::new(settings),
             store,
-            telegram: RwLock::new(None),
-            upload_sender: RwLock::new(None),
             webview_init: Mutex::new(()),
             logs: Mutex::new(VecDeque::from(recovered_logs)),
             persistent_logs,
         });
         let downloads = DownloadManager::start(Arc::clone(&shared)).await?;
-        let uploads = CloudUploadManager::start(Arc::clone(&shared)).await?;
-        let telegram_transfers = TelegramTransferManager::start(Arc::clone(&shared)).await?;
         shared
             .log(
                 "info",
@@ -81,47 +66,11 @@ impl AppState {
                 "客户端就绪；任务数据库通过 SeaORM 迁移并恢复待续传任务",
             )
             .await;
-        Ok(Self {
-            shared,
-            downloads,
-            uploads,
-            telegram_transfers,
-        })
-    }
-
-    pub async fn telegram(&self) -> Result<Arc<TelegramAdapter>> {
-        self.shared.telegram().await
+        Ok(Self { shared, downloads })
     }
 }
 
 impl SharedState {
-    pub async fn telegram(&self) -> Result<Arc<TelegramAdapter>> {
-        if let Some(client) = self.telegram.read().await.as_ref() {
-            return Ok(Arc::clone(client));
-        }
-        let settings = self.settings.read().await.clone();
-        let api_id = settings
-            .api_id
-            .trim()
-            .parse::<i32>()
-            .context("请先在设置中填写有效的 Telegram API ID")?;
-        if api_id <= 0 {
-            bail!("Telegram API ID 必须为正整数");
-        }
-        let api_hash = credentials::read("telegram-api-hash")?
-            .filter(|value| !value.trim().is_empty())
-            .context("请先在设置中填写 Telegram API Hash")?;
-        let mut guard = self.telegram.write().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(Arc::clone(client));
-        }
-        let layout = self.layout.read().await.clone();
-        let client = Arc::new(TelegramAdapter::open(&layout, api_id, &settings.proxy)?);
-        *guard = Some(Arc::clone(&client));
-        drop(api_hash);
-        Ok(client)
-    }
-
     pub async fn log(&self, level: &str, target: &str, message: impl Into<String>) {
         let entry = log_store::sanitize_entry(LogEntry {
             timestamp: chrono::Utc::now().to_rfc3339(),
