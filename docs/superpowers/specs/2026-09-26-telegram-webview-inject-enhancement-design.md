@@ -3,7 +3,8 @@
 - 日期: 2026-09-26
 - 状态: 待用户审阅
 - 范围: 单人完整版,约 2 周。不含拖拽下载、不含设置页 UI、不含 i18n、不含批量选择面板、不含 CDN。
-- 策略: 禁保存(noforwards)媒体按"可下载"对待,与油猴脚本对齐。详见 §10。
+- 下载后端:由 `webview-http-downloader-design.md` 定义(HTTP API,不依赖 MTProto)。
+- 功能要求:禁保存媒体可正常下载。实现细节见 HTTP 下载器 spec。
 
 ## 1. 摘要
 
@@ -14,7 +15,7 @@
 - 多文件消息渲染 1 个主按钮 + N 个子按钮
 - 点击后状态实时反馈(提交中 / 已入队 / 进行中 / 完成 / 失败重试)
 - 本地已下载文件标记。匹配键:`chat_id + message_id`(`file_size` 不参与匹配,仅取自同一消息最近一次已完成下载用于显示「✓ 已下载 · 3.4 MB」)
-- Story 下载走 MTProto 任务系统
+- 下载后端由 HTTP 下载器 spec 定义(注入脚本只负责提交,下载执行走 HTTP API)
 - 禁保存(`noforwards`)媒体开放下载,见 §10
 
 桥接只增加 3 个新 Tauri 命令。现有 `submit_download_from_webview` 行为不变,仅事件名升级。
@@ -479,35 +480,19 @@ Rust 侧命令**永不接收**:路径、URL、文件名、token、cookie、sessi
 
 每条命令入口**重做** `is_trusted_telegram_webview` 校验。
 
-## 10. 禁保存策略
+## 10. 禁保存媒体
 
-### 10.1 决策
+### 10.1 能力要求
 
-`noforwards=true`(频道主设的"禁止保存内容")**不视为**下载屏障,与油猴脚本对齐。
+禁保存媒体(频道主设置的"禁止保存内容")的下载按钮正常出现,点击后能成功下载至本地磁盘。
 
-### 10.2 协议层依据
+### 10.2 实现位置
 
-- Telegram 的 `noforwards` 是 UI 层标记(给官方客户端在按钮/右键菜单隐藏下载入口用),**不是协议层拒绝**
-- MTProto 拿到消息对象后,服务端对用户账号的 `upload.getFile` 请求照常响应
-- 油猴脚本能下是因为它走 HTTP API 完全看不见这个标记;我们走 MTProto 看得见,但选择不拦
+下载能力由 `webview-http-downloader-design.md` 定义。本 spec 不规定协议层细节,只在 UI 层要求:注入脚本对所有可识别的可见媒体元素(含禁保存媒体)都渲染下载按钮,点击后能成功提交并完成。
 
-### 10.3 拦截范围(收紧)
+### 10.3 自毁消息
 
-`desktop/src-tauri/src/telegram.rs::protected_or_ttl` 现状:
-
-```rust
-raw.noforwards || raw.ttl_period.unwrap_or(0) > 0
-```
-
-改为:
-
-```rust
-raw.ttl_period.unwrap_or(0) > 0
-```
-
-仅保留 `ttl_period`(自毁/限时消息)的拦截 — 这类消息不下载会消失,拦截必要。
-
-`noforwards` 不再返回 true,`message_info` 不再为它设置 `unavailable_reason`。
+`ttl_period > 0` 的自毁/限时消息**不**显示下载按钮 — 这类消息不下载会消失,不提供入口。
 
 ### 10.4 用户告知
 
@@ -515,9 +500,9 @@ raw.ttl_period.unwrap_or(0) > 0
 
 ### 10.5 验收
 
-- [ ] `noforwards=true` 的消息在聊天列表中正常出现下载按钮
+- [ ] 频道中设置了禁保存的消息,聊天列表正常出现下载按钮
 - [ ] 实际下载成功,任务状态 `completed`
-- [ ] `ttl_period > 0` 的消息仍不出现下载按钮(自毁消息必须拦截)
+- [ ] 自毁/限时消息不出现下载按钮
 
 ---
 
