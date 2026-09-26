@@ -1,363 +1,181 @@
-# WebView HTTP 下载器 — 设计规范
+# Telegram WebView 下载管线 — 设计规范
 
-- 日期: 2026-09-26
-- 状态: 待用户审阅
-- 范围: 把桌面客户端下载核心从 MTProto 切到 Telegram Web HTTP API(基于 WebView cookie + 注入脚本送 URL)。同时精简桌面客户端,**删除**上传/转发/rclone/Bot/MTProto Session。
-- 锚定参考: [Greasy Fork #446342](https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader)(Neet-Nestor)。本 spec 的设计目标是**沿用脚本的下载机制**+ 叠加桌面客户端的任务管理、断点续传、分块并发、状态反馈。脚本有的能力本 spec 必须达到;脚本不做的能力(协议层操作、上传/转发)本 spec 不做。
-- **架构分工**:浏览器侧(Telegram Web + 注入脚本)**只负责**抓文件 URL — 这部分是"参考浏览器怎么下载"的复制;下载执行、任务管理、状态反馈、断点续传、分块并发、文件校验**全部由 Rust 客户端承担**。注入脚本是桥梁,不下载;Rust 是核心,不直接接触 Telegram Web DOM。
+- 日期: 2026-09-26(2026-09-26 修订:由"Rust reqwest 拉取"改为"**页面 fetch + IPC 分块接收**",与验证脚本 #446342 的下载方式一致)
+- 状态: 待实现
+- 上游: `docs/superpowers/specs/2026-09-26-telegram-webview-inject-enhancement-design.md`(注入脚本;按钮点击后进入本管线)
 
-## 1. 摘要
+## 0. 修订要点
 
-桌面客户端当前的下载路径走 Grammers/MTProto 直连 Telegram DC,需要用户输入 API ID/手机号/验证码才能用 — 体验和油猴脚本(浏览器已登录就能用)差距很大。本 spec 把下载核心换成:
+第一版把下载执行放在 Rust(reqwest + Range)。**已修正**:下载的网络请求必须**在页面上下文里做**(和油猴脚本 #446342 完全一致的方式):
 
-- **注入脚本**从 Telegram Web DOM 里读媒体元素的 `src`/`currentSrc`,作为 URL 传给 Rust
-- **Rust** 用 reqwest + HTTP Range 头做分块下载、断点续传、并发(沿用现有的 chunk_writer/task_store 基础设施)
-- **Session** 复用 WebView2 的 Telegram Web 登录 cookie;不重新登录、不存加密 Session 文件
+- 页面内 `fetch(url, {headers:{Range}})` 拿分块 — cookie/session/Referer 自然带上,和脚本行为逐字节对齐
+- 分块经 Tauri IPC 交给 Rust — **Rust 只做管理**:落盘、任务库、进度、暂停/取消、原子提交、断点续传记账
+- **URL 永不离开页面**:Rust 端收不到 URL,只收字节。reqwest 依赖撤销,URL 白名单/SSRF 问题随之消失
 
-**关键:这是把 Greasy Fork #446342 的下载机制搬到桌面客户端的 Rust 后端**,UI 由我们的注入脚本承担,任务管理/状态反馈由我们的 Rust 调度承担,WebView 自动登录 + 持久化由 Tauri WebView2 承担。脚本本身没有队列/断点续传/分块,这些是我们叠加的能力。
+## 1. 分工
 
-同时删除:MTProto/Grammers、Telegram 上传、单条转发、rclone 云上传、Bot 能力、Python `module/bot.py` 等。桌面客户端定位回归到"Telegram Web + 本地下载管理"的聚焦产品。
+| 环节 | 执行者 | 说明 |
+|---|---|---|
+| 探测文件大小 | 页面 JS | `fetch` Range 0-0 → 解析 `Content-Range` 的 total(脚本同款) |
+| 分块抓取 | 页面 JS | `fetch` Range,可并发 N 路;超时/重试/中止都在 JS |
+| 分块落盘 | Rust | 复用 `chunk_writer`(乱序写入、缺块检测、BLAKE3 校验) |
+| 任务登记/状态 | Rust | 现有 `task_store`(SQLite) |
+| 进度/速度/事件 | Rust | 现有 `task-updated` / `stats-updated`,另发 `webview-task-*` 给按钮 |
+| 暂停/取消/重试 | Rust 决策,JS 执行中止 | Rust 发 `webview-download-abort` 事件,JS abort 掉 fetch |
+| 断点续传 | 双端协作 | Rust 记哪些块已完成;重开媒体后 JS 拿新 URL,只补缺块 |
+| 原子提交 | Rust | 现有 `atomic_file` + 重复策略检查 |
 
-## 1.5 与油猴脚本 #446342 的对标
-
-脚本做的事:
-- 浏览器里检测 Telegram Web 消息 DOM 中的媒体元素(img / video / audio / animation / sticker / voice / Story)
-- 给每条媒体加"下载"按钮
-- 点击触发浏览器下载(`<a download>` 或 `fetch` + Blob)
-- 仅在浏览器已登录时工作,无独立鉴权
-- 安装后用户零成本使用
-
-本 spec 与脚本的差异:
-- 下载执行位置:脚本在浏览器(用户机器),本 spec 在 Rust 后端(同台机器,独立进程)
-- 任务管理:脚本没有,本 spec 加队列/进度/暂停/重试/历史
-- 并发/续传/分块:脚本没有,本 spec 加
-- 状态反馈:脚本只有浏览器原生进度条,本 spec 加 5 状态按钮(就绪/提交/排队/下载/完成/失败)
-- 已下载标记:脚本没有,本 spec 加 ✓
-
-**对齐脚本**(不自创):媒体查看器路径(非聊天列表)、webk/webz 双 selector、轮询检测、URL 提取方式。详见 `telegram-webview-inject-enhancement-design.md`。
-
-**本 spec 不做的(脚本也不做)**:Telegram 上传、消息转发、rclone 云上传、Bot 能力、跨设备同步、多账号、聊天列表内联按钮(技术不可行:列表只有缩略图)。
-
-## 2. 现状摘要
-
-- `desktop/src-tauri/src/telegram.rs`(20KB):MTProto 登录、消息读取
-- `desktop/src-tauri/src/secure_session.rs`:Grammers Session 加密存储
-- `desktop/src-tauri/src/credentials.rs`:Windows 凭据管理器
-- `desktop/src-tauri/src/downloader.rs`(64KB):分块并发 + BLAKE3 校验 + 原子提交 + 进度事件
-- `desktop/src-tauri/src/task_store.rs`(36KB):SeaORM/SQLite 任务持久化
-- `desktop/src-tauri/src/chunk_writer.rs`(11KB):乱序写入、缺块检测
-- `desktop/src-tauri/src/atomic_file.rs`:临时文件原子提交
-- `desktop/src-tauri/src/transfers.rs`(34KB):上传/转发调度
-- `desktop/src-tauri/src/cloud_upload.rs`(22KB):rclone 集成
-- `desktop/src-tauri/webview-inject/`:Web 注入脚本(scaffolding + icons.js 已落地)
-- `Cargo.toml`:Grammers 0.10.0、chacha20poly1305、keyring、sea-orm、sqlx 等
-
-## 3. 设计目标
-
-1. 用户零登录成本(只用 WebView 里手动登 Telegram Web)
-2. 下载性能持平或超过原 MTProto 路径(分块并发 + 断点续传 + 校验全部保留)
-3. HTTP API 支持禁保存媒体的下载(脚本 #446342 也支持,本 spec 对齐)
-4. 自动支持 CDN 大文件(HTTP API 透明处理 redirect)
-5. Rust 端不再依赖 Grammers、二进制 Session、凭据管理器
-
-## 4. 非目标
-
-- Telegram 上传(发文档、发到频道) — 删
-- 单条消息转发 — 删
-- rclone 云盘上传 — 删
-- Bot 能力(`bot.py` / `bot_token` / 白名单)— 删
-- 旧 Python 模块(`module/`、`utils/` 中非必要部分)— 删
-- MTProto Session 持久化 — 删
-- 设置页"输入 API ID/Hash + 手机号登录"流程 — 删
-
-## 5. 架构
-
-### 5.1 模块布局
+## 2. 端到端数据流
 
 ```
-desktop/src-tauri/src/
-├── commands.rs           重构:删除所有 *_upload*/forward/bot/cloud/transfers 命令
-├── http_downloader.rs    新:HttpDownloadManager + ChunkedFetcher + UrlValidator
-├── task_store.rs         保留(查 + 写 task 记录;新增 media_url / file_name 字段)
-├── chunk_writer.rs       保留(乱序写入、BLAKE3 校验、缺块检测)
-├── atomic_file.rs        保留
-├── webview_bridge.rs     保留(注入脚本位置不变)
-├── webview-inject/       按查看器方案重写(见 telegram-webview-inject-enhancement-design.md)
-│   ├── src/
-│   │   ├── inject.js     重写:查看器轮询 + 工具栏按钮
-│   │   ├── watcher.js    新:查看器检测轮询
-│   │   ├── detect.js     新:查看器内媒体检测
-│   │   ├── extract.js    新:URL 提取 + 文件名解析
-│   │   ├── button.js     重写:原生风格按钮 + 状态机
-│   │   ├── state.js      保留:事件订阅
-│   │   ├── task-state.js 重写:按文件名查任务状态(含下载中/已完成/失败)
-│   │   └── icons.js      保留
-│   └── ...
-├── app_state.rs          调整:删除 telegram() 字段
-└── ...
+用户点下载按钮(注入脚本,已有)
+   │  JS 侧 downloader.js:
+   ├─ 1. invoke('start_webview_download', {fileName, fileType, source})
+   │      ← {taskId}(Rust: 建记录、算输出路径、重复策略、发 webview-task-submitted)
+   ├─ 2. 探测:fetch(url, Range: "bytes=0-0") → 从 Content-Range 得 totalBytes
+   ├─ 3. invoke('plan_chunks', {taskId, totalBytes})
+   │      ← {chunkSizeBytes, concurrency, timeoutSeconds, retries, missing:[{offset,length}...]}
+   │        (Rust: 配置分块表、校验本地已有块、占一个文件槽位、启动 writer、发 webview-task-updated)
+   ├─ 4. 对每个 missing 分块(并发 ≤ concurrency):
+   │      fetch(url, Range: "bytes=o-(o+len-1)") → 重试/超时/abort
+   │      → invoke('push_chunk', {taskId, offset}, rawBytes)   ← 二进制 IPC
+   │        (Rust: mpsc 入队 → chunk_writer 落盘 → 节流发进度事件;mpsc 满则背压)
+   ├─ 5. 全部完成 → invoke('finish_download', {taskId})
+   │      ← TaskRecord(Rust: 校验分块完整 → 原子提交 → webview-task-completed)
+   └─ 失败 → invoke('fail_download', {taskId, error})
+          (Rust: 保留部分块,标 failed,发 webview-task-failed)
 
-Cargo.toml:
-+ reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
-- grammers-client
-- grammers-session
-- chacha20poly1305
-- keyring
-- (其他 MTProto 间接依赖)
-
-删除整个文件:
-- telegram.rs
-- secure_session.rs
-- transfers.rs
-- cloud_upload.rs
-- credentials.rs(无 MTProto 用)
+暂停/取消:Rust task_action → 发 `webview-download-abort {taskId}` → JS abort → JS 调
+   fail_download(取消时 Rust 端按 preserve_partial_files 清理临时块)
 ```
 
-### 5.2 数据流(端到端)
+## 3. Tauri 命令(新增)
+
+| 命令 | 入参 | 返回 | 说明 |
+|---|---|---|---|
+| `start_webview_download` | `{fileName, fileType, source}` | `{taskId}` | 校验文件名(≤512 字符、无控制字符);重复策略 skip 时直接报"已存在";建记录(queued) |
+| `plan_chunks` | `{taskId, totalBytes}` | `{chunkSizeBytes, concurrency, timeoutSeconds, retries, missing}` | 幂等:可重复调用(续传重入)。与已存 total 不符 → 报错停止;占文件槽位;启动 writer |
+| `push_chunk` | `taskId` + `offset`(路径参数或 header)+ **raw bytes**(body) | `()` | 二进制 IPC(`tauri::ipc::Request` 的 raw body);实现若受阻可退化为 base64 参数并在报告中注明吞吐 |
+| `finish_download` | `{taskId}` | `TaskRecord` | 校验全块 → 原子提交 |
+| `fail_download` | `{taskId, error}` | `TaskRecord` | 保留已校验块;标 failed |
+
+保留:`webview_query_task_state`(查看器打开时查状态,含**任务在进行中**时按钮直接显示进度)、`webview_task_action`、`webview_task_action` 的既有语义。
+
+新增事件:`webview-download-abort {taskId}`(Rust → JS,暂停/取消信号)。
+
+**`webview_query_task_state` 扩展**:状态为 `queued|downloading|paused` 时额外返回 `{resumable: true}` — JS 据此走 `plan_chunks` 续传路径(只补缺块)而不是重新开始。
+
+## 4. Rust 侧设计(重写 `downloader.rs` 为 WebView 下载管理器)
+
+旧的 MTProto 下载机制(dispatch/TaskControl/RequestLimiter/FloodGate/BandwidthLimiter/`fetch_chunk`)全部删除 — 它们服务于 Rust 主动拉取,本设计不再适用。新的职责:
 
 ```
-用户在 Telegram Web 点开媒体(查看器打开)
-        ↓ watcher.js 500ms 轮询检测到查看器 / Story / 置顶音频
-        ↓ detect.js 找到媒体元素 + 注入按钮到原生工具栏
-用户点我们的下载按钮
-        ↓ extract.js 读媒体元素 src / currentSrc,解析文件名
-        ↓ invoke('submit_download_from_webview', { request: {mediaUrl, fileName, fileType, source} })
-        ▼
-Rust commands.rs
-        ↓ validate URL (https + 域名白名单 + 拒私有 IP)
-        ↓ create_http_task(...)
-        ▼
-http_downloader.rs::HttpDownloadManager
-        ↓ 入队 + 创建 task_store 记录
-        ↓ emit('webview-task-submitted', {taskId})
-        ▼
-ChunkedFetcher
-        ↓ HEAD 检查 URL 有效性 + 拿 Content-Length
-        ↓ 范围:offset=0..total, 步长 = chunk_size
-        ↓ 派 N 个并发 worker (N = perFileChunks)
-        ▼
-reqwest::Client.get(url).header(Range, "bytes=offset-end")
-        ↓ 流式读取 → chunk_writer::write_chunks_bounded
-        ▼
-chunk_writer 乱序写入临时文件 + BLAKE3 校验每块
-        ▼
-所有块完成 → atomic_file::commit(temp, output)
-        ↓
-emit('webview-task-completed', {taskId, outputPath})
+WebviewDownloadManager
+├── slots: Semaphore(max_files)           // plan_chunks 时获取,finish/fail/取消时释放
+├── channels: Map<taskId, mpsc::Sender<IncomingChunk>>   // push_chunk 的入口
+├── writers: Map<taskId, JoinHandle>      // chunk_writer::write_chunks_bounded 任务
+├── last_activity: Map<taskId, Instant>   // 看门狗用
+└── watchdog 定时器(10s 一跳):
+      status=downloading 且 30s 无 push/finish → 标 paused + 发 webview-download-abort
+      (覆盖 WebView 关闭/刷新/网络掉线等 JS 侧消失的情形)
 ```
 
-### 5.3 组件
+- `push_chunk` → `channels[taskId].send(IncomingChunk)`(await — mpsc 缓冲满时自然背压)
+- writer 完成(全部块齐)→ `finish_download` 触发 join + 校验 + 提交;**JS 未调 finish 但块已齐** → 看门狗 30s 后也走提交校验(兜底)
+- 进度事件:writer 的 progress broadcast → 350ms 节流 → `task-updated` + `webview-task-updated`
+- 复用不动:`chunk_writer.rs`、`atomic_file.rs`、`task_store.rs`、事件/统计
+- 魔法数字全部命名:`SLOT_*`、`PROGRESS_TICK`、`WATCHDOG_*`、`ACTIVITY_TIMEOUT` 常量或进 `Settings`
 
-#### 5.3.1 `http_downloader::HttpDownloadManager`
+## 5. JS 侧设计(新增 `downloader.js`)
 
-沿用现有 `DownloadManager` 的并发模型(任务级 + 文件级 + 分块级三档并发)。删除所有 MTProto 引用,改为持有 `reqwest::Client` + `TaskStore` + 设置状态。
+职责(全部在页面上下文):
 
-#### 5.3.2 `http_downloader::ChunkedFetcher`
+- `probeTotal(url, timeout)` — Range 0-0 → 解析 `Content-Range: bytes 0-0/TOTAL`(脚本同款;无 Content-Range 时回退 `Content-Length`)
+- `fetchChunk(url, offset, length, {timeout, signal})` → ArrayBuffer(状态 206/200;416 视作已到尾部)
+- `runDownload({url, taskId, plan})` — 并发闸 `concurrency`;每块重试 `retries` 次(指数退避);`AbortController` 响应 `webview-download-abort`;`max_bandwidth_kib > 0` 时对分块**启动**限速(粗粒度近似,注释说明)
+- 全部分块 push 完 → `finish_download`;任何块重试耗尽 → `fail_download`
+- 408/401/403 → 直接 fail("URL 过期,请重新打开该媒体")
 
-- `async fn fetch_chunk(url, offset, length, token) -> Result<Vec<u8>>`
-- HEAD 一次拿 `Content-Length`(失败 → bail "无法获取文件大小")
-- Range 请求 + 流式读取 → `Vec<u8>`
-- 重试 + 超时沿用现有 `RequestLimiter` / `BandwidthLimiter` / `FloodGate`(后者无 FloodWait,可降级为通用 backoff)
-- 错误码映射:
-  - 200(忽略 Range,服务器不支持)— 退化为单流下载整文件
-  - 206 Partial Content — 正常分块
-  - 401/403 → "URL 已过期或无权限,请重新打开 Telegram Web 触发该消息后再试"
-  - 404/410 → "文件已删除或 URL 失效"
-  - 429/5xx → 重试,指数退避
-  - 网络错误 → 重试
+`watcher.js` 点击流程改为:start → probe → plan → runDownload(→ finish/fail);按钮状态继续由 `webview-task-*` 事件驱动,不变。
 
-#### 5.3.3 `http_downloader::UrlValidator`
+## 6. 安全边界
 
-- 协议必须是 `https`
-- 域名在白名单(从设置读取,默认 `["web.telegram.org", "*.cdn-telegram.org", "*.telegram.org"]`)
-- 拒绝 `localhost` / `127.0.0.1` / 私有 IP(防 SSRF,即使来自 WebView 也兜底)
-- 拒绝非 GET-able URL(不允许 `file:` / `data:` / `blob:` 等)
+- **URL 永不传给 Rust**(比第一版更强):Rust 只接收 `{fileName, fileType, source}` 与分块字节
+- 注入脚本原有约束不变:不读 cookie/storage;JSON 尾部解析文件名;仅查看器内元素
+- `start_webview_download` 的文件名做过长/控制字符校验(防路径注入);输出路径 = `download_root` + 净化文件名,不接受页面传路径
+- IPC 体积上限:单块 ≤ 1 MiB(chunk_size 配置上界),Rust 侧校验 `offset+bytes.len()` 不越界
 
-#### 5.3.4 复用现有基础设施
+## 7. 错误与恢复
 
-- `chunk_writer.rs`:不动,直接接 HTTP 流式数据
-- `task_store.rs`:不动,只换 Rust 字段(file_size 来源从 MTProto media.size() 改为 Content-Length)
-- `atomic_file.rs`:不动
-- `app_state.rs`:删除 `telegram: Arc<TelegramAdapter>` 字段,替换为 `http_downloader: Arc<HttpDownloadManager>`
-
-## 6. 接口契约
-
-### 6.1 注入脚本 → Rust
-
-```typescript
-interface SubmitDownloadRequest {
-  mediaUrl: string;               // 核心字段:查看器内媒体元素的 src / currentSrc
-  fileName: string | null;        // 从 URL 尾部 JSON 解析(metadata.fileName),可空
-  fileType: 'photo' | 'video' | 'animation' | 'audio' | 'voice' | 'story';
-  source: 'viewer' | 'story' | 'pinned-audio';
-}
-
-invoke('submit_download_from_webview', { request: SubmitDownloadRequest });
-→ 返回 TaskRecord(含 taskId)
-```
-
-**无 chatId / messageId**:查看器路径不提供消息上下文(与验证脚本 #446342 一致);唯一例外是置顶音频的 `data-mid`,但本 spec 不依赖它做任务标识。
-
-### 6.2 Rust 命令
-
-| 命令 | 状态 |
+| 情形 | 行为 |
 |---|---|
-| `submit_download_from_webview` | 保留,payload 改为上表 |
-| `webview_query_task_state` | 新命令(替代原 `webview_query_downloaded`),按 `fileName` 返回最近一条任务状态:`queued` / `downloading` / `completed` / `failed` / `none` |
-| `webview_task_action` | 保留(cancel / retry / open) |
-| `submit_batch_download_from_webview` | **删除** — 查看器一次只显示一个媒体,无批量来源 |
+| URL 过期(401/403/404) | JS fail_download;错误文案"重新打开该媒体后再试";已下分块保留 |
+| WebView 关闭/刷新 | 看门狗 30s 无活动 → 标 paused;重开媒体 → 查状态 `resumable` → plan_chunks 只补缺块 |
+| 页面网络抖动 | JS 块级重试(指数退避),耗尽才 fail |
+| 用户暂停/取消 | Rust 发 abort → JS 停止 → Rust 按设置保留/清理临时块 |
+| 分块哈希不符(本地校验) | chunk_writer 现有逻辑丢弃该块并计入 missing,JS 侧下次 plan 重取 |
+| 总量变化(服务器换了文件) | plan_chunks 校验 total 与已存不符 → 报错停止,保护已有分块 |
 
-事件 schema 不变(`webview-task-submitted` / `updated` / `completed` / `failed`,均带 `taskId`)。
+## 8. 数据模型
 
-### 6.3 删除的命令
+- `tasks` 表沿用;新增迁移 **删除 `media_url` 列**(000004 加的,本设计不再存 URL — 一行迁移 + entities 同步)
+- `file_name` 为续传/去重键(现有 `find_latest_by_file_name`)
+- 分块表沿用 `chunk_writer` 的既有结构
 
-以下 Tauri 命令整条删除 + 从 `tauri::generate_handler!` 移除 + 从 `build.rs` AppManifest 移除:
+## 9. 设置页(客户端可用性硬约束)
 
-- `submit_batch_download_from_webview`
-- `upload_completed_download`
-- `forward_telegram_message`
-- `list_telegram_transfers`
-- `telegram_transfer_action`
-- `queue_cloud_upload`
-- `list_cloud_uploads`
-- `cloud_upload_action`
-- `login_request_code` / `login_submit_code` / `login_submit_password` / `logout_session`
-- `telegram()` / 任何 `state.telegram()` 调用
+**必须保留且可用**:
 
-## 7. 安全边界(注入脚本)
+- 下载任务页:队列、进度、速度、剩余、暂停/继续/取消/重试、历史、打开文件位置
+- 设置:下载目录(含"选择目录"与存储迁移)、文件名净化、重复策略(skip/rename/overwrite)、并发数(`max_files`、`per_file_chunks`)、分块大小(64-1024 KiB)、请求超时、重试、限速(JS 近似)、WebView2 profile 路径
 
-| 操作 | 现状 | 本 spec |
-|---|---|---|
-| `data-mid` / `data-peer-id` / `data-protected` | ✅ 读 | ⚠️ 仅置顶音频场景读 `data-mid`;其余不再需要 |
-| `aria-disabled` / `tagName` / `className` | ✅ 读 | ✅ 读(保留)|
-| **媒体元素 `src` / `currentSrc`** | ❌ **永不许** | ✅ **允许**(查看器内的 `<video>`/`<audio>`/`<img>`) |
-| URL 尾部 JSON 解析(取 fileName) | ❌ 永不许 | ✅ **允许** |
-| `<a>` 元素的 `href` | ❌ 永不许 | ❌ 永不许(不变)|
-| `cookie` / `localStorage` / `sessionStorage` / `indexedDB` | ❌ 永不许 | ❌ 永不许(不变)|
-| `window.__TAURI_INTERNALS__` | ❌ 永不许 | ❌ 永不许(不变)|
-| `keydown` / `paste` / `copy` / `beforeunload` | ❌ 不订阅 | ❌ 不订阅(不变)|
-| `window.__TAURI__.event` payload 内部字段 | ❌ 不读 | ❌ 不读(不变)|
+并发/分块设置现在作用于 **JS 抓取**(plan_chunks 返回给 JS),超时/重试同理 — 设置改动即时生效(下次 plan)。
 
-**放宽理由**:Telegram Web 文件 URL 是**签名 + 短期有效**的,把 URL 传给 Rust 不会泄露 cookie/session。URL 在 `UrlValidator` 里再过白名单 + 协议检查二次保险。
+## 10. 验证
 
-Rust 侧 `is_trusted_telegram_webview` 校验保持(同源 + label 校验),不读 WebView cookie 也能下载,无须新增 cookie 读取 API。
+### 10.1 Rust 侧(cargo test,非 DOM 模拟)
 
-## 8. URL 过期与错误处理
+- `start_webview_download`:文件名校验、重复策略 skip 报错、任务记录字段
+- `plan_chunks`:幂等;total 不符报错;并发槽位等待;missing 列表正确(含"块已在本地"跳过)
+- `push_chunk`:乱序写入正确、越界拒绝、mpsc 背压生效
+- `finish_download`:缺块拒绝;齐块原子提交;重复 finish 幂等
+- 看门狗:无活动超时 → paused + abort 事件
+- `find_latest_by_file_name`(已有)
 
-### 8.1 URL 有效期
+### 10.2 真机端到端(主要验证)
 
-Telegram Web 文件 URL 通常 1 小时内有效(基于内部签名 + token)。本 spec **不**实现主动续期(避免请求风暴)。
+1. 图片/视频/GIF/语音/Story/置顶音频 → 按钮 → 页面抓取 → Rust 落盘 → 文件可打开
+2. 大文件(>50MB):IPC 吞吐、进度、背压(观察是否卡 UI)
+3. 下载中杀掉客户端重开 → 重开媒体 → 只补缺块(观察日志/进度起点)
+4. 下载中关闭 WebView → 看门狗 → 任务 paused;重开后恢复
+5. 暂停/取消/重试 → 行为与任务页状态一致
+6. 禁保存频道、URL 过期(等 1 小时)各验证一次
 
-### 8.2 错误码与用户提示
-
-| HTTP 状态 | 用户提示 | 后端动作 |
-|---|---|---|
-| 200(忽略 Range) | (退化处理,正常)| Range 不支持,改整文件 GET |
-| 206 | (正常)| 写入对应分块 |
-| 301/302 | (正常,reqwest 自动跟随)| 跟随 |
-| 401 / 403 | "URL 已过期或无权限,请重新打开 Telegram Web 触发该消息后再试" | 任务失败 |
-| 404 | "文件已删除或 URL 失效" | 任务失败 |
-| 410 | "文件已过期" | 任务失败 |
-| 416(范围越界)| (正常,文件已读完)| 跳过,正常完成 |
-| 429 | (重试)| backoff 后重试,最多 N 次 |
-| 5xx | (重试)| backoff 后重试 |
-| 网络错误 / 连接重置 | (重试)| backoff 后重试 |
-
-### 8.3 重试策略
-
-- 单分块最多重试 3 次,指数 backoff(200ms / 1s / 3s)
-- 整个任务不重试(用户手动)
-- 不做 FloodWait 等待(Telegram Web HTTP API 不返回 FloodWait)
-
-## 9. 数据模型
-
-`task_store.rs` 的 `tasks` 表:
-
-- `file_size` 创建时未知(URL HEAD 未发),下载中由 `Content-Length` 头填入并 update 任务记录
-- 新增 `media_url: String` — 源 URL(排查 + 重新触发)
-- 新增 `file_name: Option<String>` — 从 URL 元数据解析的文件名(去重键)
-- `started_at` 用下载开始时间,`completed_at` 用原子提交成功时间
-- `media_token` / `cdn_dc_id` / `chat_id` + `message_id` 等 MTProto 字段删除
-
-**任务状态查询**:`webview_query_task_state(fileName)` 取该文件名**最近一条**任务(cancelled 视为 none),返回 `{state, taskId?, progress?, fileSize?, completedAt?}`。用途:查看器打开时按钮直接显示真实状态 — 正在下载 / 已下载 / 上次失败 / 从未下过。文件名是唯一稳定标识(查看器路径无 messageId);解析失败的文件不参与查询。
-
-## 10. 设置页
-
-- 删除"输入 API ID/Hash"表单
-- 删除"登录"按钮
-- 删除"上传"页
-- 删除"云盘上传"页
-- 删除"代理"设置(MTProto 专属)
-- **保留**:下载目录、文件名模板、媒体过滤、并发/分块/超时/重试、限速、WebView2 profile、设置导入(部分字段)
-- **新增**:HTTP 域名白名单(高级设置,默认隐藏;展开后可见白名单列表,可编辑)
-- **新增**:WebView2 数据根(已有,保留)
-
-## 11. 验证
-
-**JS 注入脚本不做单元测试**(合成 DOM fixture 不能代表真实 Telegram Web),验证靠真机。
-
-### 11.1 Rust 侧(保留 cargo test 惯例,不涉 Telegram 网络)
-
-`cargo test --locked`:
-- `UrlValidator` 各组合(host 白名单 / 协议 / 私有 IP / 拒绝列表)
-- `ChunkedFetcher` 用本地 mock HTTP server(`wiremock`)验证:200 + Content-Length、206 Partial Content、Range 不支持退化、401/404/410、429 重试耗尽、网络错误重试
-- `HttpDownloadManager` 调度:并发上限、取消、续传命中
-- 命令校验:URL 非白名单 → 拒
-
-以上均为真实逻辑测试(本地 HTTP server + 真实文件字节),非模拟 DOM。
-
-### 11.2 手工端到端(主要验证方式)
-
-`npx tauri dev`:
-1. WebView 中登录 Telegram Web(扫描二维码)
-2. 打开图片查看器 → 点按钮 → 下载完成
-3. 打开视频查看器 → 点按钮 → 大文件(>10MB)正常完成(HTTP Range 分块)
-4. 禁保存频道的媒体 → 同样可下载
-5. 打开 Story → 点按钮 → 下载完成
-6. 置顶音频(webk)→ 点按钮 → 下载完成
-7. 杀掉客户端,重启,未完成任务自动从断点恢复
-8. URL 过期(等 1 小时后)再次点击,失败提示明确
-
-## 12. 风险与缓解
+## 11. 风险
 
 | 风险 | 缓解 |
 |---|---|
-| Telegram Web 文件 URL 过期(用户停留后回来点) | 错误信息明确指向"重新打开媒体";不自动重试 |
-| Range 请求不被服务端支持 | 退化到整文件 GET(走 `accept-ranges: none` 检测) |
-| 域名白名单过严,真实 URL 被拒 | 默认白名单含 `web.telegram.org` + `*.cdn-telegram.org` + `*.telegram.org`;可由用户编辑 |
-| 域名白名单过松,被 SSRF 利用 | 同时拒绝私有 IP(127.0.0.1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, ::1) |
-| reqwest 间接依赖把包大小撑大 | 用 `default-features = false, features = ["stream", "rustls-tls"]`,禁用 native-tls |
-| WebView 关闭后 cookie 失效 | WebView2 profile 持久化,与现有行为一致;不增加复杂度 |
-| CDN 大文件 Range 不支持 | 单流下载整文件,自动原子提交 |
-| 查看器 selector 随 Telegram 版本变化 | selector 集中于 config.json;对齐验证脚本 #446342 的做法 |
+| **IPC 吞吐** 成为瓶颈(Tauri 2 二进制 IPC 走 WebView2 postMessage) | 分块 64KiB-1MiB 可调;必要时增大 chunk_size;实测后定默认值 |
+| WebView2 回收/刷新导致 JS 下载中断 | 看门狗 + 续传;失败文案指向"重新打开媒体" |
+| 页面 fetch 被 Telegram Web 的 CSP/ServiceWorker 影响 | 脚本在页面上下文 fetch 属同源正常请求(脚本 #446342 已验证可行) |
+| JS 并发抓取触发 Telegram 限流 | 并发数默认保守(4);块级退避 |
+| 看门狗误判慢速下载为中断 | "活动"定义 = 收到任意 push/finish;30s 阈值 + 慢速场景下进度事件也算活动 |
 
-## 13. 验收标准
+## 12. 验收标准
 
-- [ ] `cargo test --locked` 全部通过(含新增 HTTP 下载器逻辑测试)
-- [ ] `cargo clippy --locked --all-targets` 无 warning
-- [ ] `desktop/src/lib/api.ts` 的 TS 类型与命令签名一致
-- [ ] `npm run build` 通过
-- [ ] `npx tauri build` 产出 MSI/NSIS
-- [ ] 真实账号端到端(查看器路径):
-  - 图片 / 视频 / GIF / 语音 / Story / 置顶音频 下载 ✓
-  - 禁保存频道媒体下载 ✓
-  - 大文件(>10MB)下载 ✓
-  - 杀掉客户端重启,断点续传 ✓
-  - WebView 关闭后再打开,WebView2 profile 保留登录 ✓
-- [ ] Rust 端零 Grammers 依赖(`grep grammers Cargo.lock` 返回空)
-- [ ] Rust 端无 chacha20poly1305 / keyring
-- [ ] 桌面客户端所有 Tauri 命令无 `*_upload*` / `*_forward*` / `*_bot*` / `*_cloud*` / `*_transfer*` / `*_batch*`
+- [ ] `cargo test --locked` 全绿(含新管理器测试)
+- [ ] `cargo clippy --locked --all-targets` 无 warning;`cargo fmt` 干净
+- [ ] `npm run build` 通过;`npx tauri build` 产出 MSI/NSIS
+- [ ] **客户端可用性**(硬约束):
+  - 下载任务页:队列/进度/速度/暂停/继续/取消/重试/历史/打开位置 全部可用
+  - 设置:下载目录选择 + 存储迁移可用;并发/分块/超时/重试/限速改动生效
+  - 日志页、Telegram Web 窗口正常;无死按钮、无到已删功能的入口
+- [ ] 真机端到端(§10.2 全部通过)
+- [ ] Rust 端零 Grammers 依赖;`grep grammers src/` 为空
+- [ ] 无 `upload/forward/cloud/transfer/login` 命令残留
 
-## 14. 后续
+## 13. 参考
 
-- CDN:HTTP API 透明处理,本 spec 不需要单独 CDN 工作(已被解决)
-- 多账号:Telegram Web 不支持(浏览器一样),不做
-- 跨设备同步:不做
-- 性能基准:跑通后另起 spec
-
-## 15. 参考
-
-- 验证脚本源码: https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader/code
-- 注入脚本规范(查看器方案): `docs/superpowers/specs/2026-09-26-telegram-webview-inject-enhancement-design.md`
-- 现有 chunk_writer:`desktop/src-tauri/src/chunk_writer.rs`
-- 现有任务库:`desktop/src-tauri/src/task_store.rs`
-- Telegram CDN 协议说明(本次不实现,HTTP API 已透明):`docs/TELEGRAM_CDN_ZH.md`
+- 验证脚本源码(下载方式逐条对齐): https://greasyfork.org/zh-CN/scripts/446342-telegram-media-downloader/code
+- 注入脚本规范: `docs/superpowers/specs/2026-09-26-telegram-webview-inject-enhancement-design.md`
+- `chunk_writer` / `task_store` / `atomic_file`:现有实现,原样复用
