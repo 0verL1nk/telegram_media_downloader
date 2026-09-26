@@ -5,5 +5,5 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
   { className, ...props },
   ref,
 ) {
-  return <input ref={ref} className={cn(className)} {...props} />;
+  return <input ref={ref} className={cn("input", className)} {...props} />;
 });

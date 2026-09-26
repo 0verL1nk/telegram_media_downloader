@@ -1,0 +1,92 @@
+/* desktop/src/styles/tokens.css
+ * 双层设计 token(见 docs/design/DESIGN.md §2):static 原始层 + alias 语义层。
+ * 组件只引用 alias;深色主题仅覆盖 alias 值,static 层不动。
+ * 深色触发条件:显式 data-theme="dark",或在未显式指定浅色时跟随系统。
+ */
+
+:root {
+  /* ---- static:palette ---- */
+  --palette-white: #ffffff;
+  --palette-gray-50: #f7f8fa;
+  --palette-gray-100: #f1f3f5;
+  --palette-gray-200: #e5e7eb;
+  --palette-gray-250: #f0f0f1;
+  --palette-gray-500: #6b7280;
+  --palette-gray-400: #9ca3af;
+  --palette-ink-900: #0f1419;
+  --palette-navy-900: #17212b;
+  --palette-navy-800: #1c2733;
+  --palette-navy-950: #0e1621;
+  --palette-navy-700: #1f2b38;
+  --palette-navy-600: #24313f;
+  --palette-navy-650: #1c2836;
+  --palette-navy-500: #22303e;
+  --palette-slate-300: #f2f5f7;
+  --palette-slate-400: #8b9aa9;
+  --palette-slate-500: #5f7180;
+  --palette-blue-500: #3390ec;
+  --palette-blue-600: #2b82d9;
+  --palette-blue-400: #4a9fe8;
+  --palette-blue-300: #5cb0f5;
+  --palette-blue-50: #e8f2fd;
+  --palette-blue-900: #233648;
+  --palette-green-500: #4dcd5e;
+  --palette-green-50: #e9f9ee;
+  --palette-green-950: #173627;
+  --palette-red-500: #e53935;
+  --palette-red-400: #ef5350;
+  --palette-red-50: #fdeaea;
+  --palette-red-950: #3a2020;
+  --palette-amber-500: #f59e0b;
+  --palette-amber-400: #f5a623;
+  --palette-track-light: #eef0f2;
+
+  /* ---- alias:light(默认)---- */
+  --bg-base: var(--palette-white);
+  --bg-layer: var(--palette-gray-50);
+  --bg-rail: var(--palette-white);
+  --bg-hover: var(--palette-gray-100);
+  --border-l1: var(--palette-gray-200);
+  --border-l2: var(--palette-gray-250);
+  --text-1: var(--palette-ink-900);
+  --text-2: var(--palette-gray-500);
+  --text-3: var(--palette-gray-400);
+  --accent: var(--palette-blue-500);
+  --accent-hover: var(--palette-blue-600);
+  --accent-soft: var(--palette-blue-50);
+  --success: var(--palette-green-500);
+  --success-soft: var(--palette-green-50);
+  --danger: var(--palette-red-500);
+  --danger-soft: var(--palette-red-50);
+  --warn: var(--palette-amber-500);
+  --track: var(--palette-track-light);
+
+  /* 派生:阴影仅用于弹层(DESIGN.md §2 颜色纪律) */
+  --shadow-pop: 0 12px 32px rgba(15, 20, 25, 0.18);
+  --overlay-backdrop: rgba(10, 14, 18, 0.42);
+}
+
+/* 深色覆盖:只改 alias。`data-theme="dark"` 用于根节点(App 显式解析系统主题);
+ * `.theme-dark` 允许任意子树切换(如设计稿预览),两者共用同一组值。 */
+:root[data-theme="dark"],
+.theme-dark {
+  --bg-base: var(--palette-navy-900);
+  --bg-layer: var(--palette-navy-800);
+  --bg-rail: var(--palette-navy-950);
+  --bg-hover: var(--palette-navy-700);
+  --border-l1: var(--palette-navy-600);
+  --border-l2: var(--palette-navy-650);
+  --text-1: var(--palette-slate-300);
+  --text-2: var(--palette-slate-400);
+  --text-3: var(--palette-slate-500);
+  --accent: var(--palette-blue-400);
+  --accent-hover: var(--palette-blue-300);
+  --accent-soft: var(--palette-blue-900);
+  --danger: var(--palette-red-400);
+  --success-soft: var(--palette-green-950);
+  --danger-soft: var(--palette-red-950);
+  --warn: var(--palette-amber-400);
+  --track: var(--palette-navy-500);
+  --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.5);
+  --overlay-backdrop: rgba(4, 8, 12, 0.55);
+}
