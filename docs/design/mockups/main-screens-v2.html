@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>TMD 0.3 UI Mockups v2</title>
+<style>
+  :root { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background:#d7dade; padding:24px; display:flex; flex-direction:column; gap:24px; align-items:flex-start; }
+  .frame-label { font:600 13px/1 -apple-system,"Segoe UI",sans-serif; color:#3c4043; margin-bottom:8px; }
+  .frame { width:1280px; height:800px; overflow:hidden; position:relative; }
+
+  .theme-light {
+    --bg-base:#ffffff; --bg-layer:#f7f8fa; --bg-rail:#ffffff; --bg-hover:#f1f3f5;
+    --border-l1:#e5e7eb; --border-l2:#f0f0f1;
+    --text-1:#0f1419; --text-2:#6b7280; --text-3:#9ca3af;
+    --accent:#3390ec; --accent-hover:#2b82d9; --accent-soft:#e8f2fd;
+    --success:#4dcd5e; --danger:#e53935; --warn:#f59e0b;
+    --track:#eef0f2;
+  }
+  .theme-dark {
+    --bg-base:#17212b; --bg-layer:#1c2733; --bg-rail:#0e1621; --bg-hover:#1f2b38;
+    --border-l1:#24313f; --border-l2:#1c2836;
+    --text-1:#f2f5f7; --text-2:#8b9aa9; --text-3:#5f7180;
+    --accent:#4a9fe8; --accent-hover:#5cb0f5; --accent-soft:#233648;
+    --success:#4dcd5e; --danger:#ef5350; --warn:#f5a623;
+    --track:#22303e;
+  }
+
+  .app { width:100%; height:100%; display:flex; flex-direction:column; background:var(--bg-base); color:var(--text-1); }
+  .titlebar { height:36px; display:flex; align-items:center; justify-content:space-between; padding:0 0 0 14px; border-bottom:1px solid var(--border-l2); flex:none; }
+  .titlebar .tb-left { display:flex; align-items:center; gap:8px; color:var(--text-2); font:500 12px/1 inherit; }
+  .tb-mark { width:16px; height:16px; border-radius:50%; background:linear-gradient(135deg,#3390ec,#52b8ff); }
+  .tb-controls { display:flex; }
+  .tb-btn { width:44px; height:35px; display:grid; place-items:center; color:var(--text-2); font:400 12px/1 inherit; }
+  .tb-btn.close:hover { background:#e53935; color:#fff; }
+
+  .body { flex:1; display:flex; min-height:0; }
+
+  /* icon rail */
+  .rail { width:64px; flex:none; background:var(--bg-rail); border-right:1px solid var(--border-l1); display:flex; flex-direction:column; align-items:center; padding:10px 0; gap:4px; }
+  .rail-btn { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; color:var(--text-2); font:400 19px/1 inherit; position:relative; }
+  .rail-btn:hover { background:var(--bg-hover); color:var(--text-1); }
+  .rail-btn.active { background:var(--accent-soft); color:var(--accent); }
+  .rail-btn .badge { position:absolute; top:4px; right:4px; min-width:16px; height:16px; border-radius:999px; background:var(--accent); color:#fff; font:600 10px/16px inherit; text-align:center; padding:0 4px; }
+  .rail-spacer { flex:1; }
+  .rail-sep { width:28px; height:1px; background:var(--border-l1); margin:6px 0; }
+
+  /* content: split view */
+  .content { flex:1; display:flex; min-width:0; }
+
+  /* telegram web mock */
+  .web-area { flex:1; display:flex; min-width:0; background:var(--bg-layer); position:relative; }
+  .web-chats { width:250px; flex:none; background:var(--bg-base); border-right:1px solid var(--border-l2); padding:10px 8px; display:flex; flex-direction:column; gap:2px; }
+  .web-search { height:32px; border-radius:8px; background:var(--bg-hover); margin-bottom:8px; display:flex; align-items:center; padding:0 10px; color:var(--text-3); font:400 12px/1 inherit; }
+  .chat-row { display:flex; gap:9px; align-items:center; padding:7px 8px; border-radius:8px; }
+  .chat-row.on { background:var(--accent); color:#fff; }
+  .chat-row.on .chat-sub { color:#dcebfb; }
+  .avatar { width:36px; height:36px; border-radius:50%; flex:none; display:grid; place-items:center; color:#fff; font:600 13px/1 inherit; }
+  .chat-name { font:600 12.5px/1.3 inherit; }
+  .chat-sub { font:400 11px/1.4 inherit; color:var(--text-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:160px; }
+
+  .web-main { flex:1; display:flex; flex-direction:column; min-width:0; position:relative; }
+  .web-head { height:44px; flex:none; display:flex; align-items:center; gap:10px; padding:0 14px; border-bottom:1px solid var(--border-l2); background:var(--bg-base); }
+  .web-msgs { flex:1; padding:16px 18px; display:flex; flex-direction:column; gap:12px; overflow:hidden; }
+  .bubble { max-width:340px; border-radius:12px; padding:8px 10px 6px; background:var(--bg-base); border:1px solid var(--border-l2); }
+  .bubble.mine { align-self:flex-end; background:var(--accent-soft); border-color:transparent; }
+  .bubble .meta { font:400 10.5px/1.4 inherit; color:var(--text-3); text-align:right; margin-top:4px; }
+  .album { display:grid; grid-template-columns:1fr 1fr; gap:2px; border-radius:8px; overflow:hidden; }
+  .thumb { height:84px; }
+
+  /* media viewer overlay (with our injected button) */
+  .viewer { position:absolute; inset:0; background:rgba(10,14,18,.92); display:flex; flex-direction:column; }
+  .viewer-bar { height:52px; flex:none; display:flex; align-items:center; gap:6px; padding:0 14px; color:#cfd8df; }
+  .vbtn { width:38px; height:38px; border-radius:9px; display:grid; place-items:center; font:400 16px/1 inherit; color:#cfd8df; }
+  .vbtn:hover { background:rgba(255,255,255,.08); }
+  .vbtn.injected { background:var(--accent); color:#fff; box-shadow:0 2px 10px rgba(51,144,236,.5); }
+  .annotation { display:flex; align-items:center; gap:6px; margin-left:6px; white-space:nowrap; flex:none; background:rgba(51,144,236,.16); border:1px solid rgba(51,144,236,.5); color:#8ec6f5; border-radius:999px; padding:4px 10px; font:500 11px/1 inherit; }
+  .viewer-stage { flex:1; display:grid; place-items:center; }
+  .photo { width:520px; height:340px; border-radius:12px; background:linear-gradient(135deg,#2b4a63,#3a6f8f 55%,#5e97b5); box-shadow:0 16px 60px rgba(0,0,0,.55); position:relative; }
+  .photo::after { content:"图片媒体(4K 夕阳延时)"; position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); color:rgba(255,255,255,.55); font:500 13px/1 inherit; }
+
+  /* task panel */
+  .divider { width:5px; flex:none; background:transparent; position:relative; cursor:col-resize; }
+  .divider::after { content:""; position:absolute; top:50%; left:1.5px; width:2px; height:56px; transform:translateY(-50%); border-radius:2px; background:var(--border-l1); }
+  .divider:hover::after { background:var(--accent); }
+  .panel { width:360px; flex:none; background:var(--bg-base); border-left:1px solid var(--border-l1); display:flex; flex-direction:column; min-height:0; }
+  .panel-head { padding:14px 16px 10px; flex:none; }
+  .panel-title { display:flex; align-items:center; justify-content:space-between; }
+  .panel-title h2 { font:700 15.5px/1.3 inherit; }
+  .panel-tabs { display:flex; gap:6px; margin-top:10px; }
+  .ptab { height:28px; display:inline-flex; align-items:center; gap:5px; padding:0 11px; border-radius:999px; font:500 12px/1 inherit; color:var(--text-2); }
+  .ptab.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .panel-list { flex:1; overflow:hidden; padding:2px 10px 8px; display:flex; flex-direction:column; gap:2px; }
+  .pr { padding:10px 8px; border-radius:10px; display:flex; flex-direction:column; gap:6px; }
+  .pr:hover { background:var(--bg-layer); }
+  .pr-top { display:flex; align-items:center; gap:8px; min-width:0; }
+  .pr-ic { width:22px; height:22px; border-radius:7px; flex:none; display:grid; place-items:center; font:600 11.5px/1 inherit; }
+  .pr-ic.dl { background:var(--accent-soft); color:var(--accent); }
+  .pr-ic.ok { background:#e9f9ee; color:var(--success); }
+  .pr-ic.bad { background:#fdeaea; color:var(--danger); }
+  .theme-dark .pr-ic.ok { background:#173627; } .theme-dark .pr-ic.bad { background:#3a2020; }
+  .pr-name { font:600 12.5px/1.35 inherit; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; }
+  .pr-x { color:var(--text-3); font:400 12px/1 inherit; }
+  .pr-meta { display:flex; align-items:center; gap:8px; padding-left:30px; }
+  .pr-track { flex:1; height:4px; border-radius:999px; background:var(--track); overflow:hidden; }
+  .pr-fill { height:100%; border-radius:999px; background:var(--accent); }
+  .pr-speed { font:500 11px/1 inherit; color:var(--text-2); white-space:nowrap; }
+  .panel-foot { flex:none; padding:8px 16px; border-top:1px solid var(--border-l2); display:flex; justify-content:space-between; align-items:center; font:400 12px/1 inherit; color:var(--text-2); }
+  .link { color:var(--accent); font-weight:500; }
+
+  .statusbar { height:30px; flex:none; display:flex; align-items:center; justify-content:space-between; padding:0 18px; border-top:1px solid var(--border-l1); background:var(--bg-layer); font:400 11.5px/1 inherit; color:var(--text-2); }
+
+  /* full task page (panel expanded) */
+  .full { flex:1; display:flex; flex-direction:column; min-width:0; }
+  .full-head { padding:18px 24px 0; flex:none; }
+  .head-row { display:flex; align-items:center; justify-content:space-between; }
+  h1 { font:700 20px/1.3 inherit; }
+  .btn { height:36px; display:inline-flex; align-items:center; gap:7px; padding:0 14px; border-radius:8px; font:500 13px/1 inherit; border:1px solid var(--border-l1); background:var(--bg-base); color:var(--text-1); }
+  .btn.ghost { border-color:transparent; background:transparent; color:var(--text-2); }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  .tabs { display:flex; gap:6px; margin-top:14px; }
+  .tab { height:32px; display:inline-flex; align-items:center; gap:6px; padding:0 13px; border-radius:999px; font:500 13px/1 inherit; color:var(--text-2); }
+  .tab.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .tab .n { font:500 11.5px/1 inherit; color:var(--text-3); }
+  .tab.on .n { color:var(--accent); }
+  .list-wrap { flex:1; display:flex; flex-direction:column; min-height:0; padding:12px 24px 0; }
+  .list-head { display:grid; grid-template-columns: 30px minmax(0,1fr) 220px 92px 84px 118px; gap:12px; padding:0 12px 8px; border-bottom:1px solid var(--border-l1); font:500 11.5px/1 inherit; color:var(--text-3); }
+  .row { display:grid; grid-template-columns: 30px minmax(0,1fr) 220px 92px 84px 118px; gap:12px; align-items:center; padding:0 12px; height:54px; border-bottom:1px solid var(--border-l2); }
+  .row:hover { background:var(--bg-layer); }
+  .st { width:26px; height:26px; border-radius:8px; display:grid; place-items:center; font:600 12.5px/1 inherit; }
+  .st.dl { background:var(--accent-soft); color:var(--accent); }
+  .st.ok { background:#e9f9ee; color:var(--success); }
+  .st.bad { background:#fdeaea; color:var(--danger); }
+  .theme-dark .st.ok { background:#173627; } .theme-dark .st.bad { background:#3a2020; }
+  .fname b { display:block; font:600 13.5px/1.35 inherit; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .fname span { font:400 11.5px/1.4 inherit; color:var(--text-3); }
+  .prog-cell { display:flex; align-items:center; gap:10px; }
+  .track { flex:1; height:5px; border-radius:999px; background:var(--track); overflow:hidden; }
+  .fill { height:100%; border-radius:999px; background:var(--accent); }
+  .pct { font:600 12px/1 inherit; color:var(--text-2); width:34px; text-align:right; }
+  .size { font:400 12.5px/1 inherit; color:var(--text-2); }
+  .speed { font:500 12.5px/1 inherit; }
+  .speed small { display:block; font:400 11px/1.4 inherit; color:var(--text-3); }
+  .ops { display:flex; gap:6px; justify-content:flex-end; opacity:0; }
+  .row:hover .ops { opacity:1; }
+  .op { width:30px; height:30px; border-radius:7px; display:grid; place-items:center; color:var(--text-2); }
+  .op:hover { background:var(--bg-hover); color:var(--text-1); }
+  .err { font:400 11.5px/1.4 inherit; color:var(--danger); }
+
+  /* settings */
+  .set-nav { width:190px; flex:none; padding:18px 10px; border-right:1px solid var(--border-l2); }
+  .set-title { font:700 18px/1.3 inherit; padding:0 10px 12px; }
+  .set-item { height:34px; display:flex; align-items:center; padding:0 10px; border-radius:8px; font:500 13px/1 inherit; color:var(--text-2); }
+  .set-item.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .set-main { flex:1; overflow:hidden; padding:20px 28px; display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .card { border:1px solid var(--border-l1); border-radius:12px; padding:16px 20px 14px; }
+  .card h3 { font:600 14.5px/1.3 inherit; margin-bottom:2px; }
+  .card .desc { font:400 12px/1.5 inherit; color:var(--text-2); margin-bottom:12px; }
+  .field { display:grid; grid-template-columns: 170px minmax(0,1fr); align-items:center; gap:14px; padding:8px 0; }
+  .field + .field { border-top:1px solid var(--border-l2); }
+  .field label { font:500 13px/1.4 inherit; }
+  .input { height:38px; display:flex; align-items:center; gap:8px; padding:0 12px; border:1px solid var(--border-l1); border-radius:8px; font:400 12.5px/1 inherit; background:var(--bg-base); color:var(--text-1); }
+  .input .path { font-family:Consolas,"Cascadia Mono",monospace; font-size:12px; }
+  .seg { display:inline-flex; border:1px solid var(--border-l1); border-radius:8px; overflow:hidden; }
+  .seg div { padding:9px 14px; font:500 12.5px/1 inherit; color:var(--text-2); }
+  .seg div.on { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+  .switch { width:40px; height:22px; border-radius:999px; background:var(--accent); position:relative; }
+  .switch::after { content:""; position:absolute; width:16px; height:16px; border-radius:50%; background:#fff; top:3px; right:3px; }
+  .card-foot { display:flex; justify-content:flex-end; gap:10px; padding-top:12px; }
+  .stepper { display:inline-flex; align-items:center; border:1px solid var(--border-l1); border-radius:8px; height:38px; }
+  .stepper button { width:34px; height:100%; background:none; border:0; color:var(--text-2); font:500 15px/1 inherit; }
+  .stepper .val { width:44px; text-align:center; font:600 13px/1 inherit; border-left:1px solid var(--border-l1); border-right:1px solid var(--border-l1); line-height:36px; }
+
+  /* onboarding */
+  .onb { width:100%; height:100%; display:grid; place-items:center; background:var(--bg-layer); }
+  .onb-card { width:600px; background:var(--bg-base); border:1px solid var(--border-l1); border-radius:16px; padding:32px 38px 24px; }
+  .onb-mark { width:52px; height:52px; border-radius:14px; background:linear-gradient(135deg,#3390ec,#52b8ff); display:grid; place-items:center; color:#fff; font:700 22px/1 inherit; margin-bottom:18px; }
+  .onb-card h2 { font:700 22px/1.3 inherit; margin-bottom:6px; }
+  .onb-card .sub { font:400 13.5px/1.6 inherit; color:var(--text-2); margin-bottom:20px; }
+  .step { display:flex; gap:14px; padding:13px 0; border-top:1px solid var(--border-l2); }
+  .step .num { width:26px; height:26px; flex:none; border-radius:999px; background:var(--accent-soft); color:var(--accent); display:grid; place-items:center; font:600 12.5px/1 inherit; }
+  .step b { display:block; font:600 13.5px/1.4 inherit; margin-bottom:3px; }
+  .step p { font:400 12.5px/1.55 inherit; color:var(--text-2); }
+  .step .input { margin-top:9px; height:36px; }
+  .onb-foot { display:flex; align-items:center; justify-content:space-between; padding-top:18px; }
+  .onb-foot .later { font:400 12.5px/1 inherit; color:var(--text-2); }
+</style>
+</head>
+<body>
+
+<!-- ============ 1. 分栏主界面 · 浅色 ============ -->
+<div>
+<div class="frame-label">① 主界面 · 分栏常驻(浅色)— 图标栏 + Telegram Web + 任务面板(可拖拽)</div>
+<div class="frame theme-light">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <nav class="rail">
+        <div class="rail-btn active" title="Telegram">✈</div>
+        <div class="rail-btn" title="任务">↓<span class="badge">2</span></div>
+        <div class="rail-btn" title="日志">≡</div>
+        <div class="rail-spacer"></div>
+        <div class="rail-sep"></div>
+        <div class="rail-btn" title="设置">⚙</div>
+      </nav>
+      <div class="content">
+        <div class="web-area">
+          <div class="web-chats">
+            <div class="web-search">搜索</div>
+            <div class="chat-row on"><div class="avatar" style="background:#e17076">素</div><div><div class="chat-name">摄影素材频道</div><div class="chat-sub">4K 夕阳延时已上传</div></div></div>
+            <div class="chat-row"><div class="avatar" style="background:#7bc862">音</div><div><div class="chat-name">音乐分享群</div><div class="chat-sub">饭拍版.mkv</div></div></div>
+            <div class="chat-row"><div class="avatar" style="background:#65aadd">纪</div><div><div class="chat-name">纪录片频道</div><div class="chat-sub">EP04 tonight</div></div></div>
+            <div class="chat-row"><div class="avatar" style="background:#a695e7">家</div><div><div class="chat-name">家人群</div><div class="chat-sub">语音消息</div></div></div>
+          </div>
+          <div class="web-main">
+            <div class="web-head"><div class="avatar" style="width:26px;height:26px;font-size:11px;background:#e17076">素</div><b style="font:600 13px/1 inherit">摄影素材频道</b></div>
+            <div class="web-msgs">
+              <div class="bubble" style="align-self:flex-start"><div class="album"><div class="thumb" style="background:linear-gradient(135deg,#40607a,#5e88a5)"></div><div class="thumb" style="background:linear-gradient(135deg,#7a5e40,#a58e5e)"></div></div><div class="meta">14:02</div></div>
+            </div>
+            <!-- media viewer overlay with the injected download button -->
+            <div class="viewer">
+              <div class="viewer-bar">
+                <div class="vbtn">✕</div>
+                <div style="flex:1"></div>
+                <div class="vbtn">↗</div>
+                <div class="vbtn injected" title="下载">↓</div>
+                <div class="annotation">我们的下载按钮(原生样式接管)· 点击走 Rust 任务系统</div>
+                <div class="vbtn">…</div>
+              </div>
+              <div class="viewer-stage"><div class="photo"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <aside class="panel">
+          <div class="panel-head">
+            <div class="panel-title"><h2>任务</h2><span style="color:var(--text-3);font-size:16px">⋯</span></div>
+            <div class="panel-tabs"><div class="ptab on">下载中 2</div><div class="ptab">已完成 9</div><div class="ptab">失败 1</div></div>
+          </div>
+          <div class="panel-list">
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic dl">↓</div><div class="pr-name">视频_4K_夕阳延时.mp4</div><div class="pr-x">‖</div><div class="pr-x">✕</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:68%"></div></div><span class="pr-speed">68% · 3.1 MB/s</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic dl">↓</div><div class="pr-name">演唱会现场_饭拍版.mkv</div><div class="pr-x">‖</div><div class="pr-x">✕</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:23%"></div></div><span class="pr-speed">23% · 1.4 MB/s</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic ok">✓</div><div class="pr-name">风景照_03.jpg</div><div class="pr-x">↗</div><div class="pr-x">📁</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:100%;background:var(--success)"></div></div><span class="pr-speed">完成 · 3.2 MB</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic ok">✓</div><div class="pr-name">语音消息_0912.ogg</div><div class="pr-x">↗</div><div class="pr-x">📁</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:100%;background:var(--success)"></div></div><span class="pr-speed">完成 · 512 KB</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic bad">✕</div><div class="pr-name">纪录片_EP04.mp4</div><div class="pr-x">↻</div><div class="pr-x">✕</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:41%;background:var(--danger)"></div></div><span class="pr-speed" style="color:var(--danger)">URL 已过期 · 重开媒体可续</span></div>
+            </div>
+          </div>
+          <div class="panel-foot"><span>队列 0 · 限速关</span><span class="link">查看全部 ↗</span></div>
+        </aside>
+      </div>
+    </div>
+    <div class="statusbar">
+      <span>2 项下载中 · 4.5 MB/s · 已完成 9 · 失败 1</span>
+      <span>托盘运行中 · 关闭窗口下载继续 · v0.2.1</span>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 2. 分栏主界面 · 深色 ============ -->
+<div>
+<div class="frame-label">② 主界面 · 分栏常驻(深色,跟随系统)</div>
+<div class="frame theme-dark">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <nav class="rail">
+        <div class="rail-btn active" title="Telegram">✈</div>
+        <div class="rail-btn" title="任务">↓<span class="badge">2</span></div>
+        <div class="rail-btn" title="日志">≡</div>
+        <div class="rail-spacer"></div>
+        <div class="rail-sep"></div>
+        <div class="rail-btn" title="设置">⚙</div>
+      </nav>
+      <div class="content">
+        <div class="web-area">
+          <div class="web-chats">
+            <div class="web-search">搜索</div>
+            <div class="chat-row on" style="background:var(--accent);color:#fff"><div class="avatar" style="background:#e17076">素</div><div><div class="chat-name">摄影素材频道</div><div class="chat-sub" style="color:#dcebfb">4K 夕阳延时已上传</div></div></div>
+            <div class="chat-row"><div class="avatar" style="background:#7bc862">音</div><div><div class="chat-name">音乐分享群</div><div class="chat-sub">饭拍版.mkv</div></div></div>
+            <div class="chat-row"><div class="avatar" style="background:#65aadd">纪</div><div><div class="chat-name">纪录片频道</div><div class="chat-sub">EP04 tonight</div></div></div>
+          </div>
+          <div class="web-main">
+            <div class="web-head"><b style="font:600 13px/1 inherit">摄影素材频道</b></div>
+            <div class="web-msgs">
+              <div class="bubble" style="align-self:flex-start;background:var(--bg-layer);border-color:var(--border-l2)"><div class="album"><div class="thumb" style="background:linear-gradient(135deg,#2b4a63,#3a6f8f)"></div><div class="thumb" style="background:linear-gradient(135deg,#5e4a2b,#8f7a3a)"></div></div><div class="meta">14:02</div></div>
+            </div>
+            <div class="viewer">
+              <div class="viewer-bar">
+                <div class="vbtn">✕</div>
+                <div style="flex:1"></div>
+                <div class="vbtn">↗</div>
+                <div class="vbtn injected" title="下载">↓</div>
+                <div class="annotation">我们的下载按钮(原生样式接管)· 点击走 Rust 任务系统</div>
+                <div class="vbtn">…</div>
+              </div>
+              <div class="viewer-stage"><div class="photo"></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="divider"></div>
+        <aside class="panel" style="background:var(--bg-base)">
+          <div class="panel-head">
+            <div class="panel-title"><h2>任务</h2><span style="color:var(--text-3);font-size:16px">⋯</span></div>
+            <div class="panel-tabs"><div class="ptab on">下载中 2</div><div class="ptab">已完成 9</div><div class="ptab">失败 1</div></div>
+          </div>
+          <div class="panel-list">
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic dl">↓</div><div class="pr-name">视频_4K_夕阳延时.mp4</div><div class="pr-x">‖</div><div class="pr-x">✕</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:68%"></div></div><span class="pr-speed">68% · 3.1 MB/s</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic dl">↓</div><div class="pr-name">演唱会现场_饭拍版.mkv</div><div class="pr-x">‖</div><div class="pr-x">✕</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:23%"></div></div><span class="pr-speed">23% · 1.4 MB/s</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic ok">✓</div><div class="pr-name">纪录片_EP03.mp4</div><div class="pr-x">↗</div><div class="pr-x">📁</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:100%;background:var(--success)"></div></div><span class="pr-speed">完成 · 590 MB</span></div>
+            </div>
+            <div class="pr">
+              <div class="pr-top"><div class="pr-ic bad">✕</div><div class="pr-name">演唱会现场_完整版.mkv</div><div class="pr-x">↻</div><div class="pr-x">✕</div></div>
+              <div class="pr-meta"><div class="pr-track"><div class="pr-fill" style="width:41%;background:var(--danger)"></div></div><span class="pr-speed" style="color:var(--danger)">URL 已过期 · 重开媒体可续</span></div>
+            </div>
+          </div>
+          <div class="panel-foot"><span>队列 0 · 限速关</span><span class="link">查看全部 ↗</span></div>
+        </aside>
+      </div>
+    </div>
+    <div class="statusbar">
+      <span>2 项下载中 · 4.5 MB/s · 已完成 9 · 失败 1</span>
+      <span>托盘运行中 · 关闭窗口下载继续 · v0.2.1</span>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 3. 任务全览(面板展开) ============ -->
+<div>
+<div class="frame-label">③ 任务全览(点图标栏"任务"= 面板展开为整页,含完整表格与操作)</div>
+<div class="frame theme-light">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <nav class="rail">
+        <div class="rail-btn" title="Telegram">✈</div>
+        <div class="rail-btn active" title="任务">↓<span class="badge">2</span></div>
+        <div class="rail-btn" title="日志">≡</div>
+        <div class="rail-spacer"></div>
+        <div class="rail-sep"></div>
+        <div class="rail-btn" title="设置">⚙</div>
+      </nav>
+      <main class="full">
+        <div class="full-head">
+          <div class="head-row">
+            <h1>任务</h1>
+            <div style="display:flex;gap:8px"><button class="btn">打开下载目录</button><button class="btn ghost">清除已完成</button></div>
+          </div>
+          <div class="tabs">
+            <div class="tab on">全部 <span class="n">12</span></div>
+            <div class="tab">下载中 <span class="n">2</span></div>
+            <div class="tab">已完成 <span class="n">9</span></div>
+            <div class="tab">失败 <span class="n">1</span></div>
+          </div>
+        </div>
+        <div class="list-wrap">
+          <div class="list-head"><span></span><span>文件</span><span>进度</span><span>大小</span><span>速度</span><span style="text-align:right">操作</span></div>
+          <div class="row">
+            <div class="st dl">↓</div>
+            <div class="fname"><b>视频_4K_夕阳延时.mp4</b><span>来自 · 摄影素材频道 · 1.21 GB</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:68%"></div></div><span class="pct">68%</span></div>
+            <div class="size">824 MB</div>
+            <div class="speed">3.1 MB/s<small>剩余 2:05</small></div>
+            <div class="ops"><div class="op">‖</div><div class="op" style="color:var(--danger)">✕</div></div>
+          </div>
+          <div class="row">
+            <div class="st dl">↓</div>
+            <div class="fname"><b>演唱会现场_饭拍版.mkv</b><span>来自 · 音乐分享群 · 486 MB</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div>
+            <div class="size">486 MB</div>
+            <div class="speed">1.4 MB/s<small>剩余 4:30</small></div>
+            <div class="ops"><div class="op">‖</div><div class="op" style="color:var(--danger)">✕</div></div>
+          </div>
+          <div class="row">
+            <div class="st ok">✓</div>
+            <div class="fname"><b>风景照_03.jpg</b><span>来自 · 摄影素材频道 · 今天 00:12</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:100%;background:var(--success)"></div></div><span style="font:600 12.5px/1 inherit;color:var(--success)">完成</span></div>
+            <div class="size">3.2 MB</div>
+            <div class="speed">—</div>
+            <div class="ops"><div class="op">↗</div><div class="op">📁</div></div>
+          </div>
+          <div class="row">
+            <div class="st bad">✕</div>
+            <div class="fname"><b>纪录片_EP04.mp4</b><span class="err">URL 已过期或无权限 — 重新打开该媒体后点击下载即可从断点继续</span></div>
+            <div class="prog-cell"><div class="track"><div class="fill" style="width:41%;background:var(--danger)"></div></div><span class="pct" style="color:var(--danger)">41%</span></div>
+            <div class="size">610 MB</div>
+            <div class="speed">—</div>
+            <div class="ops"><div class="op">↻</div><div class="op" style="color:var(--danger)">✕</div></div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div class="statusbar">
+      <span>2 项下载中 · 4.5 MB/s · 已完成 9 · 失败 1</span>
+      <span>托盘运行中 · 关闭窗口下载继续 · v0.2.1</span>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 4. 设置 ============ -->
+<div>
+<div class="frame-label">④ 设置(图标栏进入;左类别 + 卡片表单,就地保存)</div>
+<div class="frame theme-light">
+  <div class="app">
+    <div class="titlebar">
+      <div class="tb-left"><span class="tb-mark"></span>Telegram Media Downloader</div>
+      <div class="tb-controls"><div class="tb-btn">─</div><div class="tb-btn">▢</div><div class="tb-btn close">✕</div></div>
+    </div>
+    <div class="body">
+      <nav class="rail">
+        <div class="rail-btn" title="Telegram">✈</div>
+        <div class="rail-btn" title="任务">↓<span class="badge">2</span></div>
+        <div class="rail-btn" title="日志">≡</div>
+        <div class="rail-spacer"></div>
+        <div class="rail-sep"></div>
+        <div class="rail-btn active" title="设置">⚙</div>
+      </nav>
+      <div class="content">
+        <nav class="set-nav">
+          <div class="set-title">设置</div>
+          <div class="set-item on">下载与存储</div>
+          <div class="set-item">并发与限速</div>
+          <div class="set-item">外观与语言</div>
+          <div class="set-item">软件更新</div>
+          <div class="set-item">托盘与启动</div>
+          <div class="set-item">关于</div>
+        </nav>
+        <div class="set-main">
+          <div class="card">
+            <h3>下载与存储</h3>
+            <div class="desc">媒体文件保存位置与重名处理,修改后新任务立即生效。</div>
+            <div class="field"><label>下载目录</label><div class="input"><span class="path">E:\TelegramMediaDownloader\Downloads</span></div></div>
+            <div class="field"><label>重复文件</label><div class="seg"><div>跳过</div><div class="on">重命名</div><div>覆盖</div></div></div>
+            <div class="field"><label>保留未完成分块</label><div class="switch"></div></div>
+            <div class="card-foot"><button class="btn ghost">重置</button><button class="btn primary">应用</button></div>
+          </div>
+          <div class="card">
+            <h3>并发与限速</h3>
+            <div class="desc">页面抓取并发与分块策略;限速 0 表示不限。</div>
+            <div class="field"><label>同时下载文件数</label><div class="stepper"><button>−</button><div class="val">4</div><button>+</button></div></div>
+            <div class="field"><label>每文件并发分块</label><div class="stepper"><button>−</button><div class="val">4</div><button>+</button></div></div>
+            <div class="field"><label>分块大小</label><div class="input" style="width:200px">512 KiB<span style="margin-left:auto;color:var(--text-3)">▾</span></div></div>
+            <div class="field"><label>限速</label><div class="input" style="width:200px">0<span style="margin-left:auto;color:var(--text-3)">KiB/s</span></div></div>
+          </div>
+          <div class="card">
+            <h3>托盘与启动</h3>
+            <div class="desc">关闭窗口的行为与开机启动。</div>
+            <div class="field"><label>关闭窗口时</label><div class="seg"><div class="on">驻留托盘</div><div>直接退出</div></div></div>
+            <div class="field"><label>开机自动启动</label><div class="switch"></div></div>
+            <div class="field"><label>启动时最小化到托盘</label><div class="switch" style="background:var(--track)"></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ============ 5. 首次引导 ============ -->
+<div>
+<div class="frame-label">⑤ 首次启动引导(三步确认,不挡路)</div>
+<div class="frame theme-light">
+  <div class="onb">
+    <div class="onb-card">
+      <div class="onb-mark">T</div>
+      <h2>欢迎使用 Telegram Media Downloader</h2>
+      <div class="sub">三个确认即可开始:文件放哪里、用哪个 Telegram 账号、数据存在哪。之后一切都在左边的 Telegram 窗口、右边任务面板和托盘里。</div>
+      <div class="step">
+        <div class="num">1</div>
+        <div style="flex:1"><b>选择下载目录</b><p>下载完成的媒体文件保存到这里,可随时在设置中更改。</p><div class="input"><span class="path">E:\TelegramMediaDownloader\Downloads</span></div></div>
+      </div>
+      <div class="step">
+        <div class="num">2</div>
+        <div style="flex:1"><b>登录 Telegram</b><p>在主界面左侧的 Telegram 窗口扫码或手机号登录 —— 一次登录,长期有效,不需要任何额外配置。</p></div>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <div style="flex:1"><b>数据目录</b><p>任务数据库、登录 profile 与缓存都保存在此,可在设置中整体迁移。</p><div class="input"><span class="path">E:\TelegramMediaDownloader</span></div></div>
+      </div>
+      <div class="onb-foot"><span class="later">稍后再说 — 直接进入</span><button class="btn primary" style="height:40px;padding:0 22px">开始使用</button></div>
+    </div>
+  </div>
+</div>
+</div>
+
+</body>
+</html>
