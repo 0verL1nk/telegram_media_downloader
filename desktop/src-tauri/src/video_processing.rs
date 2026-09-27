@@ -23,6 +23,44 @@ pub struct Replacement {
     pub new_size: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ProcessingOutcome {
+    AlreadyAv1,
+    NotSmaller { old_size: u64, new_size: u64 },
+    Replaced(Replacement),
+}
+
+pub const PROCESSED_NOTE_PREFIX: &str = "[video-processed] ";
+pub const LEGACY_PROCESSED_NOTE: &str = "文件已是 AV1 或转码后不会变小，原文件保持不变";
+
+pub fn is_processed_note(note: Option<&str>) -> bool {
+    note.is_some_and(|note| {
+        note.starts_with(PROCESSED_NOTE_PREFIX) || note == LEGACY_PROCESSED_NOTE
+    })
+}
+
+pub fn outcome_note(outcome: ProcessingOutcome) -> String {
+    let detail = match outcome {
+        ProcessingOutcome::AlreadyAv1 => "视频已是 AV1，跳过转码，原文件保留".to_owned(),
+        ProcessingOutcome::NotSmaller { old_size, new_size } => format!(
+            "已尝试转码为 AV1，但结果未变小（{} → {}），原文件保留",
+            display_size(old_size),
+            display_size(new_size)
+        ),
+        ProcessingOutcome::Replaced(replacement) => format!(
+            "已转码为 AV1 并替换原文件（{} → {}）",
+            display_size(replacement.old_size),
+            display_size(replacement.new_size)
+        ),
+    };
+    format!("{PROCESSED_NOTE_PREFIX}{detail}")
+}
+
+fn display_size(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    format!("{mib:.1} MiB")
+}
+
 const SEGMENT_SECONDS: f64 = 30.0;
 const ENCODE_PROGRESS_WEIGHT: f64 = 0.9;
 
@@ -134,7 +172,7 @@ pub async fn compress_replace(
     app: &AppHandle,
     task_id: &str,
     source: &Path,
-) -> Result<Option<Replacement>> {
+) -> Result<ProcessingOutcome> {
     if !source.is_file() {
         bail!("原视频文件不存在");
     }
@@ -148,7 +186,7 @@ pub async fn compress_replace(
                 .await
                 .context("视频已是 AV1，但无法清理上次处理留下的临时分段")?;
         }
-        return Ok(None);
+        return Ok(ProcessingOutcome::AlreadyAv1);
     }
     let width = video.width.context("无法读取原视频宽度")?;
     let height = video.height.context("无法读取原视频高度")?;
@@ -395,7 +433,7 @@ pub async fn compress_replace(
         fs::remove_dir_all(&work_dir)
             .await
             .context("转码结果未变小，且无法清理临时分段")?;
-        return Ok(None);
+        return Ok(ProcessingOutcome::NotSmaller { old_size, new_size });
     }
 
     let after = match probe(&ffprobe, &candidate).await {
@@ -478,7 +516,10 @@ pub async fn compress_replace(
         .await
         .context("视频已替换，但无法清理临时分段")?;
     emit_progress(app, task_id, 1.0);
-    Ok(Some(Replacement { old_size, new_size }))
+    Ok(ProcessingOutcome::Replaced(Replacement {
+        old_size,
+        new_size,
+    }))
 }
 
 async fn segment_is_valid(

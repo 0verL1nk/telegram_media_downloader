@@ -43,6 +43,20 @@ export function statusTone(status: string): "blue" | "muted" | "amber" | "green"
 }
 
 const VIDEO_EXTENSIONS = new Set(["3g2", "3gp", "asf", "avi", "divx", "f4v", "flv", "m2ts", "m2v", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg", "mpg", "mts", "mxf", "ogv", "ogg", "qt", "rm", "rmvb", "ts", "vob", "webm", "wmv"]);
+const VIDEO_PROCESSED_PREFIX = "[video-processed] ";
+const LEGACY_VIDEO_PROCESSED_NOTE = "文件已是 AV1 或转码后不会变小，原文件保持不变";
+
+export function videoProcessedNote(task: DownloadTask): string | null {
+  const note = task.error?.trim();
+  if (!note) return null;
+  if (note.startsWith(VIDEO_PROCESSED_PREFIX)) return note.slice(VIDEO_PROCESSED_PREFIX.length);
+  if (note === LEGACY_VIDEO_PROCESSED_NOTE) return "已处理过（旧记录未保存具体结果），跳过重复处理";
+  return null;
+}
+
+export function isVideoProcessed(task: DownloadTask): boolean {
+  return videoProcessedNote(task) !== null;
+}
 
 export function isVideoTask(task: DownloadTask): boolean {
   const mediaType = task.mediaType?.toLowerCase() ?? "";
@@ -72,6 +86,7 @@ export function getTaskActions(task: DownloadTask): TaskAction[] {
 
 export function canProcessVideo(task: DownloadTask): boolean {
   if (task.status.toLowerCase() !== "completed") return false;
+  if (isVideoProcessed(task)) return false;
   if (["video", "animation"].includes((task.mediaType ?? "").toLowerCase())) return true;
   return /\.(mp4|m4v|mov|mkv|webm|avi)$/i.test(task.fileName ?? task.outputPath ?? "");
 }
@@ -102,6 +117,8 @@ export function panelSubtitle(task: DownloadTask): { text: string; failed: boole
   if (status === "queued") return { text: "排队中", failed: false };
   if (status === "paused") return { text: `已暂停 · ${Math.round(getPercent(task))}%`, failed: false };
   if (status === "completed") {
+    const processingNote = videoProcessedNote(task);
+    if (processingNote) return { text: `完成 · ${processingNote}`, failed: false };
     if (task.error) return { text: `完成 · ${task.error}`, failed: true };
     return { text: `完成 · ${formatBytes(task.totalBytes ?? task.downloadedBytes)}`, failed: false };
   }
@@ -116,7 +133,11 @@ export function tableSubtitle(task: DownloadTask): { text: string; failed: boole
     return { text: task.error || "任务失败,可重试", failed: true };
   }
   if (status === "completed" && task.error) {
-    return { text: `已完成 · ${task.error}`, failed: true };
+    const processingNote = videoProcessedNote(task);
+    return {
+      text: `已完成 · ${processingNote ?? task.error}`,
+      failed: processingNote === null,
+    };
   }
   const size = task.totalBytes ? formatBytes(task.totalBytes) : formatBytes(task.downloadedBytes);
   const parts = [source, size].filter(Boolean);

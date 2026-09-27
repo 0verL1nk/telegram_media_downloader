@@ -652,7 +652,7 @@ impl DownloadManager {
                 .await;
         }
         let finished_record = self.require_record(task_id).await?;
-        let mut processing_error = None;
+        let mut processing_note = None;
         if video_processing::is_video(finished_record.media_type.as_deref(), &output) {
             self.shared
                 .store
@@ -665,42 +665,36 @@ impl DownloadManager {
                 .await
                 .context("视频编码队列已关闭")?;
             match video_processing::compress_replace(&self.shared.app, task_id, &output).await {
-                Ok(Some(replacement)) => {
-                    self.shared
-                        .log(
-                            "info",
-                            DOWNLOAD_LOG_TARGET,
-                            format!(
-                                "任务 {task_id} 视频已转为 AV1 并替换原文件：{} → {} 字节",
-                                replacement.old_size, replacement.new_size
-                            ),
-                        )
-                        .await;
-                    if let Err(error) = self
-                        .shared
-                        .store
-                        .set_file_size(task_id, replacement.new_size)
-                        .await
-                    {
-                        let detail = safe_error(&format!(
-                            "视频已替换，但任务文件大小记录更新失败：{error:#}"
-                        ));
-                        processing_error = Some(detail.clone());
-                        self.shared
-                            .log(
-                                "warn",
-                                DOWNLOAD_LOG_TARGET,
-                                format!("任务 {task_id} {detail}"),
-                            )
-                            .await;
+                Ok(outcome) => {
+                    let note = video_processing::outcome_note(outcome);
+                    if let video_processing::ProcessingOutcome::Replaced(replacement) = outcome {
+                        if let Err(error) = self
+                            .shared
+                            .store
+                            .set_file_size(task_id, replacement.new_size)
+                            .await
+                        {
+                            let detail = safe_error(&format!(
+                                "视频已替换，但任务文件大小记录更新失败：{error:#}"
+                            ));
+                            processing_note = Some(format!("{note}；{detail}"));
+                            self.shared
+                                .log(
+                                    "warn",
+                                    DOWNLOAD_LOG_TARGET,
+                                    format!("任务 {task_id} {detail}"),
+                                )
+                                .await;
+                        }
                     }
-                }
-                Ok(None) => {
+                    if processing_note.is_none() {
+                        processing_note = Some(note.clone());
+                    }
                     self.shared
                         .log(
                             "info",
                             DOWNLOAD_LOG_TARGET,
-                            format!("任务 {task_id} 视频已是 AV1 或无法进一步缩小，保留当前文件"),
+                            format!("任务 {task_id} {note}"),
                         )
                         .await;
                 }
@@ -708,7 +702,7 @@ impl DownloadManager {
                     let detail = safe_error(&format!(
                         "视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"
                     ));
-                    processing_error = Some(detail.clone());
+                    processing_note = Some(detail.clone());
                     self.shared
                         .log(
                             "warn",
@@ -729,7 +723,7 @@ impl DownloadManager {
             .await?;
         self.shared
             .store
-            .set_status(task_id, "completed", processing_error.as_deref())
+            .set_status(task_id, "completed", processing_note.as_deref())
             .await?;
         let layout = self.shared.layout.read().await.clone();
         if let Err(error) = crate::task_cover::embed_task_cover_if_selected(
@@ -776,6 +770,9 @@ impl DownloadManager {
         let record = self.require_record(task_id).await?;
         if record.status != "completed" {
             bail!("只能处理已完成下载的视频");
+        }
+        if video_processing::is_processed_note(record.error.as_deref()) {
+            bail!("该视频已经处理过，已跳过重复转码");
         }
         let output = record
             .output_path
@@ -826,15 +823,15 @@ impl DownloadManager {
 
         let result = video_processing::compress_replace(&self.shared.app, task_id, output).await;
         let (message, failure) = match result {
-            Ok(Some(replacement)) => {
+            Ok(video_processing::ProcessingOutcome::Replaced(replacement)) => {
+                let note = video_processing::outcome_note(
+                    video_processing::ProcessingOutcome::Replaced(replacement),
+                );
                 self.shared
                     .log(
                         "info",
                         DOWNLOAD_LOG_TARGET,
-                        format!(
-                            "手动视频处理完成 {task_id}：{} → {} 字节",
-                            replacement.old_size, replacement.new_size
-                        ),
+                        format!("手动视频处理完成 {task_id}：{note}"),
                     )
                     .await;
                 match self
@@ -843,7 +840,7 @@ impl DownloadManager {
                     .set_file_size(task_id, replacement.new_size)
                     .await
                 {
-                    Ok(()) => (None, None),
+                    Ok(()) => (Some(note), None),
                     Err(error) => {
                         let detail = safe_error(&format!(
                             "视频已替换，但任务文件大小记录更新失败：{error:#}"
@@ -859,10 +856,17 @@ impl DownloadManager {
                     }
                 }
             }
-            Ok(None) => (
-                Some("文件已是 AV1 或转码后不会变小，原文件保持不变".to_owned()),
-                None,
-            ),
+            Ok(outcome) => {
+                let note = video_processing::outcome_note(outcome);
+                self.shared
+                    .log(
+                        "info",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("手动视频处理 {task_id}：{note}"),
+                    )
+                    .await;
+                (Some(note), None)
+            }
             Err(error) => {
                 let detail = safe_error(&format!(
                     "视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"
