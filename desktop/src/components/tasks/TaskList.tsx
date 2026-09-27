@@ -1,6 +1,7 @@
 import { useRef } from "react";
 import { TaskContextMenu, TaskOps } from "./TaskOps";
 import { Button } from "../ui/button";
+import { Checkbox } from "../ui/checkbox";
 import { Progress } from "../ui/progress";
 import type { DownloadTask, TaskAction } from "../../lib/api";
 import { formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph } from "../../lib/format";
@@ -16,33 +17,47 @@ const FILTERS: { id: TaskFilter; label: string }[] = [
   { id: "failed", label: "失败" },
 ];
 
-/** 任务全览页(DESIGN.md §1 状态②):54px 行高表格 + 键盘操作。 */
+/** 任务全览页(DESIGN.md §1 状态②):54px 行高表格 + 多选 + 键盘操作。 */
 export function TaskList({
   tasks,
   counts,
   filter,
   onFilterChange,
   selectedId,
+  selectedIds,
   onSelect,
+  onToggleSelect,
+  onToggleSelectAll,
   onAction,
   onOpenFolder,
   onCopyName,
   onDelete,
   onClearFinished,
+  onBulkAction,
+  onBulkDelete,
+  onClearSelection,
 }: {
   tasks: DownloadTask[];
   counts: Record<TaskFilter, number>;
   filter: TaskFilter;
   onFilterChange: (filter: TaskFilter) => void;
   selectedId?: string | null;
+  selectedIds: Set<string>;
   onSelect: (task: DownloadTask | null) => void;
+  onToggleSelect: (task: DownloadTask) => void;
+  onToggleSelectAll: (checked: boolean) => void;
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   onClearFinished: () => void;
+  onBulkAction: (action: "pause" | "resume" | "retry") => void;
+  onBulkDelete: () => void;
+  onClearSelection: () => void;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
+  const allSelected = tasks.length > 0 && tasks.every((task) => selectedIds.has(task.taskId));
+  const selectedVisible = tasks.filter((task) => selectedIds.has(task.taskId));
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
     const index = tasks.findIndex((task) => task.taskId === selectedId);
@@ -58,11 +73,12 @@ export function TaskList({
     } else if (event.key === "Delete" && index >= 0) {
       event.preventDefault();
       const task = tasks[index];
-      if (task.status.toLowerCase() === "downloading" || task.status.toLowerCase() === "paused" || task.status.toLowerCase() === "queued") {
+      if (["downloading", "paused", "queued"].includes(task.status.toLowerCase())) {
         onAction(task, "cancel");
       }
     } else if (event.key === "Escape") {
       onSelect(null);
+      onClearSelection();
     }
   }
 
@@ -95,9 +111,36 @@ export function TaskList({
           ))}
         </div>
       </div>
+
+      {selectedIds.size > 0 ? (
+        <div className="bulk-bar">
+          <span className="bulk-count">已选 {selectedIds.size} 项</span>
+          <span className="bulk-actions">
+            {selectedVisible.some((task) => ["downloading", "queued"].includes(task.status.toLowerCase())) ? (
+              <Button variant="secondary" onClick={() => onBulkAction("pause")}>暂停</Button>
+            ) : null}
+            {selectedVisible.some((task) => task.status.toLowerCase() === "paused") ? (
+              <Button variant="secondary" onClick={() => onBulkAction("resume")}>继续</Button>
+            ) : null}
+            {selectedVisible.some((task) => ["failed", "cancelled"].includes(task.status.toLowerCase())) ? (
+              <Button variant="secondary" onClick={() => onBulkAction("retry")}>重试</Button>
+            ) : null}
+            <Button variant="destructive" onClick={onBulkDelete}>删除</Button>
+            <Button variant="ghost" onClick={onClearSelection}>取消选择</Button>
+          </span>
+        </div>
+      ) : null}
+
       <div className="list-wrap">
-        <div className="list-head" aria-hidden>
-          <span />
+        <div className="list-head">
+          <span className="row-check">
+            <Checkbox
+              checked={allSelected}
+              onCheckedChange={(checked) => onToggleSelectAll(checked === true)}
+              aria-label="全选任务"
+            />
+          </span>
+          <span aria-hidden />
           <span>文件</span>
           <span>进度</span>
           <span>大小</span>
@@ -116,15 +159,23 @@ export function TaskList({
             const subtitle = tableSubtitle(task);
             const percent = Math.round(getPercent(task));
             const remaining = remainingLabel(task);
+            const checked = selectedIds.has(task.taskId);
             return (
               <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onCopyName={onCopyName} onDelete={onDelete}>
                 <div
-                  className={"row" + (selectedId === task.taskId ? " selected" : "")}
+                  className={"row" + (selectedId === task.taskId ? " selected" : "") + (checked ? " checked" : "")}
                   role="row"
                   tabIndex={-1}
                   aria-selected={selectedId === task.taskId}
                   onClick={() => onSelect(task)}
                 >
+                  <span className="row-check" onClick={(event) => event.stopPropagation()}>
+                    <Checkbox
+                      checked={checked}
+                      onCheckedChange={() => onToggleSelect(task)}
+                      aria-label={`选择 ${task.fileName || "未命名媒体"}`}
+                    />
+                  </span>
                   <span className={"st " + glyph.tone}>{glyph.glyph}</span>
                   <span className="fname">
                     <b title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</b>

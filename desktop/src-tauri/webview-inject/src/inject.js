@@ -4,10 +4,11 @@ import { diag } from './diag.js';
 import { detectVersion } from './detect.js';
 import { bindEvents } from './state.js';
 import { startWatcher } from './watcher.js';
+import { restoreMediaUrls, autoResumeQueued } from './downloader.js';
 
 (function main() {
   'use strict';
-  try { document.documentElement.setAttribute('data-tmd-inject', 'v0.3.2'); } catch (_e) { /* 忽略 */ }
+  try { document.documentElement.setAttribute('data-tmd-inject', 'v0.3.3'); } catch (_e) { /* 忽略 */ }
   diag(`boot: origin=${location.origin} href=${location.pathname} top=${window.top === window} hasTauri=${typeof window.__TAURI__ !== 'undefined'}`);
   if (window.top !== window) { diag('boot: skip — not top frame'); return; }
   const cfg = globalThis.__INJECT_CONFIG__ || {};
@@ -20,4 +21,9 @@ import { startWatcher } from './watcher.js';
   } catch (error) {
     diag(`startWatcher threw: ${error && error.message ? error.message : String(error)}`);
   }
+  // URL 缓存持久化在页面自己的 localStorage:恢复后,排队中的任务可以自动续传。
+  restoreMediaUrls();
+  setTimeout(() => {
+    void autoResumeQueued(cfg).catch((error) => diag(`autoResumeQueued error: ${error && error.message}`));
+  }, 3000);
 })();

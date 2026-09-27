@@ -17,26 +17,85 @@ const HEARTBEAT_MS = 10000;
 const STALL_LIMIT_MS = 60000;
 const STALL_CHECK_MS = 5000;
 const STALL_MESSAGE = '下载停滞(媒体可能已切换或网络中断)。重新打开该媒体后再点下载即可从断点继续。';
-/// URL 会话缓存上限:文件名 → { url, fileType, source },供"继续/重试"自动续传。
+/// URL 缓存上限:文件名 → { url, fileType, source }。URL 从不进入 Rust:
+/// 它只保存在 Telegram 页面自己的 localStorage 里,重启后由页面自己恢复。
 const URL_CACHE_LIMIT = 200;
+const URL_STORE_KEY = 'tmd.mediaUrls.v1';
+/// 持久化条目的保留期(天):只用于控制缓存规模,不代表"链接有效期"——
+/// 链接是否失效由服务端决定,页面按 401/403 走既有的"重新打开媒体"提示。
+const URL_STORE_TTL_DAYS = 30;
+/// 启动扫描的最大条目数(避免一次性轰出上百个 IPC 查询)。
+const AUTO_RESUME_SCAN_LIMIT = 25;
+/// 启动扫描同时开跑的任务数上限(其余交给"打开媒体自动续传"和客户端操作)。
+const MAX_PARALLEL_AUTO_RESUME = 2;
 
 /** taskId → AbortController,由 webview-download-abort 事件触发中止。 */
 const controllers = new Map();
 
-/** 文件名 → 媒体 URL(仅本页会话内有效;URL 过期后重新打开媒体即可)。 */
+/** 文件名 → 媒体 URL(内存态;写入时同步持久化到 localStorage)。 */
 const mediaUrls = new Map();
+
+/// 同一媒体短时间内只自动续传一次(避免 500ms 轮询重复开跑)。
+const autoResumeAt = new Map();
+const AUTO_RESUME_GUARD_MS = 15000;
+
+let lastPersistAt = 0;
+
+function persistMediaUrls() {
+  const now = Date.now();
+  if (now - lastPersistAt < 2000) return;
+  lastPersistAt = now;
+  try {
+    const entries = [...mediaUrls.entries()].map(([fileName, entry]) => ({ fileName, ...entry }));
+    localStorage.setItem(URL_STORE_KEY, JSON.stringify(entries.slice(-URL_CACHE_LIMIT)));
+  } catch (_error) {
+    /* 隐私模式或配额不足:只影响重启后的自动续传 */
+  }
+}
+
+/** 启动时恢复持久化的 URL 缓存。 */
+export function restoreMediaUrls() {
+  try {
+    const raw = localStorage.getItem(URL_STORE_KEY);
+    if (!raw) return;
+    const entries = JSON.parse(raw);
+    if (!Array.isArray(entries)) return;
+    const cutoff = Date.now() - URL_STORE_TTL_DAYS * 86400_000;
+    for (const entry of entries) {
+      if (!entry || typeof entry.fileName !== 'string' || typeof entry.url !== 'string') continue;
+      if (typeof entry.savedAt === 'number' && entry.savedAt < cutoff) continue;
+      mediaUrls.set(entry.fileName, {
+        url: entry.url,
+        fileType: entry.fileType || 'file',
+        source: entry.source || 'viewer',
+        savedAt: entry.savedAt,
+      });
+    }
+    if (mediaUrls.size > 0) diag(`restore: ${mediaUrls.size} cached media url(s)`);
+  } catch (_error) {
+    /* 缓存损坏:忽略 */
+  }
+}
 
 /** 记住当前/最近一次解析到的媒体 URL(查看器打开时每个 tick 都会刷新)。 */
 export function rememberMedia(fileName, url, fileType, source) {
   if (!fileName || !url) return;
+  const previous = mediaUrls.get(fileName);
+  if (previous && previous.url === url) return;
   if (mediaUrls.size >= URL_CACHE_LIMIT && !mediaUrls.has(fileName)) {
     const oldest = mediaUrls.keys().next().value;
     if (oldest !== undefined) mediaUrls.delete(oldest);
   }
-  mediaUrls.set(fileName, { url, fileType: fileType || 'file', source: source || 'viewer' });
+  mediaUrls.set(fileName, {
+    url,
+    fileType: fileType || 'file',
+    source: source || 'viewer',
+    savedAt: Date.now(),
+  });
+  persistMediaUrls();
 }
 
-/** 客户端"继续/重试"通知:媒体仍打开(或本会话缓存过 URL)时直接续传。 */
+/** 客户端"继续/重试"通知:URL 已知(当前媒体或持久化缓存)时直接续传。 */
 export async function resumeFromCache(taskId, fileName) {
   if (!taskId || !fileName || controllers.has(taskId)) return;
   const cached = mediaUrls.get(fileName);
@@ -50,6 +109,44 @@ export async function resumeFromCache(taskId, fileName) {
   } catch (error) {
     diag(`resume: failed — ${error && error.message ? error.message : String(error)}`);
   }
+}
+
+/**
+ * 打开媒体时的自动续传入口(watcher 在每个 tick 调用,带 15 秒去重):
+ * 该文件若处于排队状态,直接开跑 —— "排队中"从此意味着"打开该媒体即继续"。
+ */
+export function maybeAutoResume(fileName, state, cfg) {
+  if (!fileName || !state || state.state !== 'queued' || !state.taskId) return;
+  if (controllers.has(state.taskId)) return;
+  const cached = mediaUrls.get(fileName);
+  if (!cached) return;
+  const last = autoResumeAt.get(fileName) ?? 0;
+  if (Date.now() - last < AUTO_RESUME_GUARD_MS) return;
+  autoResumeAt.set(fileName, Date.now());
+  diag(`auto-resume: ${fileName}`);
+  void runPipeline({ ...cached, fileName, cfg: cfg || globalThis.__INJECT_CONFIG__ || {} }).catch(() => undefined);
+}
+
+/** 启动扫描:缓存里对得上、且任务处于排队的文件,直接开跑(上限见常量)。 */
+export async function autoResumeQueued(cfg) {
+  const config = cfg || globalThis.__INJECT_CONFIG__ || {};
+  const cutoff = Date.now() - URL_STORE_TTL_DAYS * 86400_000;
+  const candidates = [...mediaUrls.entries()]
+    .filter(([, entry]) => !entry.savedAt || entry.savedAt >= cutoff)
+    .sort((a, b) => (b[1].savedAt ?? 0) - (a[1].savedAt ?? 0))
+    .slice(0, AUTO_RESUME_SCAN_LIMIT);
+  let resumed = 0;
+  for (const [fileName, entry] of candidates) {
+    if (resumed >= MAX_PARALLEL_AUTO_RESUME) break;
+    const state = await queryTaskState(fileName, config).catch(() => null);
+    if (state && state.state === 'queued' && state.taskId && !controllers.has(state.taskId)) {
+      diag(`boot auto-resume: ${fileName}`);
+      resumed += 1;
+      autoResumeAt.set(fileName, Date.now());
+      void runPipeline({ ...entry, fileName, cfg: config }).catch(() => undefined);
+    }
+  }
+  if (resumed > 0) diag(`boot auto-resume: started ${resumed} task(s)`);
 }
 
 /** 永久性失败(URL 过期/文件消失),不重试。 */
@@ -294,14 +391,23 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
       throw new DOMException('已中止', 'AbortError');
     }
     controller.abort(); // 停止其余在途 fetch,避免向已失败任务继续推送
-    const message = error instanceof Error ? error.message : String(error);
+    const message = friendlyFetchError(error);
     diag(`pipeline: failed — ${message}`);
     await window.__TAURI__.core.invoke('fail_download', { taskId, error: message }).catch(() => {});
-    throw error;
+    throw error instanceof Error ? error : new Error(message);
   } finally {
     clearInterval(heartbeat);
     clearInterval(stallWatchdog);
     controllers.delete(taskId);
     widthControllers.delete(taskId);
   }
+}
+
+/** 网络类报错(Failed to fetch 等)对用户没有意义,统一换成可行动的文案。 */
+function friendlyFetchError(error) {
+  const text = error instanceof Error ? error.message : String(error);
+  if (error instanceof TypeError || /failed to fetch|networkerror|network error|load failed/i.test(text)) {
+    return '网络中断或连接失败。网络恢复后在客户端点「重试」即可从断点继续(无需重新打开媒体)。';
+  }
+  return text;
 }

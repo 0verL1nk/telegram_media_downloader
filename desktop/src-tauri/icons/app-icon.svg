@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="Telegram Media Downloader">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3390ec"/>
+      <stop offset="1" stop-color="#52b8ff"/>
+    </linearGradient>
+    <linearGradient id="fold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e6f1fe"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角方形底:与标题栏品牌 mark 同款蓝渐变 -->
+  <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#bg)"/>
+
+  <!-- 纸飞机朝下:既是 Telegram 的意象,又直接读作"下载" -->
+  <g>
+    <!-- 左翼(受光面) -->
+    <path d="M512 736 L196 268 L512 496 Z" fill="url(#fold)"/>
+    <!-- 右翼(背光面) -->
+    <path d="M512 736 L828 268 L512 496 Z" fill="#cfe4fb"/>
+    <!-- 中缝高光:折痕 -->
+    <path d="M512 724 L512 496" stroke="#ffffff" stroke-width="10" stroke-linecap="round" opacity="0.9"/>
+  </g>
+</svg>

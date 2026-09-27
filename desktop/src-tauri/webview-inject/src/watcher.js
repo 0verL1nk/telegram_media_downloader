@@ -8,7 +8,7 @@ import { getMediaUrl, resolveFileName } from './extract.js';
 import { ensureButton, setButtonState, injectButtonStyles } from './button.js';
 import { registerTask, releaseButton } from './state.js';
 import { queryTaskState } from './task-state.js';
-import { runPipeline, rememberMedia } from './downloader.js';
+import { runPipeline, rememberMedia, maybeAutoResume } from './downloader.js';
 
 const TICK_INTERVAL_MS = 10000;
 
@@ -120,6 +120,8 @@ export function startWatcher(cfg) {
       } else if (st.state === 'queued') {
         setButtonState(btn, 'queued');
         if (st.taskId) registerTask(st.taskId, btn);
+        // 排队中的任务:媒体已打开 → 直接续传("排队"不再是死状态)。
+        maybeAutoResume(fileName, st, cfg);
       }
     } catch (error) {
       reportIssue(`tick error: ${error && error.message ? error.message : String(error)}`);

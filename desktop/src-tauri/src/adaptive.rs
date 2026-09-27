@@ -101,7 +101,8 @@ impl AdaptiveConcurrency {
 
     /// 送入一次速率采样(字节/秒),返回并发度变化后的新值。
     ///
-    /// 零速率窗口(整窗无进展)不作为样本:并发调整救不了停滞,由看门狗负责。
+    /// 零速率窗口(整窗无进展)不作为样本:它多半是网络/媒体侧的问题,
+    /// 调并发帮不上忙(页面的停滞自检与 Rust 看门狗负责这类情形)。
     pub fn sample(&mut self, now: Instant, rate: f64) -> Option<usize> {
         if !(rate > 0.0) {
             return None;

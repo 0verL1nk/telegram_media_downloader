@@ -24,6 +24,7 @@ import { TaskPanel, type PanelFilter } from "./components/tasks/TaskPanel";
 import { TaskList, type TaskFilter } from "./components/tasks/TaskList";
 import { LogsPage } from "./components/logs/LogsPage";
 import { SettingsPage, type ThemePreference, type UpdateUiState } from "./components/settings/SettingsPage";
+import { actionLabel, getTaskActions } from "./lib/format";
 
 type Toast = { kind: "success" | "error" | "info"; message: string };
 type UpdatePhase = "idle" | "checking" | "current" | "available" | "installing" | "ready";
@@ -87,6 +88,7 @@ function App() {
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [webviewEmbeddedReady, setWebviewEmbeddedReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [logsLoading, setLogsLoading] = useState(false);
@@ -97,7 +99,9 @@ function App() {
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [storageTarget, setStorageTarget] = useState("");
   const [storageConfirm, setStorageConfirm] = useState(false);
-  const [deleteTarget, setDeleteTarget] = useState<{ kind: "single"; task: DownloadTask } | { kind: "bulk" } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<
+    { kind: "single"; task: DownloadTask } | { kind: "selection"; tasks: DownloadTask[] } | { kind: "clearFinished" } | null
+  >(null);
   const [deleteFile, setDeleteFile] = useState(false);
   const [logLevel, setLogLevel] = useState("all");
   const [webviewError, setWebviewError] = useState("");
@@ -198,6 +202,12 @@ function App() {
     try {
       const rows = await api.listTasks(undefined, 300);
       setTasks(rows);
+      setSelectedIds((current) => {
+        if (current.size === 0) return current;
+        const alive = new Set(rows.map((task) => task.taskId));
+        const next = new Set([...current].filter((id) => alive.has(id)));
+        return next.size === current.size ? current : next;
+      });
     } catch (error) {
       notify(`读取下载任务失败:${friendlyError(error)}`, "error");
     }
@@ -605,28 +615,72 @@ function App() {
 
   function requestClearFinished() {
     setDeleteFile(false);
-    setDeleteTarget({ kind: "bulk" });
+    setDeleteTarget({ kind: "clearFinished" });
+  }
+
+  function requestBulkDelete() {
+    const targets = tasks.filter((task) => selectedIds.has(task.taskId));
+    if (targets.length === 0) return;
+    setDeleteFile(false);
+    setDeleteTarget({ kind: "selection", tasks: targets });
+  }
+
+  function toggleSelect(task: DownloadTask) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(task.taskId)) next.delete(task.taskId);
+      else next.add(task.taskId);
+      return next;
+    });
+  }
+
+  function toggleSelectAll(checked: boolean) {
+    setSelectedIds(checked ? new Set(visibleTasks.map((task) => task.taskId)) : new Set());
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set());
+  }
+
+  async function bulkAction(action: "pause" | "resume" | "retry") {
+    const targets = tasks.filter((task) => selectedIds.has(task.taskId) && getTaskActions(task).includes(action));
+    if (targets.length === 0) return;
+    await runBusy("bulk-action", async () => {
+      for (const task of targets) {
+        await api.taskAction(task.taskId, action);
+      }
+      await refreshTasks();
+    }, `已对 ${targets.length} 项执行${actionLabel(action)}。`);
   }
 
   async function confirmDelete() {
     const target = deleteTarget;
     if (!target) return;
-    const finished = target.kind === "bulk"
+    const finished = target.kind === "clearFinished"
       ? tasks.filter((task) => ["completed", "cancelled"].includes(task.status.toLowerCase()))
-      : null;
+      : [];
+    const selected = target.kind === "selection" ? target.tasks : [];
     await runBusy("delete-task", async () => {
       if (target.kind === "single") {
         await api.deleteTask(target.task.taskId, deleteFile);
         setSelectedId((current) => (current === target.task.taskId ? null : current));
+        setSelectedIds((current) => {
+          const next = new Set(current);
+          next.delete(target.task.taskId);
+          return next;
+        });
       } else {
-        for (const task of finished ?? []) {
+        for (const task of [...finished, ...selected]) {
           await api.deleteTask(task.taskId, false);
         }
+        if (selected.length > 0) clearSelection();
       }
       await refreshTasks();
     }, target.kind === "single"
       ? (deleteFile ? "任务与文件已删除。" : "任务已删除。")
-      : `已清除 ${finished?.length ?? 0} 条已完成记录。`);
+      : target.kind === "selection"
+        ? `已删除 ${selected.length} 项任务。`
+        : `已清除 ${finished.length} 条已完成记录。`);
     setDeleteTarget(null);
     setDeleteFile(false);
   }
@@ -827,12 +881,18 @@ function App() {
                 filter={taskFilter}
                 onFilterChange={setTaskFilter}
                 selectedId={selectedId}
+                selectedIds={selectedIds}
                 onSelect={(task) => setSelectedId(task?.taskId ?? null)}
+                onToggleSelect={toggleSelect}
+                onToggleSelectAll={toggleSelectAll}
                 onAction={(task, action) => void actionTask(task, action)}
                 onOpenFolder={(task) => void openTaskFolder(task)}
                 onCopyName={(task) => void copyTaskName(task)}
                 onDelete={requestDelete}
                 onClearFinished={requestClearFinished}
+                onBulkAction={(action) => void bulkAction(action)}
+                onBulkDelete={requestBulkDelete}
+                onClearSelection={clearSelection}
               />
             ) : null}
 
@@ -927,6 +987,13 @@ function App() {
                     <Switch checked={deleteFile} onCheckedChange={setDeleteFile} aria-label="同时删除已下载的文件" />
                   </div>
                 ) : null}
+              </>
+            ) : deleteTarget && deleteTarget.kind === "selection" ? (
+              <>
+                <AlertDialogTitle asChild><h2>删除选中的 {deleteTarget.tasks.length} 项任务?</h2></AlertDialogTitle>
+                <AlertDialogDescription asChild>
+                  <p>将从任务列表移除选中的任务,正在下载的会先被停止;已下载的文件不受影响。</p>
+                </AlertDialogDescription>
               </>
             ) : (
               <>
