@@ -674,7 +674,8 @@ function App() {
     const targets = tasks.filter((task) => selectedIds.has(task.taskId) && canProcessVideo(task));
     if (targets.length === 0 || videoBatch) return;
     await runBusy("bulk-video", async () => {
-      const concurrency = typeof navigator !== "undefined" && navigator.hardwareConcurrency >= 12 ? 2 : 1;
+      const logicalCores = typeof navigator !== "undefined" ? navigator.hardwareConcurrency || 1 : 1;
+      const concurrency = Math.min(4, Math.max(1, Math.floor(logicalCores / 4)));
       let nextIndex = 0;
       let completed = 0;
       let compressed = 0;

@@ -19,6 +19,7 @@ use crate::{
     models::TaskRecord,
     storage,
     task_store::TaskStore,
+    video_encode_limiter::VideoEncodeLimiter,
     video_processing,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -229,7 +230,7 @@ pub struct DownloadManager {
     slots: Arc<Semaphore>,
     active: Arc<AsyncMutex<HashMap<String, ActiveDownload>>>,
     processing: Arc<AsyncMutex<HashSet<String>>>,
-    video_encode_slot: Arc<Semaphore>,
+    video_encode_slot: VideoEncodeLimiter,
     budget: Arc<StreamBudget>,
 }
 
@@ -240,15 +241,12 @@ impl DownloadManager {
             let settings = shared.settings.read().await;
             settings.concurrency.max_files.clamp(1, MAX_FILE_SLOTS)
         };
-        let video_limit = std::thread::available_parallelism()
-            .map(|count| if count.get() >= 12 { 2 } else { 1 })
-            .unwrap_or(1);
         let manager = Self {
             shared,
             slots: Arc::new(Semaphore::new(limit)),
             active: Arc::new(AsyncMutex::new(HashMap::new())),
             processing: Arc::new(AsyncMutex::new(HashSet::new())),
-            video_encode_slot: Arc::new(Semaphore::new(video_limit)),
+            video_encode_slot: VideoEncodeLimiter::start(),
             budget: Arc::new(StreamBudget::new(limit)),
         };
         manager.spawn_watchdog();
@@ -657,16 +655,12 @@ impl DownloadManager {
         let finished_record = self.require_record(task_id).await?;
         let mut processing_note = None;
         if video_processing::is_video(finished_record.media_type.as_deref(), &output) {
+            let _video_slot = self.video_encode_slot.acquire().await;
             self.shared
                 .store
                 .set_status(task_id, "processing", None)
                 .await?;
             self.shared.publish_task(task_id).await;
-            let _video_slot = self
-                .video_encode_slot
-                .acquire()
-                .await
-                .context("视频编码队列已关闭")?;
             match video_processing::compress_replace(&self.shared.app, task_id, &output).await {
                 Ok(outcome) => {
                     let note = video_processing::outcome_note(outcome);
@@ -812,17 +806,12 @@ impl DownloadManager {
         task_id: &str,
         output: &Path,
     ) -> Result<TaskRecord> {
+        let _video_slot = self.video_encode_slot.acquire().await;
         self.shared
             .store
             .set_status(task_id, "processing", None)
             .await?;
         self.shared.publish_task(task_id).await;
-
-        let _video_slot = self
-            .video_encode_slot
-            .acquire()
-            .await
-            .context("视频编码队列已关闭")?;
 
         let result = video_processing::compress_replace(&self.shared.app, task_id, output).await;
         let (message, failure) = match result {

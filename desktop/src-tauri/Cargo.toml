@@ -1,6 +1,6 @@
 [package]
 name = "telegram-media-downloader"
-version = "0.3.18"
+version = "0.3.19"
 description = "Lightweight Telegram media download desktop client"
 authors = ["0verL1nk"]
 license = "MIT"
@@ -37,6 +37,7 @@ url = "2"
 fs2 = "0.4"
 walkdir = "2"
 base64 = "0.22"
+sysinfo = "=0.39.6"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "=0.38.2"

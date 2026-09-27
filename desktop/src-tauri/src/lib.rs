@@ -13,6 +13,7 @@ mod task_cover;
 mod task_maintenance;
 mod task_store;
 mod tray;
+mod video_encode_limiter;
 mod video_processing;
 mod webview_bridge;
 

@@ -140,7 +140,7 @@ export function TaskList({
         <div className="bulk-bar">
           <span className="bulk-count">
             {videoBatch
-              ? `批量转码 ${videoBatch.completed}/${videoBatch.total} · ${videoBatch.concurrency} 路并发${videoBatch.fileNames.length ? ` · ${videoBatch.fileNames.join("、")}` : ""}`
+              ? `批量转码 ${videoBatch.completed}/${videoBatch.total} · CPU 自适应（最多 ${videoBatch.concurrency} 路）${videoBatch.fileNames.length ? ` · ${videoBatch.fileNames.join("、")}` : ""}`
               : `已选 ${selectedIds.size} 项`}
           </span>
           <span className="bulk-actions">
