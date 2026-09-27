@@ -202,6 +202,21 @@ pub async fn open_task_location(state: State<'_, AppState>, task_id: String) -> 
     tauri_plugin_opener::reveal_item_in_dir(resolved).map_err(command_error)
 }
 
+/// 删除任务记录(可选一并删除已下载文件);下载中的任务会先被停止。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_task(
+    state: State<'_, AppState>,
+    task_id: String,
+    delete_file: bool,
+) -> Result<(), String> {
+    validate_task_id(&task_id)?;
+    state
+        .downloads
+        .delete(&task_id, delete_file)
+        .await
+        .map_err(command_error)
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_logs(state: State<'_, AppState>, limit: usize) -> Result<Vec<LogEntry>, String> {
     let limit = limit.min(MAX_LOG_ENTRIES);

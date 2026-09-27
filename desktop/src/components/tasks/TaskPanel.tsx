@@ -15,6 +15,7 @@ export function TaskPanel({
   onAction,
   onOpenFolder,
   onCopyName,
+  onDelete,
   onShowAll,
   counts,
   selectedId,
@@ -28,6 +29,7 @@ export function TaskPanel({
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
+  onDelete: (task: DownloadTask) => void;
   onShowAll: () => void;
   counts: { active: number; completed: number; failed: number };
   selectedId?: string | null;
@@ -67,7 +69,7 @@ export function TaskPanel({
           const glyph = taskGlyph(task);
           const subtitle = panelSubtitle(task);
           return (
-            <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onCopyName={onCopyName}>
+            <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onCopyName={onCopyName} onDelete={onDelete}>
               <div
                 className={"pr" + (selectedId === task.taskId ? " selected" : "")}
                 role="button"
@@ -84,7 +86,7 @@ export function TaskPanel({
                 <span className="pr-top">
                   <span className={"pr-ic " + glyph.tone}>{glyph.glyph}</span>
                   <span className="pr-name" title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</span>
-                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} compact />
+                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onDelete={onDelete} compact />
                 </span>
                 <span className="pr-meta">
                   <Progress

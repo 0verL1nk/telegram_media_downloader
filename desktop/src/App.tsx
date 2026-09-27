@@ -15,6 +15,7 @@ import {
 import { Icon } from "./components/Icon";
 import { Button } from "./components/ui/button";
 import { AlertDialog, AlertDialogContent, AlertDialogDescription, AlertDialogTitle } from "./components/ui/alert-dialog";
+import { Switch } from "./components/ui/switch";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { Rail, type AppView } from "./components/shell/Rail";
 import { TitleBar } from "./components/shell/TitleBar";
@@ -96,6 +97,8 @@ function App() {
   const [settingsSaved, setSettingsSaved] = useState(false);
   const [storageTarget, setStorageTarget] = useState("");
   const [storageConfirm, setStorageConfirm] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<{ kind: "single"; task: DownloadTask } | { kind: "bulk" } | null>(null);
+  const [deleteFile, setDeleteFile] = useState(false);
   const [logLevel, setLogLevel] = useState("all");
   const [webviewError, setWebviewError] = useState("");
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -583,6 +586,39 @@ function App() {
     }
   }
 
+  function requestDelete(task: DownloadTask) {
+    setDeleteFile(false);
+    setDeleteTarget({ kind: "single", task });
+  }
+
+  function requestClearFinished() {
+    setDeleteFile(false);
+    setDeleteTarget({ kind: "bulk" });
+  }
+
+  async function confirmDelete() {
+    const target = deleteTarget;
+    if (!target) return;
+    const finished = target.kind === "bulk"
+      ? tasks.filter((task) => ["completed", "cancelled"].includes(task.status.toLowerCase()))
+      : null;
+    await runBusy("delete-task", async () => {
+      if (target.kind === "single") {
+        await api.deleteTask(target.task.taskId, deleteFile);
+        setSelectedId((current) => (current === target.task.taskId ? null : current));
+      } else {
+        for (const task of finished ?? []) {
+          await api.deleteTask(task.taskId, false);
+        }
+      }
+      await refreshTasks();
+    }, target.kind === "single"
+      ? (deleteFile ? "任务与文件已删除。" : "任务已删除。")
+      : `已清除 ${finished?.length ?? 0} 条已完成记录。`);
+    setDeleteTarget(null);
+    setDeleteFile(false);
+  }
+
   async function saveSettings() {
     if (!editableSettings) return;
     const settingsToSave = structuredClone(editableSettings);
@@ -698,6 +734,10 @@ function App() {
     onInstall: () => void installUpdate(),
     onRestart: () => void restartForUpdate(),
   };
+  const deleteTaskStatus = deleteTarget && deleteTarget.kind === "single"
+    ? deleteTarget.task.status.toLowerCase()
+    : "";
+  const deleteInFlight = ["downloading", "queued", "paused"].includes(deleteTaskStatus);
 
   return (
     <TooltipProvider delayDuration={420}>
@@ -759,6 +799,7 @@ function App() {
                     onAction={(task, action) => void actionTask(task, action)}
                     onOpenFolder={(task) => void openTaskFolder(task)}
                     onCopyName={(task) => void copyTaskName(task)}
+                    onDelete={requestDelete}
                     onShowAll={() => navigate("tasks")}
                     counts={{ active: counts.active, completed: counts.completed, failed: counts.failed }}
                     selectedId={selectedId}
@@ -778,6 +819,8 @@ function App() {
                 onAction={(task, action) => void actionTask(task, action)}
                 onOpenFolder={(task) => void openTaskFolder(task)}
                 onCopyName={(task) => void copyTaskName(task)}
+                onDelete={requestDelete}
+                onClearFinished={requestClearFinished}
               />
             ) : null}
 
@@ -839,6 +882,52 @@ function App() {
               <Button variant="ghost" onClick={() => setStorageConfirm(false)}>取消</Button>
               <Button variant="primary" onClick={() => void applyStorageRoot()} disabled={busy["storage-root"]}>
                 {busy["storage-root"] ? "迁移中…" : "开始迁移"}
+              </Button>
+            </div>
+          </AlertDialogContent>
+        </AlertDialog>
+
+        <AlertDialog
+          open={deleteTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) {
+              setDeleteTarget(null);
+              setDeleteFile(false);
+            }
+          }}
+        >
+          <AlertDialogContent>
+            {deleteTarget && deleteTarget.kind === "single" ? (
+              <>
+                <AlertDialogTitle asChild><h2>删除任务?</h2></AlertDialogTitle>
+                <AlertDialogDescription asChild>
+                  <p>
+                    将从任务列表移除「{deleteTarget.task.fileName || "未命名媒体"}」。
+                    {deleteInFlight ? "该任务正在下载,会先被停止;" : ""}临时分块文件会一并清理。
+                  </p>
+                </AlertDialogDescription>
+                {deleteTaskStatus === "completed" ? (
+                  <div className="switch-row" style={{ marginBottom: 14 }}>
+                    <span className="switch-copy">
+                      <strong>同时删除已下载的文件</strong>
+                      <small>文件将从磁盘移除,不可恢复。</small>
+                    </span>
+                    <Switch checked={deleteFile} onCheckedChange={setDeleteFile} aria-label="同时删除已下载的文件" />
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <AlertDialogTitle asChild><h2>清除已完成记录?</h2></AlertDialogTitle>
+                <AlertDialogDescription asChild>
+                  <p>将移除 {counts.completed + counts.failed} 条已完成 / 已取消的任务记录,已下载的文件不受影响。</p>
+                </AlertDialogDescription>
+              </>
+            )}
+            <div className="modal-foot">
+              <Button variant="ghost" onClick={() => { setDeleteTarget(null); setDeleteFile(false); }}>取消</Button>
+              <Button variant="destructive" onClick={() => void confirmDelete()} disabled={busy["delete-task"]}>
+                {busy["delete-task"] ? "正在删除…" : "删除"}
               </Button>
             </div>
           </AlertDialogContent>

@@ -60,6 +60,7 @@ pub fn run() {
             commands::webview_log,
             commands::list_tasks,
             commands::task_action,
+            commands::delete_task,
             commands::open_task_location,
             commands::get_logs,
             commands::ensure_telegram_webview,

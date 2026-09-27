@@ -6,6 +6,7 @@ commands.allow = [
   "save_settings",
   "list_tasks",
   "task_action",
+  "delete_task",
   "open_task_location",
   "get_logs",
   "ensure_telegram_webview",

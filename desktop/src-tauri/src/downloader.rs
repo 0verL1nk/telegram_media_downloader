@@ -630,6 +630,77 @@ impl DownloadManager {
         self.mark_failed(task_id, error).await
     }
 
+    /// 删除任务记录:活动任务先按取消路径停住,再清理临时分块,最后删库。
+    ///
+    /// `delete_file` 只对已提交的输出文件生效,且要求文件位于下载目录内(防止任务记录
+    /// 被篡改后越界删除);临时分块文件总是清理 —— 删除的语义是"这条任务不再存在"。
+    pub async fn delete(&self, task_id: &str, delete_file: bool) -> Result<()> {
+        let record = self.require_record(task_id).await?;
+        if let Some(active) = self.detach(task_id).await {
+            announce_abort(&self.shared, task_id);
+            let _ = drain_active(active).await;
+        }
+        if let Some(output) = record.output_path.as_deref().map(PathBuf::from) {
+            let temp = temporary_output_path(&output, task_id);
+            if let Err(error) = tokio::fs::remove_file(&temp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                self.shared
+                    .log(
+                        "warn",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("任务 {task_id} 临时分块清理失败:{error}"),
+                    )
+                    .await;
+            }
+            if delete_file && output.exists() {
+                if !self.output_within_download_root(&output).await? {
+                    bail!("任务目标不在下载目录内,已拒绝删除文件");
+                }
+                tokio::fs::remove_file(&output)
+                    .await
+                    .with_context(|| format!("删除文件失败:{}", output.display()))?;
+            }
+        }
+        self.shared.store.delete(task_id).await?;
+        if let Ok(stats) = self.shared.store.stats().await {
+            let _ = self
+                .shared
+                .app
+                .emit("stats-updated", serde_json::json!({ "stats": stats }));
+        }
+        self.shared
+            .log(
+                "info",
+                DOWNLOAD_LOG_TARGET,
+                format!(
+                    "任务 {task_id} 已删除{file_note}",
+                    file_note = if delete_file {
+                        "(含已下载文件)"
+                    } else {
+                        ""
+                    }
+                ),
+            )
+            .await;
+        Ok(())
+    }
+
+    /// 输出文件是否位于下载目录内(删除文件前的安全检查)。
+    async fn output_within_download_root(&self, output: &Path) -> Result<bool> {
+        let settings = self.shared.settings.read().await.clone();
+        let Ok(root) = PathBuf::from(&settings.download_root).canonicalize() else {
+            return Ok(false);
+        };
+        let Some(parent) = output.parent() else {
+            return Ok(false);
+        };
+        let Ok(parent) = parent.canonicalize() else {
+            return Ok(false);
+        };
+        Ok(parent.starts_with(&root))
+    }
+
     /// 任务页操作:`pause` / `resume` / `cancel` / `retry`。
     pub async fn action(&self, task_id: &str, action: &str) -> Result<TaskRecord> {
         match action {

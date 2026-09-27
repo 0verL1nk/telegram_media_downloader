@@ -304,6 +304,18 @@ impl TaskStore {
         Ok(())
     }
 
+    /// 删除任务及其全部分块记录(不可恢复;文件由调用方决定是否一并删除)。
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        let transaction = self.db.begin().await?;
+        chunk::Entity::delete_many()
+            .filter(chunk::Column::TaskId.eq(id))
+            .exec(&transaction)
+            .await?;
+        task::Entity::delete_by_id(id).exec(&transaction).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn chunk_map(&self, id: &str) -> Result<Vec<(u64, u64, Option<String>, bool)>> {
         let rows = chunk::Entity::find()
             .filter(chunk::Column::TaskId.eq(id))
@@ -538,5 +550,25 @@ mod tests {
         assert_eq!(downloading.progress, Some(0.25));
         assert_eq!(downloading.file_size, Some(1024));
         assert!(downloading.completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_task_and_its_chunk_map() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        store.create(&record("t1")).await.unwrap();
+        store.set_chunks("t1", 2048, 1024).await.unwrap();
+        store.complete_chunk("t1", 0, "digest").await.unwrap();
+        assert_eq!(store.chunk_map("t1").await.unwrap().len(), 2);
+
+        store.delete("t1").await.unwrap();
+
+        assert!(store.get("t1").await.unwrap().is_none());
+        assert!(store.chunk_map("t1").await.unwrap().is_empty());
+        assert!(store.list(None, 10).await.unwrap().is_empty());
+        // 删除不存在的任务不报错(幂等)。
+        store.delete("t1").await.unwrap();
     }
 }

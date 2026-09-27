@@ -1,5 +1,6 @@
 import { useRef } from "react";
 import { TaskContextMenu, TaskOps } from "./TaskOps";
+import { Button } from "../ui/button";
 import { Progress } from "../ui/progress";
 import type { DownloadTask, TaskAction } from "../../lib/api";
 import { formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph } from "../../lib/format";
@@ -26,6 +27,8 @@ export function TaskList({
   onAction,
   onOpenFolder,
   onCopyName,
+  onDelete,
+  onClearFinished,
 }: {
   tasks: DownloadTask[];
   counts: Record<TaskFilter, number>;
@@ -36,6 +39,8 @@ export function TaskList({
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
+  onDelete: (task: DownloadTask) => void;
+  onClearFinished: () => void;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -66,6 +71,14 @@ export function TaskList({
       <div className="full-head">
         <div className="head-row">
           <h1>任务</h1>
+          <Button
+            variant="secondary"
+            onClick={onClearFinished}
+            disabled={counts.completed + counts.failed === 0}
+            title="移除已完成与已取消的任务记录(不删除已下载的文件)"
+          >
+            清除已完成
+          </Button>
         </div>
         <div className="tabs" role="tablist" aria-label="任务筛选">
           {FILTERS.map((entry) => (
@@ -104,7 +117,7 @@ export function TaskList({
             const percent = Math.round(getPercent(task));
             const remaining = remainingLabel(task);
             return (
-              <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onCopyName={onCopyName}>
+              <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onCopyName={onCopyName} onDelete={onDelete}>
                 <div
                   className={"row" + (selectedId === task.taskId ? " selected" : "")}
                   role="row"
@@ -129,7 +142,7 @@ export function TaskList({
                     {remaining ? <small>{remaining}</small> : null}
                     {status !== "downloading" && status !== "completed" && task.updatedAt ? <small>{formatDate(task.updatedAt)}</small> : null}
                   </span>
-                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} />
+                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onDelete={onDelete} />
                 </div>
               </TaskContextMenu>
             );

@@ -15,17 +15,19 @@ export function TaskOps({
   task,
   onAction,
   onOpenFolder,
+  onDelete,
   compact = false,
 }: {
   task: DownloadTask;
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
+  onDelete: (task: DownloadTask) => void;
   compact?: boolean;
 }) {
   const status = task.status.toLowerCase();
   const actions = getTaskActions(task);
   const done = status === "completed";
-  const className = compact ? "pr-x" : "op" + (status === "failed" ? "" : "");
+  const className = compact ? "pr-x" : "op";
   const run = (event: { stopPropagation: () => void }, fn: () => void) => {
     event.stopPropagation();
     fn();
@@ -49,22 +51,33 @@ export function TaskOps({
           <Icon name={iconName(action)} size={compact ? 13 : 15} />
         </button>
       ))}
+      <button
+        type="button"
+        className={className + " danger"}
+        title="删除任务"
+        aria-label={`删除任务${task.fileName ? " " + task.fileName : ""}`}
+        onClick={(event) => run(event, () => onDelete(task))}
+      >
+        <Icon name="trash" size={compact ? 13 : 15} />
+      </button>
     </span>
   );
 }
 
-/** 任务行右键菜单(DESIGN.md §5:暂停/继续/取消/重试/打开位置/复制文件名)。 */
+/** 任务行右键菜单(DESIGN.md §5:暂停/继续/取消/重试/打开位置/复制文件名/删除)。 */
 export function TaskContextMenu({
   task,
   onAction,
   onOpenFolder,
   onCopyName,
+  onDelete,
   children,
 }: {
   task: DownloadTask;
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
+  onDelete: (task: DownloadTask) => void;
   children: ReactNode;
 }) {
   const actions = getTaskActions(task);
@@ -85,9 +98,12 @@ export function TaskContextMenu({
             <Icon name="folder" size={14} />打开文件位置
           </ContextMenuItem>
         ) : null}
-        <ContextMenuSeparator />
         <ContextMenuItem onSelect={() => onCopyName(task)}>
           <Icon name="file" size={14} />复制文件名
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem className="danger" onSelect={() => onDelete(task)}>
+          <Icon name="trash" size={14} />删除任务记录
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>

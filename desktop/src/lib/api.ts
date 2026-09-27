@@ -149,6 +149,9 @@ export const api = {
   openTaskLocation: (taskId: string) =>
     call<void>("open_task_location", { taskId }),
 
+  deleteTask: (taskId: string, deleteFile = false) =>
+    call<void>("delete_task", { taskId, deleteFile }),
+
   getLogs: (limit = 300) => call<LogEntry[]>("get_logs", { limit }),
 
   ensureTelegramWebview: () => call<void>("ensure_telegram_webview"),
