@@ -1,32 +1,28 @@
 // desktop/src-tauri/src/adaptive.rs
-//! 自适应分块并发控制器:把"每文件并发分块数"当作拥塞窗口来调。
+//! 自适应分块并发控制器:把每个任务的分块并发作为可调窗口。
 //!
-//! 依据:
-//! - BBR(Cardwell 等,ACM Queue 2016;IETF draft-ietf-ccwg-bbr)——
-//!   用"窗口内最大投递率"建模可用带宽,ProbeBW 以 1.25× 乘性探测、
-//!   0.75× 乘性退避;不把丢包当拥塞信号,而是看速率本身。
-//! - Netflix concurrency-limits(Vegas/Gradient2,"Performance Under Load",
-//!   Netflix Tech Blog 2018)——把并发度当作 TCP 拥塞窗口来自适应。
-//! - ceiling 稳定化(NVIDIA NeMo Data Designer 工程笔记,AIMD 改进)——
-//!   退避后记录"已知安全上限",探测不再冲回配置上限,消除锯齿。
-//!
-//! 与 TCP 的差异:并发度是整数、页面侧线程池是软调整(缩小不打断在途分块),
-//! 采样是 2s 聚合值而非逐包事件——天然抑制突发抖动,不存在级联退避问题。
+//! 这是应用层启发式算法,借鉴拥塞控制和服务端并发限制的思想,不等同于 TCP BBR。
+//! 速率来自 Rust 已入账的分块字节,会受网络、IPC 与落盘共同影响,因此使用 EWMA、
+//! 连续窗口确认和探测观察期,避免单个短窗口就触发并发来回变化。
 
 use std::time::{Duration, Instant};
 
-/// BBR ProbeBW 探测增益(乘性增长步长)。
-const GROWTH: f64 = 1.25;
-/// BBR ProbeBW 排空增益(乘性退避步长)。
-const BACKOFF: f64 = 0.75;
-/// 速率提升超过该比例才认为"增长有收益"。
-const IMPROVE_RATIO: f64 = 1.03;
-/// 速率回落到该比例以下即触发乘性退避。
+/// EWMA 每个采样窗口的权重;2 秒采样时可平滑短时分块/写盘突发。
+const RATE_EWMA_ALPHA: f64 = 0.35;
+/// 速率持续低于参考值该比例时开始累计退避窗口。
 const DROP_RATIO: f64 = 0.80;
-/// 平台期两次探测之间的最短间隔。
-const PROBE_INTERVAL: Duration = Duration::from_secs(6);
-/// 长时间无增益后清空失败计数(链路容量可能已变化,允许重新探测)。
-const IDLE_RESET: Duration = Duration::from_secs(20);
+/// 需要连续多个低速窗口才退避。
+const DROP_CONFIRMATION_SAMPLES: u32 = 3;
+/// 速率持续高于参考值该比例时才允许增大并发。
+const IMPROVE_RATIO: f64 = 1.10;
+/// 增益需要连续多个窗口确认。
+const IMPROVE_CONFIRMATION_SAMPLES: u32 = 3;
+/// 两次平台期探测之间的最短间隔。
+const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// 探测 +1 后留出足够时间收集多个样本再判断。
+const PROBE_SETTLE: Duration = Duration::from_secs(8);
+/// 长时间没有确认增益后重置失败计数,允许重新探测。
+const IDLE_RESET: Duration = Duration::from_secs(30);
 /// 连续探测无收益的次数上限。
 const MAX_FAILED_PROBES: u32 = 2;
 
@@ -35,16 +31,18 @@ pub struct AdaptiveConcurrency {
     width: usize,
     min: usize,
     max: usize,
-    /// 已知安全上限:退避时记录为当时的并发;探测不会越过它,除非探到增益。
+    /// 已知安全上限。退避时保留,成功探测后逐步抬高。
     ceiling: usize,
-    /// 上一次并发变更前的速率采样("变更前基线")。
+    /// 当前窗口的 EWMA 速率。
+    smoothed_rate: f64,
+    /// 当前并发度对应的速率参考值。
     baseline: f64,
-    /// 上一次速率采样(用于回落检测)。
-    last_rate: f64,
-    /// 上一次获得增益的时间。
     improved_at: Instant,
-    /// 最近一次采样是不是"探测 +1",用于无收益时撤回。
-    probing: bool,
+    last_change_at: Instant,
+    low_rate_samples: u32,
+    high_rate_samples: u32,
+    /// 探测开始时的平滑速率,用于探测结果比较。
+    probe: Option<(Instant, f64)>,
     failed_probes: u32,
 }
 
@@ -53,15 +51,19 @@ impl AdaptiveConcurrency {
         let max = max.max(1);
         let min = min.clamp(1, max);
         let width = initial.clamp(min, max);
+        let now = Instant::now();
         Self {
             width,
             min,
             max,
             ceiling: max,
+            smoothed_rate: 0.0,
             baseline: 0.0,
-            last_rate: 0.0,
-            improved_at: Instant::now(),
-            probing: false,
+            improved_at: now,
+            last_change_at: now,
+            low_rate_samples: 0,
+            high_rate_samples: 0,
+            probe: None,
             failed_probes: 0,
         }
     }
@@ -72,87 +74,124 @@ impl AdaptiveConcurrency {
         self.width
     }
 
-    /// 探测上限 = min(配置上限, ceiling)。
+    /// 探测上限 = min(配置上限, 已知安全上限)。
     fn limit(&self) -> usize {
         self.max.min(self.ceiling)
     }
 
     fn grow(&mut self) {
-        let grown = (self.width as f64 * GROWTH).ceil() as usize;
-        let next = grown.max(self.width + 1).min(self.limit());
-        if next > self.width {
-            self.width = next;
-        }
+        let grown = (self.width as f64 * 1.25).ceil() as usize;
+        self.width = grown.max(self.width + 1).min(self.limit());
     }
 
     fn shrink(&mut self) {
-        let shrunk = (self.width as f64 * BACKOFF).floor() as usize;
-        let next = shrunk
+        let shrunk = (self.width as f64 * 0.75).floor() as usize;
+        self.width = shrunk
             .max(self.min)
-            .min(self.width.saturating_sub(1))
-            .max(self.min);
-        self.width = next;
-    }
-
-    /// 撤回一次失败的平台期探测:+1 的对称操作,退回探测前宽度。
-    fn withdraw(&mut self) {
-        self.width = self.width.saturating_sub(1).max(self.min);
+            .min(self.width.saturating_sub(1).max(self.min));
     }
 
     /// 送入一次速率采样(字节/秒),返回并发度变化后的新值。
     ///
-    /// 零速率窗口(整窗无进展)不作为样本:它多半是网络/媒体侧的问题,
-    /// 调并发帮不上忙(页面的停滞自检与 Rust 看门狗负责这类情形)。
+    /// 零速率窗口不作为样本;停滞由页面侧超时与 Rust 看门狗处理。
     pub fn sample(&mut self, now: Instant, rate: f64) -> Option<usize> {
-        if !(rate > 0.0) {
+        if !(rate > 0.0) || !rate.is_finite() {
             return None;
         }
+
+        if self.smoothed_rate == 0.0 {
+            self.smoothed_rate = rate;
+            self.baseline = rate;
+            self.improved_at = now;
+            self.last_change_at = now;
+            return None;
+        }
+        self.smoothed_rate += RATE_EWMA_ALPHA * (rate - self.smoothed_rate);
+
         if now.duration_since(self.improved_at) >= IDLE_RESET {
             self.failed_probes = 0;
             self.improved_at = now;
         }
+
         let before = self.width;
 
-        if self.baseline > 0.0 && rate < self.last_rate * DROP_RATIO {
-            // 明显回落 → 乘性退避;ceiling 记录退避前宽度,之后要越过它必须有增益证明。
+        if self.baseline > 0.0 && self.smoothed_rate < self.baseline * DROP_RATIO {
+            self.low_rate_samples = self.low_rate_samples.saturating_add(1);
+        } else {
+            self.low_rate_samples = 0;
+        }
+
+        if self.low_rate_samples >= DROP_CONFIRMATION_SAMPLES {
+            // 连续低速窗口确认后才退避,避免一两个短样本造成并发锯齿。
             self.ceiling = self.width;
             self.shrink();
-            self.baseline = rate;
-            self.probing = false;
+            self.baseline = self.smoothed_rate;
+            self.probe = None;
             self.failed_probes = 0;
+            self.low_rate_samples = 0;
+            self.high_rate_samples = 0;
             self.improved_at = now;
-        } else if self.baseline > 0.0 && rate >= self.baseline * IMPROVE_RATIO {
-            // 增长有收益 → 当前宽度被证明安全;若已顶到 ceiling,允许 +1 继续验证。
-            self.baseline = rate;
-            self.probing = false;
-            self.failed_probes = 0;
+            self.last_change_at = now;
+            return (self.width != before).then_some(self.width);
+        }
+
+        if let Some((probe_started, probe_baseline)) = self.probe {
+            if now.duration_since(probe_started) < PROBE_SETTLE {
+                return None;
+            }
+
+            if self.smoothed_rate >= probe_baseline * IMPROVE_RATIO {
+                // 探测成功:保留新宽度并将其记为已验证。
+                self.ceiling = self.ceiling.max(self.width).min(self.max);
+                self.baseline = self.smoothed_rate;
+                self.failed_probes = 0;
+                self.improved_at = now;
+            } else {
+                // 探测失败:回到探测前宽度,并阻止立即冲回同一宽度。
+                self.ceiling = self.ceiling.min(self.width.saturating_sub(1).max(self.min));
+                self.width = self.width.saturating_sub(1).max(self.min);
+                self.failed_probes = self.failed_probes.saturating_add(1);
+                self.baseline = self.smoothed_rate;
+                self.improved_at = now;
+            }
+            self.probe = None;
+            self.low_rate_samples = 0;
+            self.high_rate_samples = 0;
+            self.last_change_at = now;
+            return (self.width != before).then_some(self.width);
+        }
+
+        if self.baseline > 0.0 && self.smoothed_rate >= self.baseline * IMPROVE_RATIO {
+            self.high_rate_samples = self.high_rate_samples.saturating_add(1);
+        } else {
+            self.high_rate_samples = 0;
+        }
+
+        if self.high_rate_samples >= IMPROVE_CONFIRMATION_SAMPLES
+            && now.duration_since(self.last_change_at) >= PROBE_INTERVAL
+        {
+            self.baseline = self.smoothed_rate;
             self.improved_at = now;
+            self.high_rate_samples = 0;
             if self.width >= self.ceiling && self.ceiling < self.max {
                 self.ceiling += 1;
             }
             self.grow();
-        } else if self.probing {
-            // 平台期探测没有换来增益 → 撤回探测,记一次失败。
-            self.probing = false;
-            self.failed_probes = self.failed_probes.saturating_add(1);
-            self.withdraw();
+            self.last_change_at = now;
         } else if now.duration_since(self.improved_at) >= PROBE_INTERVAL
             && self.failed_probes < MAX_FAILED_PROBES
             && self.width < self.max
         {
-            // 平台期低频探测(BBR ProbeBW:不时试着要更多带宽)。
-            // 注意上限用 `max` 而不是 ceiling:ceiling 是"退避后不再快速冲回"的
-            // 护栏,不是禁止恢复的死墙 —— 否则在低并发上退避一次就永远卡死。
-            self.baseline = rate;
-            self.probing = true;
+            // 平台期只探测一条流,并等待多个样本后再决定是否保留。
+            let old_width = self.width;
             self.width = (self.width + 1).min(self.max);
+            self.probe = Some((now, self.smoothed_rate));
+            self.last_change_at = now;
+            if self.width == old_width {
+                self.probe = None;
+            }
         }
 
-        if self.baseline == 0.0 {
-            // 首个采样:建立基线即可,不做变更。
-            self.baseline = rate;
-        }
-        self.last_rate = rate;
         (self.width != before).then_some(self.width)
     }
 }
@@ -167,138 +206,188 @@ mod tests {
     }
 
     #[test]
-    fn ramps_up_while_rate_keeps_improving() {
+    fn ignores_zero_and_non_finite_samples() {
         let mut controller = AdaptiveConcurrency::new(2, 4, 16);
         let t0 = Instant::now();
-        let mut at = t0;
-        let mut rate = 1_000_000.0;
-        // 基线采样
-        tick(&mut controller, at, rate);
-        let mut widths = vec![controller.width()];
-        for _ in 0..12 {
-            at += Duration::from_secs(2);
-            rate *= 1.10;
-            widths.push(tick(&mut controller, at, rate));
-        }
-        assert!(
-            widths.windows(2).all(|w| w[1] >= w[0]),
-            "递增序列:{widths:?}"
+        assert_eq!(controller.sample(t0, 0.0), None);
+        assert_eq!(controller.sample(t0, f64::NAN), None);
+        assert_eq!(controller.width(), 4);
+    }
+
+    #[test]
+    fn a_single_low_window_does_not_back_off() {
+        let mut controller = AdaptiveConcurrency::new(2, 8, 16);
+        let t0 = Instant::now();
+        tick(&mut controller, t0, 4_000_000.0);
+        assert_eq!(
+            tick(&mut controller, t0 + Duration::from_secs(2), 100_000.0),
+            8
         );
-        assert_eq!(controller.width(), 16, "链路足够快时应探到配置上限");
-    }
-
-    #[test]
-    fn backs_off_multiplicatively_on_rate_drop() {
-        let mut controller = AdaptiveConcurrency::new(2, 8, 16);
-        let t0 = Instant::now();
-        tick(&mut controller, t0, 4_000_000.0);
-        let width = tick(&mut controller, t0 + Duration::from_secs(2), 2_000_000.0);
-        assert_eq!(width, 6, "8 × 0.75 = 6");
-    }
-
-    #[test]
-    fn never_drops_below_floor() {
-        let mut controller = AdaptiveConcurrency::new(2, 2, 16);
-        let t0 = Instant::now();
-        tick(&mut controller, t0, 4_000_000.0);
-        let width = tick(&mut controller, t0 + Duration::from_secs(2), 1_000_000.0);
-        assert_eq!(width, 2);
-    }
-
-    #[test]
-    fn probes_climb_back_after_a_backoff_even_under_the_ceiling() {
-        let mut controller = AdaptiveConcurrency::new(2, 8, 16);
-        let t0 = Instant::now();
-        let mut at = t0;
-        tick(&mut controller, at, 4_000_000.0);
-        // 速率回落 → 退避,ceiling 被压到退避前的宽度
-        at += Duration::from_secs(2);
-        let floor = tick(&mut controller, at, 1_000_000.0);
-        // 之后速率平稳:探针要能一步步爬回去,而不是被 ceiling 永久卡死
-        let mut max_seen = floor;
-        for _ in 0..12 {
-            at += PROBE_INTERVAL;
-            max_seen = max_seen.max(tick(&mut controller, at, 1_000_000.0));
-        }
-        assert!(
-            max_seen > floor,
-            "退避后必须能靠探测恢复:floor={floor} max={max_seen}"
+        assert_eq!(
+            tick(&mut controller, t0 + Duration::from_secs(4), 4_000_000.0),
+            8
         );
     }
 
     #[test]
-    fn failed_probe_is_withdrawn_and_retried_at_most_twice() {
+    fn small_rate_jitter_does_not_make_width_follow_each_sample() {
         let mut controller = AdaptiveConcurrency::new(2, 4, 8);
         let t0 = Instant::now();
-        let mut at = t0;
-        // 平台期速率(先建立基线,再给足探测间隔)
-        tick(&mut controller, at, 4_000_000.0);
-        at += PROBE_INTERVAL;
-        let probed = tick(&mut controller, at, 4_000_000.0);
-        assert_eq!(probed, 5, "平台期应探测 +1");
-        // 探测无收益 → 撤回
-        at += Duration::from_secs(2);
-        let withdrawn = tick(&mut controller, at, 4_000_000.0);
-        assert_eq!(withdrawn, 4, "无收益的探测应撤回");
-        // 第二次探测同样失败
-        at += PROBE_INTERVAL;
-        let probed = tick(&mut controller, at, 4_000_000.0);
-        assert_eq!(probed, 5);
-        at += Duration::from_secs(2);
-        let withdrawn = tick(&mut controller, at, 4_000_000.0);
-        assert_eq!(withdrawn, 4);
-        // 两次失败后暂停探测(下一个采样点已越过 IDLE_RESET,重置探测窗口)
-        at += PROBE_INTERVAL;
-        assert_eq!(
-            tick(&mut controller, at, 4_000_000.0),
-            4,
-            "两次失败后不能马上再探测"
-        );
-        // 空闲窗口过后允许重新探测(链路容量可能已变化)
-        at += PROBE_INTERVAL;
-        assert_eq!(
-            tick(&mut controller, at, 4_000_000.0),
-            5,
-            "空闲窗口后重新探测"
-        );
-    }
-
-    #[test]
-    fn ceiling_caps_growth_after_drop_until_gain_proves_otherwise() {
-        let mut controller = AdaptiveConcurrency::new(2, 12, 16);
-        let t0 = Instant::now();
-        let mut at = t0;
-        tick(&mut controller, at, 8_000_000.0); // 建立基线
-        // 12 路时速率回落 → 退避到 9,ceiling=12
-        at += Duration::from_secs(2);
-        assert_eq!(tick(&mut controller, at, 5_000_000.0), 9);
-        // 增益证明:速率回升 → 回到 ceiling(12)
-        at += Duration::from_secs(2);
-        assert_eq!(tick(&mut controller, at, 6_000_000.0), 12);
-        // 平台期(无增益)时 ceiling 挡住探测,不再增长
-        for _ in 0..4 {
-            at += PROBE_INTERVAL;
-            tick(&mut controller, at, 6_000_000.0);
+        tick(&mut controller, t0, 1_000_000.0);
+        let mut changes = 0;
+        for sample in 1..=60 {
+            let at = t0 + Duration::from_secs(sample * 2);
+            let rate = if sample % 2 == 0 {
+                1_100_000.0
+            } else {
+                900_000.0
+            };
+            changes += usize::from(controller.sample(at, rate).is_some());
         }
-        assert_eq!(controller.width(), 12, "无增益时 ceiling 阻止继续增长");
-        // 在 ceiling 上重新出现增益 → ceiling 抬升,允许继续增长
-        at += Duration::from_secs(2);
-        tick(&mut controller, at, 7_000_000.0);
-        assert!(controller.width() > 12, "增益证明后应越过原 ceiling");
+        assert!(changes <= 8, "小幅抖动不应让并发每个窗口反复变化:{changes}");
     }
 
     #[test]
-    fn respects_configured_cap() {
+    fn sustained_low_rate_eventually_backs_off_multiplicatively() {
+        let mut controller = AdaptiveConcurrency::new(2, 8, 16);
+        let t0 = Instant::now();
+        tick(&mut controller, t0, 4_000_000.0);
+        let mut width = 8;
+        for second in [2, 4, 6, 8] {
+            width = tick(&mut controller, t0 + Duration::from_secs(second), 100_000.0);
+        }
+        assert_eq!(width, 6, "持续低速确认后,8 × 0.75 应退到 6");
+    }
+
+    #[test]
+    fn ramps_up_after_sustained_improvement_and_respects_cap() {
         let mut controller = AdaptiveConcurrency::new(2, 4, 5);
         let t0 = Instant::now();
+        tick(&mut controller, t0, 1_000_000.0);
         let mut at = t0;
         let mut rate = 1_000_000.0;
-        tick(&mut controller, at, rate);
-        for _ in 0..10 {
+        let mut previous_width = controller.width();
+        for _ in 0..30 {
             at += Duration::from_secs(2);
-            rate *= 1.5;
-            tick(&mut controller, at, rate);
+            rate *= 1.10;
+            let width = tick(&mut controller, at, rate);
+            assert!(width >= previous_width, "增长样本不应降低并发");
+            previous_width = width;
         }
         assert_eq!(controller.width(), 5);
+    }
+
+    #[test]
+    fn plateau_probe_waits_before_withdrawing() {
+        let mut controller = AdaptiveConcurrency::new(2, 4, 8);
+        let t0 = Instant::now();
+        tick(&mut controller, t0, 4_000_000.0);
+        assert_eq!(tick(&mut controller, t0 + PROBE_INTERVAL, 4_000_000.0), 5);
+        // 探测后头几个窗口仍在观察期,不会立即回到原并发。
+        assert_eq!(
+            tick(
+                &mut controller,
+                t0 + PROBE_INTERVAL + Duration::from_secs(2),
+                4_000_000.0
+            ),
+            5
+        );
+        assert_eq!(
+            tick(
+                &mut controller,
+                t0 + PROBE_INTERVAL + Duration::from_secs(4),
+                4_000_000.0
+            ),
+            5
+        );
+        assert_eq!(
+            tick(
+                &mut controller,
+                t0 + PROBE_INTERVAL + PROBE_SETTLE,
+                4_000_000.0
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn a_successful_probe_is_kept_and_becomes_the_new_safe_width() {
+        let mut controller = AdaptiveConcurrency::new(2, 4, 8);
+        let t0 = Instant::now();
+        tick(&mut controller, t0, 4_000_000.0);
+        assert_eq!(tick(&mut controller, t0 + PROBE_INTERVAL, 4_000_000.0), 5);
+        assert_eq!(
+            tick(
+                &mut controller,
+                t0 + PROBE_INTERVAL + Duration::from_secs(2),
+                5_000_000.0
+            ),
+            5
+        );
+        assert_eq!(
+            tick(
+                &mut controller,
+                t0 + PROBE_INTERVAL + Duration::from_secs(4),
+                5_000_000.0
+            ),
+            5
+        );
+        assert_eq!(
+            tick(
+                &mut controller,
+                t0 + PROBE_INTERVAL + PROBE_SETTLE,
+                5_000_000.0
+            ),
+            5
+        );
+        assert_eq!(controller.width(), 5);
+        assert!(controller.ceiling >= controller.width());
+    }
+
+    #[test]
+    fn failed_probes_are_limited_until_idle_reset() {
+        let mut controller = AdaptiveConcurrency::new(2, 4, 8);
+        let t0 = Instant::now();
+        tick(&mut controller, t0, 4_000_000.0);
+        let probe_at = t0 + PROBE_INTERVAL;
+        assert_eq!(tick(&mut controller, probe_at, 4_000_000.0), 5);
+        assert_eq!(
+            tick(&mut controller, probe_at + PROBE_SETTLE, 4_000_000.0),
+            4
+        );
+
+        let second_probe_at = probe_at + PROBE_SETTLE + PROBE_INTERVAL;
+        assert_eq!(tick(&mut controller, second_probe_at, 4_000_000.0), 5);
+        assert_eq!(
+            tick(&mut controller, second_probe_at + PROBE_SETTLE, 4_000_000.0),
+            4
+        );
+
+        let blocked_probe_at = second_probe_at + PROBE_SETTLE + PROBE_INTERVAL;
+        assert_eq!(tick(&mut controller, blocked_probe_at, 4_000_000.0), 4);
+        let reset_at = blocked_probe_at + IDLE_RESET;
+        assert_eq!(tick(&mut controller, reset_at, 4_000_000.0), 4);
+        assert_eq!(
+            tick(&mut controller, reset_at + PROBE_INTERVAL, 4_000_000.0),
+            5
+        );
+    }
+
+    #[test]
+    fn recovers_above_a_previous_safe_ceiling_after_gain() {
+        let mut controller = AdaptiveConcurrency::new(2, 8, 16);
+        let t0 = Instant::now();
+        tick(&mut controller, t0, 4_000_000.0);
+        let mut width = 8;
+        for second in [2, 4, 6, 8] {
+            width = tick(&mut controller, t0 + Duration::from_secs(second), 100_000.0);
+        }
+        assert_eq!(width, 6);
+        // 持续恢复后可先探测并确认更高并发,不会被旧 ceiling 永久卡住。
+        for step in 1..=20 {
+            let at = t0 + Duration::from_secs(8 + step * 2);
+            width = tick(&mut controller, at, 4_000_000.0 + step as f64 * 300_000.0);
+        }
+        assert!(width > 6, "速率恢复后应允许重新探测:width={width}");
     }
 }

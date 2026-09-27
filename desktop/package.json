@@ -1,6 +1,6 @@
 {
   "name": "telegram-media-downloader-desktop",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "private": true,
   "type": "module",
   "description": "Tauri desktop client for Telegram media downloads",
