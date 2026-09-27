@@ -629,7 +629,7 @@ async fn probe(ffprobe: &Path, path: &Path) -> Result<Probe> {
             OsStr::new("-select_streams"),
             OsStr::new("v:0"),
             OsStr::new("-show_entries"),
-            OsStr::new("stream=codec_name,width,height,duration"),
+            OsStr::new("stream=codec_name,width,height,duration,r_frame_rate,avg_frame_rate"),
             OsStr::new("-show_entries"),
             OsStr::new("format=duration"),
             OsStr::new("-of"),
