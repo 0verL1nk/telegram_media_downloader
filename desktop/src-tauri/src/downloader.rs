@@ -280,6 +280,7 @@ impl DownloadManager {
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             completed_at: None,
             output_path: Some(target.to_string_lossy().into_owned()),
+            cover_path: None,
             error: None,
             retry_count: 0,
             group_id: None,
@@ -649,6 +650,23 @@ impl DownloadManager {
             .store
             .set_status(task_id, "completed", None)
             .await?;
+        let layout = self.shared.layout.read().await.clone();
+        if let Err(error) = crate::task_cover::embed_task_cover_if_selected(
+            &self.shared.app,
+            &layout.root,
+            task_id,
+            &output,
+        )
+        .await
+        {
+            self.shared
+                .log(
+                    "warn",
+                    DOWNLOAD_LOG_TARGET,
+                    format!("任务 {task_id} 已完成，但自定义封面未能写入视频文件：{error}"),
+                )
+                .await;
+        }
         self.shared.publish_task(task_id).await;
         self.emit(
             "webview-task-completed",
@@ -1526,6 +1544,7 @@ mod tests {
             updated_at: None,
             completed_at: None,
             output_path: Some(output_path.to_string_lossy().into_owned()),
+            cover_path: None,
             error: None,
             retry_count: 0,
             group_id: None,

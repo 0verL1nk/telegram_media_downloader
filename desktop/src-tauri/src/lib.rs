@@ -9,6 +9,7 @@ mod entities;
 mod log_store;
 mod models;
 mod storage;
+mod task_cover;
 mod task_store;
 mod tray;
 mod webview_bridge;
@@ -60,6 +61,9 @@ pub fn run() {
             commands::webview_query_task_state,
             commands::webview_log,
             commands::list_tasks,
+            task_cover::probe_task_video,
+            task_cover::extract_video_frame,
+            task_cover::set_task_video_cover,
             commands::task_action,
             commands::delete_task,
             commands::open_task_location,

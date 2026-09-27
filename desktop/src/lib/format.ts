@@ -42,6 +42,14 @@ export function statusTone(status: string): "blue" | "muted" | "amber" | "green"
   return tones[status.toLowerCase()] ?? "muted";
 }
 
+const VIDEO_EXTENSIONS = new Set(["3g2", "3gp", "asf", "avi", "divx", "f4v", "flv", "m2ts", "m2v", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg", "mpg", "mts", "mxf", "ogv", "ogg", "qt", "rm", "rmvb", "ts", "vob", "webm", "wmv"]);
+
+export function isVideoTask(task: DownloadTask): boolean {
+  if (task.mediaType?.toLowerCase() === "video") return true;
+  const extension = task.fileName?.split(".").pop()?.toLowerCase();
+  return Boolean(extension && VIDEO_EXTENSIONS.has(extension));
+}
+
 /** 任务状态 → 行首图标块(26×26 圆角 8,见 DESIGN.md §3)。 */
 export function taskGlyph(task: DownloadTask): { glyph: string; tone: "dl" | "ok" | "bad" } {
   const status = task.status.toLowerCase();

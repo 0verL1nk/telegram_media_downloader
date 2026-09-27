@@ -1,13 +1,13 @@
 {
   "name": "telegram-media-downloader-desktop",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "private": true,
   "type": "module",
   "description": "Tauri desktop client for Telegram media downloads",
   "license": "MIT",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
+    "dev": "node scripts/prepare-ffmpeg.mjs && vite",
+    "build": "node scripts/prepare-ffmpeg.mjs && tsc -b && vite build",
     "check": "tsc -b --pretty false",
     "preview": "vite preview",
     "tauri": "tauri"

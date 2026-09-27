@@ -22,6 +22,7 @@ import { TitleBar } from "./components/shell/TitleBar";
 import { StatusBar } from "./components/shell/StatusBar";
 import { TaskPanel, type PanelFilter } from "./components/tasks/TaskPanel";
 import { TaskList, type TaskFilter } from "./components/tasks/TaskList";
+import { VideoCoverDialog } from "./components/tasks/VideoCoverDialog";
 import { LogsPage } from "./components/logs/LogsPage";
 import { SettingsPage, type ThemePreference, type UpdateUiState } from "./components/settings/SettingsPage";
 import { actionLabel, getTaskActions } from "./lib/format";
@@ -103,6 +104,7 @@ function App() {
     { kind: "single"; task: DownloadTask } | { kind: "selection"; tasks: DownloadTask[] } | { kind: "clearFinished" } | null
   >(null);
   const [deleteFile, setDeleteFile] = useState(false);
+  const [coverTask, setCoverTask] = useState<DownloadTask | null>(null);
   const [logLevel, setLogLevel] = useState("all");
   const [webviewError, setWebviewError] = useState("");
   const [windowMaximized, setWindowMaximized] = useState(false);
@@ -250,8 +252,12 @@ function App() {
     }
     startTransition(() => {
       setTasks((current) => {
-        const next = current.some((task) => task.taskId === candidate.taskId)
-          ? current.map((task) => (task.taskId === candidate.taskId ? candidate : task))
+        const existing = current.find((task) => task.taskId === candidate.taskId);
+        const merged = existing && !candidate.coverPath
+          ? { ...candidate, coverPath: existing.coverPath }
+          : candidate;
+        const next = existing
+          ? current.map((task) => (task.taskId === candidate.taskId ? merged : task))
           : [candidate, ...current];
         return next.slice(0, 300);
       });
@@ -607,6 +613,10 @@ function App() {
     await runBusy(`open-${task.taskId}`, () => api.openTaskLocation(task.taskId), "已打开文件位置。");
   }
 
+  function chooseVideoCover(task: DownloadTask) {
+    setCoverTask(task);
+  }
+
   async function copyTaskName(task: DownloadTask) {
     const name = task.fileName ?? "";
     if (!name) return;
@@ -874,6 +884,7 @@ function App() {
                     onSelect={(task) => setSelectedId(task.taskId)}
                     onAction={(task, action) => void actionTask(task, action)}
                     onOpenFolder={(task) => void openTaskFolder(task)}
+                    onSetCover={chooseVideoCover}
                     onCopyName={(task) => void copyTaskName(task)}
                     onDelete={requestDelete}
                     onShowAll={() => navigate("tasks")}
@@ -897,6 +908,7 @@ function App() {
                 onToggleSelectAll={toggleSelectAll}
                 onAction={(task, action) => void actionTask(task, action)}
                 onOpenFolder={(task) => void openTaskFolder(task)}
+                onSetCover={chooseVideoCover}
                 onCopyName={(task) => void copyTaskName(task)}
                 onDelete={requestDelete}
                 onClearFinished={requestClearFinished}
@@ -1021,6 +1033,16 @@ function App() {
             </div>
           </AlertDialogContent>
         </AlertDialog>
+        <VideoCoverDialog
+          task={coverTask}
+          onClose={() => setCoverTask(null)}
+          onSaved={(result) => {
+            void refreshTasks();
+            notify(result.embedded
+              ? "视频封面已写入文件，其他支持该容器封面元数据的播放器也能读取。"
+              : "封面已保存；下载完成后会自动写入视频文件。", "success");
+          }}
+        />
       </div>
     </TooltipProvider>
   );

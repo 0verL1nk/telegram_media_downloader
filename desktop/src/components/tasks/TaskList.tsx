@@ -1,4 +1,5 @@
 import { useRef } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { TaskContextMenu, TaskOps } from "./TaskOps";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
@@ -30,6 +31,7 @@ export function TaskList({
   onToggleSelectAll,
   onAction,
   onOpenFolder,
+  onSetCover,
   onCopyName,
   onDelete,
   onClearFinished,
@@ -48,6 +50,7 @@ export function TaskList({
   onToggleSelectAll: (checked: boolean) => void;
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
+  onSetCover: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   onClearFinished: () => void;
@@ -161,7 +164,7 @@ export function TaskList({
             const remaining = remainingLabel(task);
             const checked = selectedIds.has(task.taskId);
             return (
-              <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onCopyName={onCopyName} onDelete={onDelete}>
+              <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onCopyName={onCopyName} onDelete={onDelete}>
                 <div
                   className={"row" + (selectedId === task.taskId ? " selected" : "") + (checked ? " checked" : "")}
                   role="row"
@@ -176,7 +179,9 @@ export function TaskList({
                       aria-label={`选择 ${task.fileName || "未命名媒体"}`}
                     />
                   </span>
-                  <span className={"st " + glyph.tone}>{glyph.glyph}</span>
+                  <span className={"st " + glyph.tone + (task.coverPath ? " st-thumb" : "")}>
+                    {task.coverPath ? <img src={convertFileSrc(task.coverPath)} alt="视频封面" loading="lazy" /> : glyph.glyph}
+                  </span>
                   <span className="fname">
                     <b title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</b>
                     <span className={subtitle.failed ? "err" : undefined}>{subtitle.text}</span>
@@ -193,7 +198,7 @@ export function TaskList({
                     {remaining ? <small>{remaining}</small> : null}
                     {status !== "downloading" && status !== "completed" && task.updatedAt ? <small>{formatDate(task.updatedAt)}</small> : null}
                   </span>
-                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onDelete={onDelete} />
+                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onDelete={onDelete} />
                 </div>
               </TaskContextMenu>
             );

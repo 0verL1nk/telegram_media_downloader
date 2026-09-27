@@ -124,6 +124,8 @@ pub async fn write_chunks_bounded(
     let mut already = verify_resumable_chunks(&store, &task_id, temp_path).await?;
     store.update_progress(&task_id, already, 0).await?;
     let _ = progress_events.send(());
+    let mut last_progress_persisted_at = Instant::now();
+    let mut last_persisted_bytes = already;
     let mut rate_window_started = Instant::now();
     let mut rate_window_bytes = already;
     let mut smoothed_speed = 0.0_f64;
@@ -173,6 +175,24 @@ pub async fn write_chunks_bounded(
             rate_window_started = Instant::now();
             rate_window_bytes = already;
         }
+        // Each completed chunk still gets a durable digest, but task-level progress is only
+        // flushed once per rate window. With many active files this avoids doubling every chunk
+        // write into another SQLite UPDATE while keeping UI/adaptive samples current to ~1s.
+        if last_progress_persisted_at.elapsed() >= RATE_WINDOW {
+            store
+                .update_progress(
+                    &task_id,
+                    already,
+                    smoothed_speed.min(u64::MAX as f64) as u64,
+                )
+                .await?;
+            last_progress_persisted_at = Instant::now();
+            last_persisted_bytes = already;
+        }
+        let _ = progress_events.send(());
+    }
+    file.sync_all().await?;
+    if last_persisted_bytes != already {
         store
             .update_progress(
                 &task_id,
@@ -180,9 +200,7 @@ pub async fn write_chunks_bounded(
                 smoothed_speed.min(u64::MAX as f64) as u64,
             )
             .await?;
-        let _ = progress_events.send(());
     }
-    file.sync_all().await?;
     let chunks = store.chunk_map(&task_id).await?;
     if chunks.iter().any(|(_, _, _, complete)| !complete) {
         bail!("仍有未完成的下载分块");
@@ -271,6 +289,7 @@ mod tests {
             updated_at: None,
             completed_at: None,
             output_path: Some(path.join("final.bin").to_string_lossy().into()),
+            cover_path: None,
             error: None,
             retry_count: 0,
             group_id: None,

@@ -55,6 +55,18 @@ export interface TelegramWebviewBounds {
   height: number;
 }
 
+export interface VideoPreviewInfo {
+  videoPath: string;
+  durationSeconds: number;
+  coverPath?: string | null;
+  downloadComplete: boolean;
+}
+
+export interface CoverSaveResult {
+  coverPath: string;
+  embedded: boolean;
+}
+
 /** Mirrors `RuntimeStats` in the Rust backend. */
 export interface RuntimeStats {
   activeDownloads: number;
@@ -91,6 +103,7 @@ export interface DownloadTask {
   updatedAt?: string | null;
   completedAt?: string | null;
   outputPath?: string | null;
+  coverPath?: string | null;
   error?: string | null;
   retryCount?: number;
   groupId?: string | null;
@@ -150,6 +163,15 @@ export const api = {
 
   openTaskLocation: (taskId: string) =>
     call<void>("open_task_location", { taskId }),
+
+  probeTaskVideo: (taskId: string) =>
+    call<VideoPreviewInfo>("probe_task_video", { taskId }),
+
+  extractVideoFrame: (taskId: string, timestampSeconds: number) =>
+    call<string>("extract_video_frame", { taskId, timestampSeconds }),
+
+  setTaskVideoCover: (taskId: string, jpegBase64: string) =>
+    call<CoverSaveResult>("set_task_video_cover", { taskId, jpegBase64 }),
 
   deleteTask: (taskId: string, deleteFile = false) =>
     call<void>("delete_task", { taskId, deleteFile }),

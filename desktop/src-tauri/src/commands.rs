@@ -125,12 +125,15 @@ pub async fn list_tasks(
         return Err("未知的下载任务状态".into());
     }
     let limit = limit.clamp(1, MAX_TASKS_PER_LIST);
-    state
+    let mut tasks = state
         .shared
         .store
         .list(status.as_deref(), limit)
         .await
-        .map_err(command_error)
+        .map_err(command_error)?;
+    let layout = state.shared.layout.read().await.clone();
+    crate::task_cover::attach_cover_paths(&state.shared.app, &layout.root, &mut tasks);
+    Ok(tasks)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -214,7 +217,26 @@ pub async fn delete_task(
         .downloads
         .delete(&task_id, delete_file)
         .await
-        .map_err(command_error)
+        .map_err(command_error)?;
+    let layout = state.shared.layout.read().await.clone();
+    let cover = layout
+        .root
+        .join("Cache")
+        .join("video-covers")
+        .join(format!("{task_id}.jpg"));
+    if let Err(error) = fs::remove_file(cover)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        state
+            .shared
+            .log(
+                "warn",
+                "video-cover",
+                format!("清理任务封面缓存失败：{error}"),
+            )
+            .await;
+    }
+    Ok(())
 }
 
 #[tauri::command(rename_all = "camelCase")]

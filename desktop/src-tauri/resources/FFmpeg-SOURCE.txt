@@ -1,0 +1,5 @@
+The bundled FFmpeg binary is from the BtbN LGPL Windows x64 build.
+Build source and configuration: https://github.com/BtbN/FFmpeg-Builds
+FFmpeg source: https://github.com/FFmpeg/FFmpeg
+The build is obtained from the upstream latest release asset: ffmpeg-master-latest-win64-lgpl.zip
+Upstream license texts are included as FFmpeg-LICENSE.txt and FFmpeg-LICENSE-v3.txt.

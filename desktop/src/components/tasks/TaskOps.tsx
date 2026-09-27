@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Icon } from "../Icon";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "../ui/context-menu";
 import type { DownloadTask, TaskAction } from "../../lib/api";
-import { actionLabel, getTaskActions, statusLabel } from "../../lib/format";
+import { actionLabel, getTaskActions, isVideoTask, statusLabel } from "../../lib/format";
 
 const ACTION_ICON: Record<TaskAction, string> = { pause: "pause", resume: "play", cancel: "close", retry: "refresh" };
 
@@ -15,18 +15,21 @@ export function TaskOps({
   task,
   onAction,
   onOpenFolder,
+  onSetCover,
   onDelete,
   compact = false,
 }: {
   task: DownloadTask;
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
+  onSetCover: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   compact?: boolean;
 }) {
   const status = task.status.toLowerCase();
   const actions = getTaskActions(task);
   const done = status === "completed";
+  const canSetCover = isVideoTask(task) && ["completed", "downloading", "queued", "paused", "failed", "cancelled"].includes(status);
   const className = compact ? "pr-x" : "op";
   const run = (event: { stopPropagation: () => void }, fn: () => void) => {
     event.stopPropagation();
@@ -37,6 +40,11 @@ export function TaskOps({
       {done ? (
         <button type="button" className={className} title="打开文件位置" aria-label="打开文件位置" onClick={(event) => run(event, () => onOpenFolder(task))}>
           <Icon name="folder" size={compact ? 13 : 15} />
+        </button>
+      ) : null}
+      {canSetCover ? (
+        <button type="button" className={className} title="选取视频帧作为封面" aria-label={`选取视频帧作为封面${task.fileName ? " " + task.fileName : ""}`} onClick={(event) => run(event, () => onSetCover(task))}>
+          <Icon name="image" size={compact ? 13 : 15} />
         </button>
       ) : null}
       {actions.map((action) => (
@@ -69,6 +77,7 @@ export function TaskContextMenu({
   task,
   onAction,
   onOpenFolder,
+  onSetCover,
   onCopyName,
   onDelete,
   children,
@@ -76,6 +85,7 @@ export function TaskContextMenu({
   task: DownloadTask;
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
+  onSetCover: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   children: ReactNode;
@@ -96,6 +106,11 @@ export function TaskContextMenu({
         {status === "completed" ? (
           <ContextMenuItem onSelect={() => onOpenFolder(task)}>
             <Icon name="folder" size={14} />打开文件位置
+          </ContextMenuItem>
+        ) : null}
+        {isVideoTask(task) && ["completed", "downloading", "queued", "paused", "failed", "cancelled"].includes(status) ? (
+          <ContextMenuItem onSelect={() => onSetCover(task)}>
+            <Icon name="image" size={14} />选取视频帧作为封面
           </ContextMenuItem>
         ) : null}
         <ContextMenuItem onSelect={() => onCopyName(task)}>

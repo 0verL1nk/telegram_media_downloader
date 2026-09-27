@@ -6,14 +6,45 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait, sea_query::Expr,
+    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait, sea_query::Expr,
 };
 use sea_orm_migration::MigratorTrait;
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// 对应用内的写操作排队。SQLite WAL 允许读并发,但仍只有一个 writer;多个下载任务
+/// 同时更新 chunks/tasks 时,依赖连接池的 busy_timeout 仍会在事务升级或写锁竞争时
+/// 返回 SQLITE_BUSY。这个锁由所有 TaskStore clone 共享,并覆盖完整事务生命周期。
+/// 外部进程造成的短暂冲突仍由 SQLite busy_timeout 和下方退避重试处理。
+const BUSY_BACKOFFS: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(25),
+    Duration::from_millis(125),
+];
+
+/// 判 SQLITE_BUSY:sea-orm 2.x 的 DbErr 没有公开 variant,直接看字符串 + 错误码。
+fn is_sqlite_busy(error: &DbErr) -> bool {
+    if let DbErr::Custom(msg) = error {
+        return msg.contains("database is locked");
+    }
+    let s = error.to_string();
+    s.contains("database is locked") || s.contains("(code: 5)")
+}
+
+fn log_busy_retry(op: &'static str, attempt: usize, delay: Duration) {
+    tracing::debug!(
+        target: "desktop::download",
+        op = op,
+        attempt = attempt,
+        delay_ms = delay.as_millis() as u64,
+        "SQLITE_BUSY,backing off and retrying"
+    );
+}
 
 #[derive(Clone)]
 pub struct TaskStore {
     db: DatabaseConnection,
+    write_gate: Arc<AsyncMutex<()>>,
 }
 
 impl TaskStore {
@@ -50,7 +81,10 @@ impl TaskStore {
             .await
             .context("任务数据库迁移失败")?;
         migration.commit().await.context("无法提交迁移事务")?;
-        let store = Self { db };
+        let store = Self {
+            db,
+            write_gate: Arc::new(AsyncMutex::new(())),
+        };
         store.recover_interrupted().await?;
         Ok(store)
     }
@@ -70,6 +104,7 @@ impl TaskStore {
             bail!("媒体文件长度超出任务数据库可表示范围");
         }
         let now = chrono::Utc::now().to_rfc3339();
+        let _write = self.write_gate.lock().await;
         task::ActiveModel {
             id: Set(record.task_id.clone()),
             chat_id: Set(record.chat_id.clone()),
@@ -168,6 +203,10 @@ impl TaskStore {
             ("completed", &["queued"]),
             ("cancelled", &["queued"]),
         ];
+        // Hold the shared writer gate from before BEGIN through COMMIT. This method reads the
+        // current status before updating it, so concurrent deferred transactions can otherwise
+        // race while upgrading their SQLite read snapshots to writers.
+        let _write = self.write_gate.lock().await;
         let transaction = self.db.begin().await?;
         let model = task::Entity::find_by_id(id)
             .one(&transaction)
@@ -209,23 +248,36 @@ impl TaskStore {
     }
 
     pub async fn update_progress(&self, id: &str, completed: u64, speed: u64) -> Result<()> {
-        task::Entity::update_many()
-            .filter(task::Column::Id.eq(id))
-            .col_expr(
-                task::Column::CompletedBytes,
-                Expr::value(completed.min(i64::MAX as u64) as i64),
-            )
-            .col_expr(
-                task::Column::SpeedBytesPerSecond,
-                Expr::value(speed.min(i64::MAX as u64) as i64),
-            )
-            .col_expr(
-                task::Column::UpdatedAt,
-                Expr::value(chrono::Utc::now().to_rfc3339()),
-            )
-            .exec(&self.db)
-            .await?;
-        Ok(())
+        let completed = completed.min(i64::MAX as u64) as i64;
+        let speed = speed.min(i64::MAX as u64) as i64;
+        let id = id.to_owned();
+        // 高频进度写走共享 writer gate;额外保留短退避,处理应用外部持有数据库写锁的情况。
+        let mut attempt = 0usize;
+        loop {
+            let now = chrono::Utc::now().to_rfc3339();
+            let result = {
+                let _write = self.write_gate.lock().await;
+                task::Entity::update_many()
+                    .filter(task::Column::Id.eq(&id))
+                    .col_expr(task::Column::CompletedBytes, Expr::value(completed))
+                    .col_expr(task::Column::SpeedBytesPerSecond, Expr::value(speed))
+                    .col_expr(task::Column::UpdatedAt, Expr::value(now))
+                    .exec(&self.db)
+                    .await
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(error) if is_sqlite_busy(&error) && attempt < BUSY_BACKOFFS.len() => {
+                    let delay = BUSY_BACKOFFS[attempt];
+                    log_busy_retry("update_progress", attempt + 1, delay);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).context(format!("update_progress ({id})"));
+                }
+            }
+        }
     }
 
     /// Persist the file size discovered by the page-side probe. WebView tasks are created
@@ -235,22 +287,39 @@ impl TaskStore {
         if total_bytes > i64::MAX as u64 {
             bail!("媒体文件长度超出任务数据库可表示范围");
         }
-        task::Entity::update_many()
-            .filter(task::Column::Id.eq(id))
-            .col_expr(task::Column::TotalBytes, Expr::value(total_bytes as i64))
-            .col_expr(
-                task::Column::UpdatedAt,
-                Expr::value(chrono::Utc::now().to_rfc3339()),
-            )
-            .exec(&self.db)
-            .await?;
-        Ok(())
+        let total = total_bytes as i64;
+        let mut attempt = 0usize;
+        loop {
+            let now = chrono::Utc::now().to_rfc3339();
+            let result = {
+                let _write = self.write_gate.lock().await;
+                task::Entity::update_many()
+                    .filter(task::Column::Id.eq(id))
+                    .col_expr(task::Column::TotalBytes, Expr::value(total))
+                    .col_expr(task::Column::UpdatedAt, Expr::value(now))
+                    .exec(&self.db)
+                    .await
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(error) if is_sqlite_busy(&error) && attempt < BUSY_BACKOFFS.len() => {
+                    let delay = BUSY_BACKOFFS[attempt];
+                    log_busy_retry("set_total_bytes", attempt + 1, delay);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).context(format!("set_total_bytes ({id})"));
+                }
+            }
+        }
     }
 
     pub async fn set_chunks(&self, id: &str, total_bytes: u64, chunk_size: u64) -> Result<()> {
         if total_bytes > i64::MAX as u64 || chunk_size == 0 || chunk_size > i64::MAX as u64 {
             bail!("任务分块尺寸无效");
         }
+        let _write = self.write_gate.lock().await;
         let transaction = self.db.begin().await?;
         chunk::Entity::delete_many()
             .filter(chunk::Column::TaskId.eq(id))
@@ -285,8 +354,28 @@ impl TaskStore {
         let mut active: chunk::ActiveModel = model.into();
         active.complete = Set(true);
         active.digest = Set(Some(digest.to_owned()));
-        active.update(&self.db).await?;
-        Ok(())
+        // UPDATE 阶段排队并重试,SELECT 阶段不重试(读操作不该放大锁时间)。
+        // `ActiveModel::update` 按值消费,所以每次重试前克隆一次。
+        let mut attempt = 0usize;
+        loop {
+            let attempt_model = active.clone();
+            let result = {
+                let _write = self.write_gate.lock().await;
+                attempt_model.update(&self.db).await
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(error) if is_sqlite_busy(&error) && attempt < BUSY_BACKOFFS.len() => {
+                    let delay = BUSY_BACKOFFS[attempt];
+                    log_busy_retry("complete_chunk", attempt + 1, delay);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).context(format!("complete_chunk ({id}@{offset})"));
+                }
+            }
+        }
     }
 
     pub async fn reset_chunk(&self, id: &str, offset: u64) -> Result<()> {
@@ -299,6 +388,7 @@ impl TaskStore {
             let mut active: chunk::ActiveModel = model.into();
             active.complete = Set(false);
             active.digest = Set(None);
+            let _write = self.write_gate.lock().await;
             active.update(&self.db).await?;
         }
         Ok(())
@@ -306,14 +396,36 @@ impl TaskStore {
 
     /// 删除任务及其全部分块记录(不可恢复;文件由调用方决定是否一并删除)。
     pub async fn delete(&self, id: &str) -> Result<()> {
-        let transaction = self.db.begin().await?;
-        chunk::Entity::delete_many()
-            .filter(chunk::Column::TaskId.eq(id))
-            .exec(&transaction)
-            .await?;
-        task::Entity::delete_by_id(id).exec(&transaction).await?;
-        transaction.commit().await?;
-        Ok(())
+        // 整个事务作为一次重试单元;失败后先释放 writer gate,再退避。
+        let mut attempt = 0usize;
+        loop {
+            let result = {
+                let _write = self.write_gate.lock().await;
+                async {
+                    let transaction = self.db.begin().await?;
+                    chunk::Entity::delete_many()
+                        .filter(chunk::Column::TaskId.eq(id))
+                        .exec(&transaction)
+                        .await?;
+                    task::Entity::delete_by_id(id).exec(&transaction).await?;
+                    transaction.commit().await?;
+                    Ok::<_, DbErr>(())
+                }
+                .await
+            };
+            match result {
+                Ok(_) => return Ok(()),
+                Err(error) if is_sqlite_busy(&error) && attempt < BUSY_BACKOFFS.len() => {
+                    let delay = BUSY_BACKOFFS[attempt];
+                    log_busy_retry("delete", attempt + 1, delay);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Err(error) => {
+                    return Err(error).context(format!("delete ({id})"));
+                }
+            }
+        }
     }
 
     pub async fn chunk_map(&self, id: &str) -> Result<Vec<(u64, u64, Option<String>, bool)>> {
@@ -385,6 +497,7 @@ impl TaskStore {
         if interrupted.is_empty() {
             return Ok(());
         }
+        let _write = self.write_gate.lock().await;
         let transaction = self.db.begin().await?;
         for model in interrupted {
             let mut active: task::ActiveModel = model.into();
@@ -425,6 +538,7 @@ impl From<task::Model> for TaskRecord {
             updated_at: Some(row.updated_at),
             completed_at: row.completed_at,
             output_path: Some(row.target_path),
+            cover_path: None,
             error: row.error,
             retry_count: row.retry_count.max(0) as u32,
             group_id: row.group_id,
@@ -455,6 +569,7 @@ mod tests {
             updated_at: None,
             completed_at: None,
             output_path: Some("test/a.mp4".into()),
+            cover_path: None,
             error: None,
             retry_count: 0,
             group_id: None,
@@ -570,5 +685,65 @@ mod tests {
         assert!(store.list(None, 10).await.unwrap().is_empty());
         // 删除不存在的任务不报错(幂等)。
         store.delete("t1").await.unwrap();
+    }
+
+    /// SQLITE_BUSY 字符串匹配能识别真锁。生产中我们靠 sea-orm 把 SQLx 错包成
+    /// "(code: 5) database is locked",这里直接走字符串路径,避免依赖 sea-orm 内部枚举。
+    #[test]
+    fn busy_string_match_recognizes_code_5() {
+        let cases = [
+            DbErr::Custom("Query Error: error returned from database: (code: 5) database is locked".into()),
+            DbErr::Custom("error returned from database: (code: 5) database is locked: error returned from database: (code: 5) database is locked".into()),
+        ];
+        for case in cases {
+            assert!(is_sqlite_busy(&case), "should recognize: {case}");
+        }
+        let not_busy = DbErr::Custom("no such column: foo".into());
+        assert!(!is_sqlite_busy(&not_busy));
+    }
+
+    /// 写路径在偶发 SQLITE_BUSY 下应当退避重试并最终成功 —— 用一个短超时(1ms)
+    /// 模拟"第一次被撞、第二次让出来",验证 `update_progress` 不再向上抛 code: 5。
+    #[tokio::test]
+    async fn update_progress_survives_an_occasional_busy_retry() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::open(&dir.path().join("db.sqlite"))
+            .await
+            .unwrap();
+        store.create(&record("t1")).await.unwrap();
+        // busy_timeout 设到 0,海面立刻撞锁 → 让我们的退避自己吃掉。
+        sqlx::query("PRAGMA busy_timeout = 0")
+            .execute(&store.db)
+            .await
+            .unwrap();
+        // 启动一个长事务,持有 task 表的写锁,等另一线程 update_progress 重试一次。
+        let busy_conn = sqlx::query("BEGIN IMMEDIATE")
+            .execute(&store.db)
+            .await
+            .unwrap();
+        let store2 = store.clone();
+        let updater = tokio::spawn(async move {
+            // 第一次会拿到 SQLITE_BUSY → 退避 → 等我们 COMMIT → 第二次成功。
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let store2_cloned = store2.clone();
+            tokio::spawn(async move {
+                sqlx::query("COMMIT")
+                    .execute(&store2_cloned.db)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        let result = store.update_progress("t1", 42, 7).await;
+        updater.await.unwrap();
+        drop(busy_conn);
+        assert!(
+            result.is_ok(),
+            "update_progress should retry past a transient busy: {result:?}"
+        );
+        let row = store.get("t1").await.unwrap().unwrap();
+        assert_eq!(row.completed_bytes, 42);
+        assert_eq!(row.speed_bytes_per_second, 7);
     }
 }
