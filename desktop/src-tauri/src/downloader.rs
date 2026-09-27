@@ -19,11 +19,12 @@ use crate::{
     models::TaskRecord,
     storage,
     task_store::TaskStore,
+    video_processing,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -227,6 +228,8 @@ pub struct DownloadManager {
     shared: Arc<SharedState>,
     slots: Arc<Semaphore>,
     active: Arc<AsyncMutex<HashMap<String, ActiveDownload>>>,
+    processing: Arc<AsyncMutex<HashSet<String>>>,
+    video_encode_slot: Arc<Semaphore>,
     budget: Arc<StreamBudget>,
 }
 
@@ -241,6 +244,8 @@ impl DownloadManager {
             shared,
             slots: Arc::new(Semaphore::new(limit)),
             active: Arc::new(AsyncMutex::new(HashMap::new())),
+            processing: Arc::new(AsyncMutex::new(HashSet::new())),
+            video_encode_slot: Arc::new(Semaphore::new(1)),
             budget: Arc::new(StreamBudget::new(limit)),
         };
         manager.spawn_watchdog();
@@ -646,10 +651,79 @@ impl DownloadManager {
                 .mark_failed(task_id, &safe_error(&format!("{error:#}")))
                 .await;
         }
-        self.shared.store.update_progress(task_id, total, 0).await?;
+        let finished_record = self.require_record(task_id).await?;
+        let mut processing_error = None;
+        if video_processing::is_video(finished_record.media_type.as_deref(), &output) {
+            self.shared
+                .store
+                .set_status(task_id, "processing", None)
+                .await?;
+            self.shared.publish_task(task_id).await;
+            let _video_slot = self
+                .video_encode_slot
+                .acquire()
+                .await
+                .context("视频编码队列已关闭")?;
+            match video_processing::compress_replace(&self.shared.app, &output).await {
+                Ok(Some(replacement)) => {
+                    self.shared
+                        .log(
+                            "info",
+                            DOWNLOAD_LOG_TARGET,
+                            format!(
+                                "任务 {task_id} 视频已转为 AV1 并替换原文件：{} → {} 字节",
+                                replacement.old_size, replacement.new_size
+                            ),
+                        )
+                        .await;
+                    if let Err(error) = self
+                        .shared
+                        .store
+                        .set_file_size(task_id, replacement.new_size)
+                        .await
+                    {
+                        let detail = safe_error(&format!(
+                            "视频已替换，但任务文件大小记录更新失败：{error:#}"
+                        ));
+                        processing_error = Some(detail.clone());
+                        self.shared
+                            .log("warn", DOWNLOAD_LOG_TARGET, format!("任务 {task_id} {detail}"))
+                            .await;
+                    }
+                }
+                Ok(None) => {
+                    self.shared
+                        .log(
+                            "info",
+                            DOWNLOAD_LOG_TARGET,
+                            format!("任务 {task_id} 视频已是 AV1 或无法进一步缩小，保留当前文件"),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let detail = safe_error(&format!("视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"));
+                    processing_error = Some(detail.clone());
+                    self.shared
+                        .log(
+                            "warn",
+                            DOWNLOAD_LOG_TARGET,
+                            format!("任务 {task_id} {detail}"),
+                        )
+                        .await;
+                }
+            }
+        }
+        let final_size = tokio::fs::metadata(&output)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(total);
         self.shared
             .store
-            .set_status(task_id, "completed", None)
+            .update_progress(task_id, final_size, 0)
+            .await?;
+        self.shared
+            .store
+            .set_status(task_id, "completed", processing_error.as_deref())
             .await?;
         let layout = self.shared.layout.read().await.clone();
         if let Err(error) = crate::task_cover::embed_task_cover_if_selected(
@@ -689,6 +763,121 @@ impl DownloadManager {
             )
             .await;
         Ok(record)
+    }
+
+    /// Manually process an already-downloaded video from the local task list.
+    pub async fn process_video(&self, task_id: &str) -> Result<TaskRecord> {
+        let record = self.require_record(task_id).await?;
+        if record.status != "completed" {
+            bail!("只能处理已完成下载的视频");
+        }
+        let output = record
+            .output_path
+            .as_deref()
+            .map(PathBuf::from)
+            .context("任务目标路径为空")?;
+        if !video_processing::is_video(record.media_type.as_deref(), &output) {
+            bail!("该任务不是支持的视频文件");
+        }
+        let settings = self.shared.settings.read().await.clone();
+        let root = PathBuf::from(settings.download_root)
+            .canonicalize()
+            .context("下载目录不可用")?;
+        let resolved = output
+            .canonicalize()
+            .context("原视频文件不存在或不可访问")?;
+        if !resolved.starts_with(&root) {
+            bail!("任务视频不在下载目录内，已拒绝替换");
+        }
+
+        {
+            let mut processing = self.processing.lock().await;
+            if !processing.insert(task_id.to_owned()) {
+                bail!("该视频正在处理中");
+            }
+        }
+        let result = self.process_existing_video_inner(task_id, &resolved).await;
+        self.processing.lock().await.remove(task_id);
+        result
+    }
+
+    async fn process_existing_video_inner(
+        &self,
+        task_id: &str,
+        output: &Path,
+    ) -> Result<TaskRecord> {
+        self.shared
+            .store
+            .set_status(task_id, "processing", None)
+            .await?;
+        self.shared.publish_task(task_id).await;
+
+        let _video_slot = self
+            .video_encode_slot
+            .acquire()
+            .await
+            .context("视频编码队列已关闭")?;
+
+        let result = video_processing::compress_replace(&self.shared.app, output).await;
+        let (message, failure) = match result {
+            Ok(Some(replacement)) => {
+                self.shared
+                    .log(
+                        "info",
+                        DOWNLOAD_LOG_TARGET,
+                        format!(
+                            "手动视频处理完成 {task_id}：{} → {} 字节",
+                            replacement.old_size, replacement.new_size
+                        ),
+                    )
+                    .await;
+                match self
+                    .shared
+                    .store
+                    .set_file_size(task_id, replacement.new_size)
+                    .await
+                {
+                    Ok(()) => (None, None),
+                    Err(error) => {
+                        let detail = safe_error(&format!(
+                            "视频已替换，但任务文件大小记录更新失败：{error:#}"
+                        ));
+                        self.shared
+                            .log(
+                                "warn",
+                                DOWNLOAD_LOG_TARGET,
+                                format!("手动视频处理 {task_id}：{detail}"),
+                            )
+                            .await;
+                        (Some(detail.clone()), Some(anyhow!(detail)))
+                    }
+                }
+            }
+            Ok(None) => (
+                Some("文件已是 AV1 或转码后不会变小，原文件保持不变".to_owned()),
+                None,
+            ),
+            Err(error) => {
+                let detail = safe_error(&format!("视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"));
+                self.shared
+                    .log(
+                        "warn",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("手动视频处理失败 {task_id}：{detail}"),
+                    )
+                    .await;
+                (Some(detail.clone()), Some(anyhow!(detail)))
+            }
+        };
+        self.shared
+            .store
+            .set_status(task_id, "completed", message.as_deref())
+            .await?;
+        self.shared.publish_task(task_id).await;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        self.require_record(task_id).await
     }
 
     /// 页面侧失败(URL 失效、网络中断、抓取停滞等):保留已校验分块,标记 `failed`。
@@ -767,6 +956,9 @@ impl DownloadManager {
     /// 被篡改后越界删除);临时分块文件总是清理 —— 删除的语义是"这条任务不再存在"。
     pub async fn delete(&self, task_id: &str, delete_file: bool) -> Result<()> {
         let record = self.require_record(task_id).await?;
+        if record.status == "processing" {
+            bail!("视频处理中，暂时不能删除该任务");
+        }
         if let Some(active) = self.detach(task_id).await {
             announce_abort(&self.shared, task_id);
             if let Err(error) = drain_active(active).await {

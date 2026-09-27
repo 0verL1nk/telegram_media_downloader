@@ -76,6 +76,7 @@ data.yaml
 
 # Desktop client TS sources live under src/lib（覆盖上面的 Python 打包规则 lib/）
 !desktop/src/lib/
+desktop/src-tauri/resources/ffmpeg/
 .playwright-mcp/
 desktop/src-tauri/resources/ffmpeg.exe
 desktop/src-tauri/resources/ffprobe.exe

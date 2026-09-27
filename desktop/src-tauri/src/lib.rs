@@ -13,6 +13,7 @@ mod task_cover;
 mod task_maintenance;
 mod task_store;
 mod tray;
+mod video_processing;
 mod webview_bridge;
 
 use app_state::AppState;
@@ -67,6 +68,7 @@ pub fn run() {
             task_cover::get_task_video_thumbnail,
             task_cover::set_task_video_cover,
             commands::task_action,
+            commands::process_video,
             commands::delete_task,
             commands::open_task_location,
             commands::get_logs,

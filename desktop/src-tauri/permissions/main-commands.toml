@@ -10,6 +10,7 @@ commands.allow = [
   "get_task_video_thumbnail",
   "set_task_video_cover",
   "task_action",
+  "process_video",
   "delete_task",
   "open_task_location",
   "get_logs",

@@ -31,13 +31,13 @@ export function getPercent(task: DownloadTask): number {
 }
 
 export function statusLabel(status: string): string {
-  const labels: Record<string, string> = { downloading: "下载中", queued: "排队中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" };
+  const labels: Record<string, string> = { downloading: "下载中", processing: "处理中", queued: "排队中", paused: "已暂停", completed: "已完成", failed: "失败", cancelled: "已取消" };
   return labels[status.toLowerCase()] ?? status;
 }
 
 export function statusTone(status: string): "blue" | "muted" | "amber" | "green" | "red" {
   const tones: Record<string, "blue" | "muted" | "amber" | "green" | "red"> = {
-    downloading: "blue", queued: "muted", paused: "amber", completed: "green", failed: "red", cancelled: "muted",
+    downloading: "blue", processing: "blue", queued: "muted", paused: "amber", completed: "green", failed: "red", cancelled: "muted",
   };
   return tones[status.toLowerCase()] ?? "muted";
 }
@@ -70,6 +70,12 @@ export function getTaskActions(task: DownloadTask): TaskAction[] {
   }
 }
 
+export function canProcessVideo(task: DownloadTask): boolean {
+  if (task.status.toLowerCase() !== "completed") return false;
+  if (["video", "animation"].includes((task.mediaType ?? "").toLowerCase())) return true;
+  return /\.(mp4|m4v|mov|mkv|webm|avi)$/i.test(task.fileName ?? task.outputPath ?? "");
+}
+
 export function actionLabel(action: TaskAction): string {
   return ({ pause: "暂停", resume: "继续", cancel: "取消", retry: "重试" })[action];
 }
@@ -92,9 +98,13 @@ export function panelSubtitle(task: DownloadTask): { text: string; failed: boole
   if (status === "downloading") {
     return { text: `${Math.round(getPercent(task))}% · ${formatSpeed(task.speedBytesPerSecond)}`, failed: false };
   }
+  if (status === "processing") return { text: "AV1 视频处理中", failed: false };
   if (status === "queued") return { text: "排队中", failed: false };
   if (status === "paused") return { text: `已暂停 · ${Math.round(getPercent(task))}%`, failed: false };
-  if (status === "completed") return { text: `完成 · ${formatBytes(task.totalBytes ?? task.downloadedBytes)}`, failed: false };
+  if (status === "completed") {
+    if (task.error) return { text: `完成 · ${task.error}`, failed: true };
+    return { text: `完成 · ${formatBytes(task.totalBytes ?? task.downloadedBytes)}`, failed: false };
+  }
   return { text: task.error || statusLabel(status), failed: true };
 }
 
@@ -104,6 +114,9 @@ export function tableSubtitle(task: DownloadTask): { text: string; failed: boole
   const source = task.chatTitle || (task.fileName ? "" : "Telegram Web");
   if (status === "failed" || status === "cancelled") {
     return { text: task.error || "任务失败,可重试", failed: true };
+  }
+  if (status === "completed" && task.error) {
+    return { text: `已完成 · ${task.error}`, failed: true };
   }
   const size = task.totalBytes ? formatBytes(task.totalBytes) : formatBytes(task.downloadedBytes);
   const parts = [source, size].filter(Boolean);

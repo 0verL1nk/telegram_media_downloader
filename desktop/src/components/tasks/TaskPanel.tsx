@@ -15,6 +15,7 @@ export function TaskPanel({
   onAction,
   onOpenFolder,
   onSetCover,
+  onProcessVideo,
   onCopyName,
   onDelete,
   onShowAll,
@@ -30,6 +31,7 @@ export function TaskPanel({
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onSetCover: (task: DownloadTask) => void;
+  onProcessVideo: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   onShowAll: () => void;
@@ -71,7 +73,7 @@ export function TaskPanel({
           const glyph = taskGlyph(task);
           const subtitle = panelSubtitle(task);
           return (
-            <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onCopyName={onCopyName} onDelete={onDelete}>
+            <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onProcessVideo={onProcessVideo} onCopyName={onCopyName} onDelete={onDelete}>
               <div
                 className={"pr" + (selectedId === task.taskId ? " selected" : "")}
                 role="button"
@@ -88,7 +90,7 @@ export function TaskPanel({
                 <span className="pr-top">
                   <span className={"pr-ic " + glyph.tone}>{glyph.glyph}</span>
                   <span className="pr-name" title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</span>
-                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onDelete={onDelete} compact />
+                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onProcessVideo={onProcessVideo} onDelete={onDelete} compact />
                 </span>
                 <span className="pr-meta">
                   <Progress

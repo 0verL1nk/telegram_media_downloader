@@ -7,13 +7,15 @@ import { fileURLToPath } from "node:url";
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const resourceDir = resolve(scriptDir, "../src-tauri/resources");
 const ffmpegPath = join(resourceDir, "ffmpeg.exe");
+const ffprobePath = join(resourceDir, "ffprobe.exe");
 
 if (process.platform !== "win32") {
   throw new Error("当前桌面发布目标是 Windows；FFmpeg 资源下载脚本仅准备 Windows x64 构建所需文件。");
 }
 
 try {
-  await import("node:fs/promises").then(({ access }) => access(ffmpegPath));
+  const { access } = await import("node:fs/promises");
+  await Promise.all([access(ffmpegPath), access(ffprobePath)]);
   process.exit(0);
 } catch {
   // Download only when binaries are missing. They are ignored by Git and bundled into releases.
@@ -42,8 +44,11 @@ try {
 
   const foundFfmpeg = await findBinary(extracted, "ffmpeg.exe");
   if (!foundFfmpeg) throw new Error("FFmpeg 发布包中没有找到 ffmpeg.exe");
+  const foundFfprobe = await findBinary(extracted, "ffprobe.exe");
+  if (!foundFfprobe) throw new Error("FFmpeg 发布包中没有找到 ffprobe.exe");
   await mkdir(resourceDir, { recursive: true });
   await copyFile(foundFfmpeg, ffmpegPath);
+  await copyFile(foundFfprobe, ffprobePath);
   const version = spawnSync(ffmpegPath, ["-version"], { encoding: "utf8" });
   const versionLine = version.stdout?.split(/\r?\n/, 1)[0] ?? "unknown version";
   const commit = versionLine.match(/-g([0-9a-f]{7,})\b/i)?.[1];

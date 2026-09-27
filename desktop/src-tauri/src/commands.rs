@@ -34,6 +34,7 @@ const MAX_TEMPLATE_LENGTH: usize = 256;
 const ALLOWED_TASK_STATUSES: &[&str] = &[
     "queued",
     "downloading",
+    "processing",
     "paused",
     "completed",
     "failed",
@@ -149,6 +150,20 @@ pub async fn task_action(
     state
         .downloads
         .action(&task_id, &action)
+        .await
+        .map_err(command_error)
+}
+
+/// Manually run the same safe in-place compression used after new video downloads.
+#[tauri::command(rename_all = "camelCase")]
+pub async fn process_video(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<TaskRecord, String> {
+    validate_task_id(&task_id)?;
+    state
+        .downloads
+        .process_video(&task_id)
         .await
         .map_err(command_error)
 }

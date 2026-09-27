@@ -182,6 +182,8 @@ impl TaskStore {
         let downloading = row.status == "downloading";
         let state = if row.status == "paused" {
             "queued".to_owned()
+        } else if row.status == "processing" {
+            "completed".to_owned()
         } else {
             row.status
         };
@@ -200,11 +202,19 @@ impl TaskStore {
             ("queued", &["downloading", "paused", "cancelled", "failed"]),
             (
                 "downloading",
-                &["paused", "completed", "failed", "cancelled", "queued"],
+                &[
+                    "paused",
+                    "processing",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "queued",
+                ],
             ),
+            ("processing", &["completed", "failed"]),
             ("paused", &["queued", "cancelled", "failed"]),
             ("failed", &["queued", "cancelled"]),
-            ("completed", &["queued"]),
+            ("completed", &["queued", "processing"]),
             ("cancelled", &["queued"]),
         ];
         // Hold the shared writer gate from before BEGIN through COMMIT. This method reads the
@@ -317,6 +327,24 @@ impl TaskStore {
                 }
             }
         }
+    }
+
+    /// Keep completed task size metadata in sync after an in-place video replacement.
+    pub async fn set_file_size(&self, id: &str, size: u64) -> Result<()> {
+        if size > i64::MAX as u64 {
+            bail!("媒体文件长度超出任务数据库可表示范围");
+        }
+        task::Entity::update_many()
+            .filter(task::Column::Id.eq(id))
+            .col_expr(task::Column::TotalBytes, Expr::value(size as i64))
+            .col_expr(task::Column::CompletedBytes, Expr::value(size as i64))
+            .col_expr(
+                task::Column::UpdatedAt,
+                Expr::value(chrono::Utc::now().to_rfc3339()),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
     }
 
     pub async fn set_chunks(&self, id: &str, total_bytes: u64, chunk_size: u64) -> Result<()> {
@@ -466,7 +494,9 @@ impl TaskStore {
         for (status, count, bytes, speed) in rows {
             match status.as_str() {
                 "queued" | "paused" => stats.queued_downloads += count.max(0) as usize,
-                "downloading" => stats.active_downloads += count.max(0) as usize,
+                "downloading" | "processing" => {
+                    stats.active_downloads += count.max(0) as usize
+                }
                 "completed" => stats.completed_downloads += count.max(0) as usize,
                 "failed" => stats.failed_downloads += count.max(0) as usize,
                 _ => {}
@@ -498,7 +528,11 @@ impl TaskStore {
             .filter(task::Column::Status.eq("downloading"))
             .all(&self.db)
             .await?;
-        if interrupted.is_empty() {
+        let processing = task::Entity::find()
+            .filter(task::Column::Status.eq("processing"))
+            .all(&self.db)
+            .await?;
+        if interrupted.is_empty() && processing.is_empty() {
             return Ok(());
         }
         let _write = self.write_gate.lock().await;
@@ -507,6 +541,21 @@ impl TaskStore {
             let mut active: task::ActiveModel = model.into();
             active.status = Set("queued".into());
             active.error = Set(Some("应用意外退出，任务已恢复".into()));
+            active.speed_bytes_per_second = Set(0);
+            active.updated_at = Set(chrono::Utc::now().to_rfc3339());
+            active.update(&transaction).await?;
+        }
+        for model in processing {
+            let output = std::path::PathBuf::from(&model.target_path);
+            let recovery_error = crate::video_processing::recover_interrupted_replace(&output)
+                .err()
+                .map(|error| format!("；原文件恢复需人工检查：{error:#}"));
+            let mut active: task::ActiveModel = model.into();
+            active.status = Set("completed".into());
+            active.error = Set(Some(format!(
+                "视频处理在应用关闭时中断；可点击任务上的按钮从已完成片段继续{}",
+                recovery_error.unwrap_or_default()
+            )));
             active.speed_bytes_per_second = Set(0);
             active.updated_at = Set(chrono::Utc::now().to_rfc3339());
             active.update(&transaction).await?;

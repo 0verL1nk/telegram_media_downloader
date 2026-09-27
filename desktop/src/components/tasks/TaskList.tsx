@@ -7,11 +7,12 @@ import { Progress } from "../ui/progress";
 import type { DownloadTask, TaskAction } from "../../lib/api";
 import { formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph } from "../../lib/format";
 
-export type TaskFilter = "all" | "downloading" | "queued" | "paused" | "completed" | "failed";
+export type TaskFilter = "all" | "downloading" | "processing" | "queued" | "paused" | "completed" | "failed";
 
 const FILTERS: { id: TaskFilter; label: string }[] = [
   { id: "all", label: "全部" },
   { id: "downloading", label: "下载中" },
+  { id: "processing", label: "视频处理中" },
   { id: "queued", label: "队列" },
   { id: "paused", label: "已暂停" },
   { id: "completed", label: "已完成" },
@@ -34,6 +35,7 @@ export function TaskList({
   onAction,
   onOpenFolder,
   onSetCover,
+  onProcessVideo,
   onCopyName,
   onDelete,
   onClearFinished,
@@ -55,6 +57,7 @@ export function TaskList({
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onSetCover: (task: DownloadTask) => void;
+  onProcessVideo: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   onClearFinished: () => void;
@@ -176,7 +179,7 @@ export function TaskList({
             const remaining = remainingLabel(task);
             const checked = selectedIds.has(task.taskId);
             return (
-              <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onCopyName={onCopyName} onDelete={onDelete}>
+              <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onProcessVideo={onProcessVideo} onCopyName={onCopyName} onDelete={onDelete}>
                 <div
                   className={"row" + (selectedId === task.taskId ? " selected" : "") + (checked ? " checked" : "")}
                   role="row"
@@ -199,7 +202,7 @@ export function TaskList({
                   <span className="prog-cell">
                     <Progress value={percent} tone={glyph.tone === "ok" ? "success" : glyph.tone === "bad" ? "danger" : "default"} />
                     <span className={"pct" + (glyph.tone === "bad" ? " bad" : "") + (status === "completed" ? " ok" : "")}>
-                      {status === "completed" ? "完成" : `${percent}%`}
+                      {status === "completed" ? "完成" : status === "processing" ? "转码中" : `${percent}%`}
                     </span>
                   </span>
                   <span className="size">{task.totalBytes ? formatBytes(task.totalBytes) : formatBytes(task.downloadedBytes)}</span>
@@ -208,7 +211,7 @@ export function TaskList({
                     {remaining ? <small>{remaining}</small> : null}
                     {status !== "downloading" && status !== "completed" && task.updatedAt ? <small>{formatDate(task.updatedAt)}</small> : null}
                   </span>
-                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onDelete={onDelete} />
+                  <TaskOps task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onProcessVideo={onProcessVideo} onDelete={onDelete} />
                 </div>
               </TaskContextMenu>
             );

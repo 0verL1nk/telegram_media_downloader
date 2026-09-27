@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { Icon } from "../Icon";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "../ui/context-menu";
 import type { DownloadTask, TaskAction } from "../../lib/api";
-import { actionLabel, getTaskActions, isVideoTask, statusLabel } from "../../lib/format";
+import { actionLabel, canProcessVideo, getTaskActions, isVideoTask, statusLabel } from "../../lib/format";
 
 const ACTION_ICON: Record<TaskAction, string> = { pause: "pause", resume: "play", cancel: "close", retry: "refresh" };
 
@@ -16,6 +16,7 @@ export function TaskOps({
   onAction,
   onOpenFolder,
   onSetCover,
+  onProcessVideo,
   onDelete,
   compact = false,
 }: {
@@ -23,6 +24,7 @@ export function TaskOps({
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onSetCover: (task: DownloadTask) => void;
+  onProcessVideo: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   compact?: boolean;
 }) {
@@ -30,6 +32,7 @@ export function TaskOps({
   const actions = getTaskActions(task);
   const done = status === "completed";
   const canSetCover = isVideoTask(task) && ["completed", "downloading", "queued", "paused", "failed", "cancelled"].includes(status);
+  const processLabel = task.error?.includes("中断") ? "继续视频处理" : "压缩视频并替换原文件";
   const className = compact ? "pr-x" : "op";
   const run = (event: { stopPropagation: () => void }, fn: () => void) => {
     event.stopPropagation();
@@ -47,6 +50,11 @@ export function TaskOps({
           <Icon name="image" size={compact ? 13 : 15} />
         </button>
       ) : null}
+      {canProcessVideo(task) ? (
+        <button type="button" className={className} title={processLabel} aria-label={`${processLabel}${task.fileName ? " " + task.fileName : ""}`} onClick={(event) => run(event, () => onProcessVideo(task))}>
+          <Icon name="video" size={compact ? 13 : 15} />
+        </button>
+      ) : null}
       {actions.map((action) => (
         <button
           key={action}
@@ -62,8 +70,9 @@ export function TaskOps({
       <button
         type="button"
         className={className + " danger"}
-        title="删除任务"
+        title={status === "processing" ? "视频处理中，暂时不能删除" : "删除任务"}
         aria-label={`删除任务${task.fileName ? " " + task.fileName : ""}`}
+        disabled={status === "processing"}
         onClick={(event) => run(event, () => onDelete(task))}
       >
         <Icon name="trash" size={compact ? 13 : 15} />
@@ -78,6 +87,7 @@ export function TaskContextMenu({
   onAction,
   onOpenFolder,
   onSetCover,
+  onProcessVideo,
   onCopyName,
   onDelete,
   children,
@@ -86,12 +96,15 @@ export function TaskContextMenu({
   onAction: (task: DownloadTask, action: TaskAction) => void;
   onOpenFolder: (task: DownloadTask) => void;
   onSetCover: (task: DownloadTask) => void;
+  onProcessVideo: (task: DownloadTask) => void;
   onCopyName: (task: DownloadTask) => void;
   onDelete: (task: DownloadTask) => void;
   children: ReactNode;
 }) {
   const actions = getTaskActions(task);
   const status = task.status.toLowerCase();
+  const canSetCover = isVideoTask(task) && ["completed", "downloading", "queued", "paused", "failed", "cancelled"].includes(status);
+  const processLabel = task.error?.includes("中断") ? "继续视频处理" : "压缩视频并替换原文件";
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
@@ -108,9 +121,14 @@ export function TaskContextMenu({
             <Icon name="folder" size={14} />打开文件位置
           </ContextMenuItem>
         ) : null}
-        {isVideoTask(task) && ["completed", "downloading", "queued", "paused", "failed", "cancelled"].includes(status) ? (
+        {canSetCover ? (
           <ContextMenuItem onSelect={() => onSetCover(task)}>
             <Icon name="image" size={14} />选取视频帧作为封面
+          </ContextMenuItem>
+        ) : null}
+        {canProcessVideo(task) ? (
+          <ContextMenuItem onSelect={() => onProcessVideo(task)}>
+            <Icon name="video" size={14} />{processLabel}
           </ContextMenuItem>
         ) : null}
         <ContextMenuItem onSelect={() => onCopyName(task)}>

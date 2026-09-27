@@ -34,6 +34,7 @@
     "targets": ["nsis", "msi"],
     "resources": {
       "resources/ffmpeg.exe": "ffmpeg.exe",
+      "resources/ffprobe.exe": "ffprobe.exe",
       "resources/FFmpeg-LICENSE.txt": "FFmpeg-LICENSE.txt",
       "resources/FFmpeg-LICENSE-v3.txt": "FFmpeg-LICENSE-v3.txt",
       "resources/FFmpeg-SOURCE.txt": "FFmpeg-SOURCE.txt"

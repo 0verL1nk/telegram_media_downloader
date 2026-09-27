@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Event } from "@tauri-apps/api/event";
 
-export type TaskStatus = "queued" | "downloading" | "paused" | "completed" | "failed" | "cancelled" | string;
+export type TaskStatus = "queued" | "downloading" | "processing" | "paused" | "completed" | "failed" | "cancelled" | string;
 export type TaskAction = "pause" | "resume" | "cancel" | "retry";
 
 /** Mirrors `ConcurrencySettings` in the Rust backend. */
@@ -161,6 +161,9 @@ export const api = {
 
   taskAction: (taskId: string, action: TaskAction) =>
     call<DownloadTask>("task_action", { taskId, action }),
+
+  processVideo: (taskId: string) =>
+    call<DownloadTask>("process_video", { taskId }),
 
   openTaskLocation: (taskId: string) =>
     call<void>("open_task_location", { taskId }),

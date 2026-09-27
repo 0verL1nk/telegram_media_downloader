@@ -139,10 +139,11 @@ function App() {
   const counts = useMemo(() => {
     const count = (status: string) => tasks.filter((task) => task.status.toLowerCase() === status).length;
     return {
-      active: count("downloading") + count("queued") + count("paused"),
+      active: count("downloading") + count("processing") + count("queued") + count("paused"),
       completed: count("completed"),
       failed: count("failed") + count("cancelled"),
       downloading: count("downloading"),
+      processing: count("processing"),
       queued: count("queued"),
       paused: count("paused"),
       all: tasks.length,
@@ -156,7 +157,7 @@ function App() {
   const panelTasks = useMemo(() => {
     const match = (task: DownloadTask) => {
       const status = task.status.toLowerCase();
-      if (panelFilter === "active") return status === "downloading" || status === "queued" || status === "paused";
+      if (panelFilter === "active") return status === "downloading" || status === "processing" || status === "queued" || status === "paused";
       if (panelFilter === "completed") return status === "completed";
       return status === "failed" || status === "cancelled";
     };
@@ -637,6 +638,22 @@ function App() {
     setCoverTask(task);
   }
 
+  async function processTaskVideo(task: DownloadTask) {
+    await runBusy(`process-${task.taskId}`, async () => {
+      try {
+        const updated = await api.processVideo(task.taskId);
+        mergeTaskUpdate(updated);
+        notify(
+          updated.error || "视频处理完成，已替换原路径文件。",
+          updated.error ? "info" : "success",
+        );
+        return updated;
+      } finally {
+        await refreshTasks();
+      }
+    });
+  }
+
   async function copyTaskName(task: DownloadTask) {
     const name = task.fileName ?? "";
     if (!name) return;
@@ -905,6 +922,7 @@ function App() {
                     onAction={(task, action) => void actionTask(task, action)}
                     onOpenFolder={(task) => void openTaskFolder(task)}
                     onSetCover={chooseVideoCover}
+                    onProcessVideo={(task) => void processTaskVideo(task)}
                     onCopyName={(task) => void copyTaskName(task)}
                     onDelete={requestDelete}
                     onShowAll={() => navigate("tasks")}
@@ -937,6 +955,7 @@ function App() {
                 onAction={(task, action) => void actionTask(task, action)}
                 onOpenFolder={(task) => void openTaskFolder(task)}
                 onSetCover={chooseVideoCover}
+                onProcessVideo={(task) => void processTaskVideo(task)}
                 onCopyName={(task) => void copyTaskName(task)}
                 onDelete={requestDelete}
                 onClearFinished={requestClearFinished}

@@ -9,6 +9,7 @@
 - 浏览有权访问的聊天和频道，分页查看历史消息，按消息 ID 范围、媒体类别、文件格式及筛选表达式创建任务。
 - 在本机 SeaORM/SQLite 任务库保存下载状态、分块完成摘要和重试信息；支持排队、速度和剩余量、暂停、继续、取消、重试、历史列表及打开文件位置。
 - Telegram 原生下载使用有界队列、单文件分块并发、请求节奏控制、重试、file reference 刷新、分块摘要校验和临时文件原子提交。
+- 视频下载完成后自动用 SVT-AV1 CRF 20 分段处理，校验通过且确实变小后替换原路径并删除旧文件；编码片段可跨应用重启续跑，处理失败时保留原文件与已完成的临时片段。已完成的视频任务也可点行内视频按钮继续或重新处理，成功后清理临时片段。
 - 为可下载消息注入“下载”按钮；桥接只接受聊天 ID、消息 ID 与媒体类型，Rust 重新读取消息并检查访问权限。
 - 支持 rclone 云上传队列、进度、重试、取消、可选压缩以及按设置清理本地副本。
 - 可将已完成文件发送为 Telegram 文档，也可将单条可转发消息转发到数字 ID 指定的聊天。
@@ -18,6 +19,8 @@
 ## 安装与首次使用
 
 Windows 安装包由 GitHub Actions 生成，构建成功后可在 workflow 的 artifact 下载 `.msi` 或 NSIS `.exe`。本地构建产物位于 `src-tauri/target/release/bundle/msi/` 和 `src-tauri/target/release/bundle/nsis/`。应用使用系统 WebView2 Runtime 显示 Telegram Web。
+
+安装包包含 LGPL 版 FFmpeg、ffprobe 与 SVT-AV1；`npm run dev`、`npm run build` 会自动准备 Windows x64 编码器资源。本地处理视频需要联网下载上游工具包。
 
 首次启动时：
 
@@ -86,3 +89,4 @@ GitHub Actions 工作流位于 `.github/workflows/desktop.yml`，在 Windows x64
 ## 许可证
 
 桌面客户端代码按仓库根目录 MIT 许可证发布。第三方 Rust/JavaScript 依赖保留其各自许可证；发布前应从锁定依赖清单生成并审查随安装包分发的 NOTICE/许可证清单。
+随包 FFmpeg 使用 LGPL 共享构建，许可证文件随编码器资源一同分发；FFmpeg 构建及其启用组件以对应的上游许可证为准。
