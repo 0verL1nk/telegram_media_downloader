@@ -317,7 +317,9 @@ pub async fn compress_replace(
     let concat_path = work_dir.join("concat.txt");
     let mut concat = String::new();
     for index in 0..segment_count {
-        concat.push_str(&format!("file 'segment-{index:06}.mkv'\n"));
+        concat.push_str(&ffconcat_file_entry(
+            &work_dir.join(format!("segment-{index:06}.mkv")),
+        ));
     }
     fs::write(&concat_path, concat).await?;
     emit_progress(app, task_id, 0.92);
@@ -356,6 +358,7 @@ pub async fn compress_replace(
             OsStr::new("copy"),
         ])
         .arg(&candidate)
+        .current_dir(&work_dir)
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -541,6 +544,13 @@ fn work_directory(source: &Path) -> Result<PathBuf> {
         .and_then(OsStr::to_str)
         .context("视频文件名无效")?;
     Ok(parent.join(format!(".{file_name}.tmd-parts")))
+}
+
+fn ffconcat_file_entry(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let path = path.strip_prefix("\\\\?\\").unwrap_or(path.as_ref());
+    let path = path.replace('\\', "/").replace('\'', "'\\''");
+    format!("file '{path}'\n")
 }
 
 async fn probe(ffprobe: &Path, path: &Path) -> Result<Probe> {
