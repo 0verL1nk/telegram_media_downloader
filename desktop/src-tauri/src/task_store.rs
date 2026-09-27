@@ -67,7 +67,7 @@ impl TaskStore {
             .min_connections(1)
             .connect_timeout(Duration::from_secs(20))
             .sqlx_logging(false);
-        options.map_sqlx_sqlite_opts(|sqlite| {
+        options.map_sqlx_sqlite_opts(move |sqlite| {
             sqlite
                 .foreign_keys(true)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
