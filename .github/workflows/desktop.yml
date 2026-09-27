@@ -15,11 +15,17 @@ on:
       - "desktop/**"
       - "docs/**"
       - ".github/workflows/desktop.yml"
+  # 每天预热一次 release 档编译缓存(见 warm-release-cache:缓存按 ref 隔离,
+  # 只有默认分支保存的缓存才能被 tag 运行恢复)。
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 jobs:
   checks:
     name: Windows x64 checks
+    # 定时任务只跑缓存预热,不做重复的检查。
+    if: github.event_name != 'schedule'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +56,56 @@ jobs:
         run: cargo test --locked
       # 安装包只在 tag 的 release 任务里构建并签名,这里不做重复编译。
 
+  # 预热 release 档编译缓存:Action 缓存按 ref 隔离,tag 运行保存的缓存只有同一个
+  # tag 才能恢复,而默认分支(master)保存的缓存可以被任何 ref 恢复。所以由这里
+  # (master 作用域)编译一次 release 并保存缓存,release 任务只做只读恢复。
+  warm-release-cache:
+    name: Warm release cache
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore cargo home
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-cargo-home-
+      - name: Restore release target dir
+        uses: actions/cache/restore@v4
+        with:
+          path: desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-release-target-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-cargo-release-target-
+      - name: Install frontend packages
+        working-directory: desktop
+        run: npm ci
+      # --no-bundle 只做 release 编译(与 tauri-action 的构建环境一致),
+      # 安装包仍然只由发布任务打包。
+      - name: Build release profile
+        working-directory: desktop
+        run: npx tauri build --no-bundle
+      - name: Save cargo home
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ github.run_id }}
+      - name: Save release target dir
+        uses: actions/cache/save@v4
+        with:
+          path: desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-release-target-${{ github.run_id }}
+
   release:
     name: Publish signed release
     if: startsWith(github.ref, 'refs/tags/')
@@ -65,26 +121,23 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      # release 任务不用 Swatinem/rust-cache:它在缓存键完全命中时会跳过回写
-      # ("Cache up-to-date."),而 checks 先存下的只有 debug 档产物 —— 两头一夹,
-      # release 档产物永远进不了缓存,每次发版都要从零全量重编 release。
-      # 改用原生 actions/cache:key 里带 run_id 保证本次必定回写,
-      # restore-keys 前缀保证下次发布能取到上一次的 release 档产物。
-      - name: Cache cargo home
-        uses: actions/cache@v4
+      # 这里只做只读恢复(actions/cache/restore):缓存按 ref 隔离,tag 运行保存的
+      # 缓存对其他 tag 完全不可见,写入只会白占配额。缓存的写入统一交给
+      # warm-release-cache(master 作用域,每天预热),release 任务只负责消费。
+      - name: Restore cargo home
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-home-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
-      - name: Cache release profile target dir
-        uses: actions/cache@v4
+          key: ${{ runner.os }}-cargo-home-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-cargo-home-
+      - name: Restore release profile target dir
+        uses: actions/cache/restore@v4
         with:
           path: desktop/src-tauri/target
-          key: ${{ runner.os }}-cargo-release-target-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-target-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}-
-            ${{ runner.os }}-cargo-release-target-
+          key: ${{ runner.os }}-cargo-release-target-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-cargo-release-target-
       - name: Install frontend packages
         working-directory: desktop
         run: npm ci
@@ -109,6 +162,11 @@ jobs:
           updaterJsonPreferNsis: true
           args: --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
+# 缓存模型(Action 缓存按 ref 隔离):
+# - tag 运行保存的缓存只有同一个 tag 能再取到;默认分支保存的缓存可被任何 ref 恢复。
+# - 因此 release 任务只读恢复,warm-release-cache(master,每日)负责编译并保存 release 档缓存。
+# - checks 任务用 Swatinem/rust-cache 自带的"去掉锁哈希"回退,天然跨版本恢复。
+#
 # 发布流程:更新 desktop/src-tauri/tauri.conf.json 与 desktop/package.json 的版本,
 # 提交后打标签并推送:`git tag v0.2.1 && git push origin v0.2.1`
 # 打标签会触发 checks 再进入 release:tauri-action 构建 MSI/NSIS 安装包(附带 .sig 签名),
