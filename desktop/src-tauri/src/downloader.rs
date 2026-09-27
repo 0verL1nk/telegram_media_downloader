@@ -687,7 +687,11 @@ impl DownloadManager {
                         ));
                         processing_error = Some(detail.clone());
                         self.shared
-                            .log("warn", DOWNLOAD_LOG_TARGET, format!("任务 {task_id} {detail}"))
+                            .log(
+                                "warn",
+                                DOWNLOAD_LOG_TARGET,
+                                format!("任务 {task_id} {detail}"),
+                            )
                             .await;
                     }
                 }
@@ -701,7 +705,9 @@ impl DownloadManager {
                         .await;
                 }
                 Err(error) => {
-                    let detail = safe_error(&format!("视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"));
+                    let detail = safe_error(&format!(
+                        "视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"
+                    ));
                     processing_error = Some(detail.clone());
                     self.shared
                         .log(
@@ -858,7 +864,9 @@ impl DownloadManager {
                 None,
             ),
             Err(error) => {
-                let detail = safe_error(&format!("视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"));
+                let detail = safe_error(&format!(
+                    "视频处理未完整完成；若替换阶段失败，原视频会保留：{error:#}"
+                ));
                 self.shared
                     .log(
                         "warn",

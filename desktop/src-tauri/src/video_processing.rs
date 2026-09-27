@@ -116,10 +116,7 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
     }
     let (ffmpeg, ffprobe) = resolve_tools(app)?;
     let before = probe(&ffprobe, source).await?;
-    let video = before
-        .streams
-        .first()
-        .context("原视频没有可读取的视频流")?;
+    let video = before.streams.first().context("原视频没有可读取的视频流")?;
     if video.codec_name.as_deref() == Some("av1") {
         let work_dir = work_directory(source)?;
         if work_dir.exists() {
@@ -139,7 +136,11 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .context("无法读取原视频时长，不能创建可恢复的编码分段")?;
     let old_size = fs::metadata(source).await?.len();
-    let modified = fs::metadata(source).await?.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let modified = fs::metadata(source)
+        .await?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
     let work_dir = work_directory(source)?;
     fs::create_dir_all(&work_dir).await?;
     let manifest_path = work_dir.join("manifest.json");
@@ -187,9 +188,37 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
         let start_arg = format!("{start:.3}");
         let duration_arg = format!("{segment_duration:.3}");
         let encode = Command::new(&ffmpeg)
-            .args([OsStr::new("-hide_banner"), OsStr::new("-loglevel"), OsStr::new("error"), OsStr::new("-nostdin"), OsStr::new("-y"), OsStr::new("-ss"), OsStr::new(&start_arg), OsStr::new("-i")])
+            .args([
+                OsStr::new("-hide_banner"),
+                OsStr::new("-loglevel"),
+                OsStr::new("error"),
+                OsStr::new("-nostdin"),
+                OsStr::new("-y"),
+                OsStr::new("-ss"),
+                OsStr::new(&start_arg),
+                OsStr::new("-i"),
+            ])
             .arg(source)
-            .args([OsStr::new("-t"), OsStr::new(&duration_arg), OsStr::new("-map"), OsStr::new("0:v:0"), OsStr::new("-an"), OsStr::new("-sn"), OsStr::new("-c:v"), OsStr::new("libsvtav1"), OsStr::new("-preset"), OsStr::new("8"), OsStr::new("-crf"), OsStr::new("20"), OsStr::new("-svtav1-params"), OsStr::new("tune=0"), OsStr::new("-fps_mode"), OsStr::new("passthrough"), OsStr::new("-f"), OsStr::new("matroska")])
+            .args([
+                OsStr::new("-t"),
+                OsStr::new(&duration_arg),
+                OsStr::new("-map"),
+                OsStr::new("0:v:0"),
+                OsStr::new("-an"),
+                OsStr::new("-sn"),
+                OsStr::new("-c:v"),
+                OsStr::new("libsvtav1"),
+                OsStr::new("-preset"),
+                OsStr::new("8"),
+                OsStr::new("-crf"),
+                OsStr::new("20"),
+                OsStr::new("-svtav1-params"),
+                OsStr::new("tune=0"),
+                OsStr::new("-fps_mode"),
+                OsStr::new("passthrough"),
+                OsStr::new("-f"),
+                OsStr::new("matroska"),
+            ])
             .arg(&segment)
             .kill_on_drop(true)
             .stdout(Stdio::null())
@@ -199,8 +228,19 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
             .context("无法启动 FFmpeg 分段编码")?;
         if !encode.status.success() {
             let _ = fs::remove_file(&segment).await;
-            let detail = String::from_utf8_lossy(&encode.stderr).trim().chars().take(500).collect::<String>();
-            bail!("FFmpeg 分段编码失败{}", if detail.is_empty() { String::new() } else { format!("：{detail}") });
+            let detail = String::from_utf8_lossy(&encode.stderr)
+                .trim()
+                .chars()
+                .take(500)
+                .collect::<String>();
+            bail!(
+                "FFmpeg 分段编码失败{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{detail}")
+                }
+            );
         }
         if !segment_is_valid(&ffmpeg, &ffprobe, &segment, width, height, segment_duration).await {
             let _ = fs::remove_file(&segment).await;
@@ -216,11 +256,39 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
     }
     fs::write(&concat_path, concat).await?;
     let mux = Command::new(&ffmpeg)
-        .args([OsStr::new("-hide_banner"), OsStr::new("-loglevel"), OsStr::new("error"), OsStr::new("-nostdin"), OsStr::new("-y"), OsStr::new("-f"), OsStr::new("concat"), OsStr::new("-safe"), OsStr::new("0"), OsStr::new("-i")])
+        .args([
+            OsStr::new("-hide_banner"),
+            OsStr::new("-loglevel"),
+            OsStr::new("error"),
+            OsStr::new("-nostdin"),
+            OsStr::new("-y"),
+            OsStr::new("-f"),
+            OsStr::new("concat"),
+            OsStr::new("-safe"),
+            OsStr::new("0"),
+            OsStr::new("-i"),
+        ])
         .arg(&concat_path)
         .arg("-i")
         .arg(source)
-        .args([OsStr::new("-map"), OsStr::new("0:v:0"), OsStr::new("-map"), OsStr::new("1:a?"), OsStr::new("-map"), OsStr::new("1:s?"), OsStr::new("-map_metadata"), OsStr::new("1"), OsStr::new("-map_chapters"), OsStr::new("1"), OsStr::new("-c:v"), OsStr::new("copy"), OsStr::new("-c:a"), OsStr::new("copy"), OsStr::new("-c:s"), OsStr::new("copy")])
+        .args([
+            OsStr::new("-map"),
+            OsStr::new("0:v:0"),
+            OsStr::new("-map"),
+            OsStr::new("1:a?"),
+            OsStr::new("-map"),
+            OsStr::new("1:s?"),
+            OsStr::new("-map_metadata"),
+            OsStr::new("1"),
+            OsStr::new("-map_chapters"),
+            OsStr::new("1"),
+            OsStr::new("-c:v"),
+            OsStr::new("copy"),
+            OsStr::new("-c:a"),
+            OsStr::new("copy"),
+            OsStr::new("-c:s"),
+            OsStr::new("copy"),
+        ])
         .arg(&candidate)
         .kill_on_drop(true)
         .stdout(Stdio::null())
@@ -230,8 +298,19 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
         .context("无法启动 FFmpeg 最终封装")?;
     if !mux.status.success() {
         let _ = fs::remove_file(&candidate).await;
-        let detail = String::from_utf8_lossy(&mux.stderr).trim().chars().take(500).collect::<String>();
-        bail!("FFmpeg 最终封装失败{}", if detail.is_empty() { String::new() } else { format!("：{detail}") });
+        let detail = String::from_utf8_lossy(&mux.stderr)
+            .trim()
+            .chars()
+            .take(500)
+            .collect::<String>();
+        bail!(
+            "FFmpeg 最终封装失败{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("：{detail}")
+            }
+        );
     }
 
     let new_size = match fs::metadata(&candidate).await {
@@ -243,7 +322,9 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
     };
     if new_size >= old_size {
         let _ = fs::remove_file(&candidate).await;
-        fs::remove_dir_all(&work_dir).await.context("转码结果未变小，且无法清理临时分段")?;
+        fs::remove_dir_all(&work_dir)
+            .await
+            .context("转码结果未变小，且无法清理临时分段")?;
         return Ok(None);
     }
 
@@ -299,25 +380,60 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
     }
 
     replace_with_rollback(source, &candidate).await?;
-    fs::remove_dir_all(&work_dir).await.context("视频已替换，但无法清理临时分段")?;
+    fs::remove_dir_all(&work_dir)
+        .await
+        .context("视频已替换，但无法清理临时分段")?;
     Ok(Some(Replacement { old_size, new_size }))
 }
 
-async fn segment_is_valid(ffmpeg: &Path, ffprobe: &Path, path: &Path, width: u32, height: u32, expected_duration: f64) -> bool {
-    let Ok(metadata) = fs::metadata(path).await else { return false; };
-    if metadata.len() == 0 { return false; }
-    let Ok(probe) = probe(ffprobe, path).await else { return false; };
-    let Some(video) = probe.streams.first() else { return false; };
+async fn segment_is_valid(
+    ffmpeg: &Path,
+    ffprobe: &Path,
+    path: &Path,
+    width: u32,
+    height: u32,
+    expected_duration: f64,
+) -> bool {
+    let Ok(metadata) = fs::metadata(path).await else {
+        return false;
+    };
+    if metadata.len() == 0 {
+        return false;
+    }
+    let Ok(probe) = probe(ffprobe, path).await else {
+        return false;
+    };
+    let Some(video) = probe.streams.first() else {
+        return false;
+    };
     let metadata_valid = video.codec_name.as_deref() == Some("av1")
         && video.width == Some(width)
         && video.height == Some(height)
-        && probe.format.duration.as_deref().and_then(|v| v.parse::<f64>().ok())
+        && probe
+            .format
+            .duration
+            .as_deref()
+            .and_then(|v| v.parse::<f64>().ok())
             .is_some_and(|duration| (duration - expected_duration).abs() <= 1.5);
-    if !metadata_valid { return false; }
+    if !metadata_valid {
+        return false;
+    }
     Command::new(ffmpeg)
-        .args([OsStr::new("-v"), OsStr::new("error"), OsStr::new("-xerror"), OsStr::new("-nostdin"), OsStr::new("-i")])
+        .args([
+            OsStr::new("-v"),
+            OsStr::new("error"),
+            OsStr::new("-xerror"),
+            OsStr::new("-nostdin"),
+            OsStr::new("-i"),
+        ])
         .arg(path)
-        .args([OsStr::new("-map"), OsStr::new("0:v:0"), OsStr::new("-f"), OsStr::new("null"), OsStr::new(if cfg!(windows) { "NUL" } else { "/dev/null" })])
+        .args([
+            OsStr::new("-map"),
+            OsStr::new("0:v:0"),
+            OsStr::new("-f"),
+            OsStr::new("null"),
+            OsStr::new(if cfg!(windows) { "NUL" } else { "/dev/null" }),
+        ])
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -328,7 +444,10 @@ async fn segment_is_valid(ffmpeg: &Path, ffprobe: &Path, path: &Path, width: u32
 
 fn work_directory(source: &Path) -> Result<PathBuf> {
     let parent = source.parent().context("视频没有父目录")?;
-    let file_name = source.file_name().and_then(OsStr::to_str).context("视频文件名无效")?;
+    let file_name = source
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("视频文件名无效")?;
     Ok(parent.join(format!(".{file_name}.tmd-parts")))
 }
 
@@ -365,7 +484,9 @@ fn resolve_tools(app: &AppHandle) -> Result<(PathBuf, PathBuf)> {
         .or_else(|| sibling_tool("ffmpeg.exe"))
         .or_else(|| find_on_path("ffmpeg.exe"))
         .or_else(|| find_on_path("ffmpeg"))
-        .ok_or_else(|| anyhow!("未找到 FFmpeg；请将 ffmpeg.exe 加入 PATH，或设置 TMD_FFMPEG_PATH"))?;
+        .ok_or_else(|| {
+            anyhow!("未找到 FFmpeg；请将 ffmpeg.exe 加入 PATH，或设置 TMD_FFMPEG_PATH")
+        })?;
     let sibling = ffmpeg.with_file_name("ffprobe.exe");
     let ffprobe = if sibling.is_file() {
         sibling
@@ -385,8 +506,8 @@ fn resource_tool(app: &AppHandle, name: &str) -> Option<PathBuf> {
         root.join("resources").join("ffmpeg").join(name),
         root.join(name),
     ]
-        .into_iter()
-        .find(|path| path.is_file())
+    .into_iter()
+    .find(|path| path.is_file())
 }
 
 fn sibling_tool(name: &str) -> Option<PathBuf> {
@@ -418,7 +539,10 @@ async fn replace_with_rollback(source: &Path, candidate: &Path) -> Result<()> {
         .extension()
         .and_then(OsStr::to_str)
         .context("视频缺少扩展名")?;
-    let stem = source.file_stem().and_then(OsStr::to_str).unwrap_or("video");
+    let stem = source
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("video");
     let backup = source.with_file_name(format!(
         ".{stem}.tmd-backup-{}.{}",
         Uuid::new_v4(),
@@ -429,7 +553,10 @@ async fn replace_with_rollback(source: &Path, candidate: &Path) -> Result<()> {
         .context("无法安全暂存原视频")?;
     if let Err(error) = fs::rename(candidate, source).await {
         if let Err(restore_error) = fs::rename(&backup, source).await {
-            bail!("写入转码结果失败({error})，且恢复原视频失败({restore_error})；原视频保存在 {}", backup.display());
+            bail!(
+                "写入转码结果失败({error})，且恢复原视频失败({restore_error})；原视频保存在 {}",
+                backup.display()
+            );
         }
         return Err(error).context("无法将转码结果替换到原路径；原视频已恢复");
     }
@@ -439,13 +566,19 @@ async fn replace_with_rollback(source: &Path, candidate: &Path) -> Result<()> {
         if fs::remove_file(source).await.is_ok() && fs::rename(&backup, source).await.is_ok() {
             bail!("无法删除旧视频备份，已恢复原视频：{error}");
         }
-        bail!("无法删除旧视频备份；新视频位于原路径，旧视频备份保留在 {}：{error}", backup.display());
+        bail!(
+            "无法删除旧视频备份；新视频位于原路径，旧视频备份保留在 {}：{error}",
+            backup.display()
+        );
     }
     Ok(())
 }
 
 fn durations_match(before: Option<&str>, after: Option<&str>) -> bool {
-    match (before.and_then(|value| value.parse::<f64>().ok()), after.and_then(|value| value.parse::<f64>().ok())) {
+    match (
+        before.and_then(|value| value.parse::<f64>().ok()),
+        after.and_then(|value| value.parse::<f64>().ok()),
+    ) {
         (Some(before), Some(after)) => (before - after).abs() <= 0.5,
         _ => false,
     }

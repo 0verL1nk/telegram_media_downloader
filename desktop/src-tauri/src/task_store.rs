@@ -494,9 +494,7 @@ impl TaskStore {
         for (status, count, bytes, speed) in rows {
             match status.as_str() {
                 "queued" | "paused" => stats.queued_downloads += count.max(0) as usize,
-                "downloading" | "processing" => {
-                    stats.active_downloads += count.max(0) as usize
-                }
+                "downloading" | "processing" => stats.active_downloads += count.max(0) as usize,
                 "completed" => stats.completed_downloads += count.max(0) as usize,
                 "failed" => stats.failed_downloads += count.max(0) as usize,
                 _ => {}
