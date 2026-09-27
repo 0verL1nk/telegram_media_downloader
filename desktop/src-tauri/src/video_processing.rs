@@ -103,6 +103,8 @@ struct ProbeStream {
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    r_frame_rate: Option<String>,
+    avg_frame_rate: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +199,7 @@ pub async fn compress_replace(
         .and_then(|duration| duration.parse::<f64>().ok())
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .context("无法读取原视频时长，不能创建可恢复的编码分段")?;
+    let segment_seconds = aligned_segment_seconds(video).unwrap_or(SEGMENT_SECONDS);
     let old_size = fs::metadata(source).await?.len();
     let modified = fs::metadata(source)
         .await?
@@ -212,7 +215,11 @@ pub async fn compress_replace(
         duration_seconds,
         width,
         height,
-        profile: "svtav1-p8-crf20-tune0-v1".to_owned(),
+        profile: if (segment_seconds - SEGMENT_SECONDS).abs() <= f64::EPSILON {
+            "svtav1-p8-crf20-tune0-v1".to_owned()
+        } else {
+            format!("svtav1-p8-crf20-tune0-frame-aligned-{segment_seconds:.6}-v2")
+        },
     };
     let can_resume = match fs::read(&manifest_path).await {
         Ok(bytes) => serde_json::from_slice::<EncodeManifest>(&bytes)
@@ -232,7 +239,7 @@ pub async fn compress_replace(
         fs::create_dir_all(&work_dir).await?;
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?).await?;
     }
-    let segment_count = (duration_seconds / SEGMENT_SECONDS).ceil() as usize;
+    let segment_count = (duration_seconds / segment_seconds).ceil() as usize;
     if segment_count == 0 || segment_count > 100_000 {
         bail!("视频时长超出可处理范围");
     }
@@ -241,8 +248,8 @@ pub async fn compress_replace(
     // Encode fixed-size, independently decodable segments. Completed segments survive
     // app exits and are reused; only the segment interrupted in progress is repeated.
     for index in 0..segment_count {
-        let start = index as f64 * SEGMENT_SECONDS;
-        let segment_duration = (duration_seconds - start).min(SEGMENT_SECONDS);
+        let start = index as f64 * segment_seconds;
+        let segment_duration = (duration_seconds - start).min(segment_seconds);
         let segment = work_dir.join(format!("segment-{index:06}.mkv"));
         if segment_is_valid(&ffmpeg, &ffprobe, &segment, width, height, segment_duration).await {
             emit_progress(
@@ -253,8 +260,8 @@ pub async fn compress_replace(
             continue;
         }
         let _ = fs::remove_file(&segment).await;
-        let start_arg = format!("{start:.3}");
-        let duration_arg = format!("{segment_duration:.3}");
+        let start_arg = format!("{start:.6}");
+        let duration_arg = format!("{segment_duration:.6}");
         let encode = media_tool_command(&ffmpeg)
             .args([
                 OsStr::new("-hide_banner"),
@@ -447,16 +454,32 @@ pub async fn compress_replace(
         .streams
         .first()
         .context("转码结果没有可读取的视频流")?;
-    if encoded_video.codec_name.as_deref() != Some("av1")
-        || encoded_video.width != Some(width)
-        || encoded_video.height != Some(height)
-        || !durations_match(
-            before.format.duration.as_deref(),
-            after.format.duration.as_deref(),
-        )
-    {
+    let validation_failure = if encoded_video.codec_name.as_deref() != Some("av1") {
+        Some(format!(
+            "编码应为 AV1，实际为 {}",
+            encoded_video.codec_name.as_deref().unwrap_or("未知")
+        ))
+    } else if encoded_video.width != Some(width) || encoded_video.height != Some(height) {
+        Some(format!(
+            "分辨率应为 {width}×{height}，实际为 {}×{}",
+            encoded_video.width.unwrap_or_default(),
+            encoded_video.height.unwrap_or_default()
+        ))
+    } else if !durations_match(
+        before.format.duration.as_deref(),
+        after.format.duration.as_deref(),
+    ) {
+        Some(format!(
+            "时长不匹配（原片 {} 秒，转码结果 {} 秒）",
+            before.format.duration.as_deref().unwrap_or("未知"),
+            after.format.duration.as_deref().unwrap_or("未知")
+        ))
+    } else {
+        None
+    };
+    if let Some(detail) = validation_failure {
         let _ = fs::remove_file(&candidate).await;
-        bail!("转码结果的编码、分辨率或时长校验未通过");
+        bail!("转码结果校验未通过：{detail}");
     }
 
     // Decode the complete candidate before changing the original path.
@@ -715,6 +738,32 @@ async fn replace_with_rollback(source: &Path, candidate: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Align independently encoded cuts to whole frames for constant-frame-rate sources.
+/// Otherwise every seek can round to the next frame, accumulating one frame of overlap
+/// per segment and causing the final duration check to reject a valid encode.
+fn aligned_segment_seconds(video: &ProbeStream) -> Option<f64> {
+    let nominal = parse_frame_rate(video.r_frame_rate.as_deref()?)?;
+    let average = parse_frame_rate(video.avg_frame_rate.as_deref()?)?;
+    if (nominal - average).abs() > 0.000_001 {
+        return None;
+    }
+    let frames = (SEGMENT_SECONDS * nominal).ceil();
+    let duration = frames / nominal;
+    (duration.is_finite() && duration > 0.0).then_some(duration)
+}
+
+fn parse_frame_rate(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    if !numerator.is_finite() || !denominator.is_finite() || numerator <= 0.0 || denominator <= 0.0
+    {
+        return None;
+    }
+    let rate = numerator / denominator;
+    (rate.is_finite() && rate <= 1000.0).then_some(rate)
 }
 
 fn durations_match(before: Option<&str>, after: Option<&str>) -> bool {
