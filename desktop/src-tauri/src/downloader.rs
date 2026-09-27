@@ -335,11 +335,19 @@ impl DownloadManager {
             supported_chunk_size_kib(settings.concurrency.chunk_size_kib)
         };
         let chunk_size_bytes = chunk_size_kib as u64 * 1024;
-        let max_concurrency = settings
+        let mut max_concurrency = settings
             .concurrency
             .per_file_chunks
             .clamp(MIN_PER_FILE_CHUNKS, MAX_PER_FILE_CHUNKS);
+        let settings_cap = max_concurrency;
         let adaptive_enabled = settings.concurrency.adaptive;
+        // 公平份额:多个任务并行时按活跃任务数均分全局流预算 —— 先启动的任务
+        // 不该把 24 条流全占住,让后启动的任务只剩 1 路。任务变少时份额自动放宽。
+        if adaptive_enabled {
+            let active_count = self.active.lock().await.len().max(1);
+            let fair_share = (GLOBAL_MAX_STREAMS / active_count).max(MIN_ADAPTIVE_CONCURRENCY);
+            max_concurrency = max_concurrency.min(fair_share);
+        }
         // 自适应模式从较小并发起步,由控制器按投递率爬升;固定模式直接用设置值。
         let concurrency = if adaptive_enabled {
             max_concurrency.min(INITIAL_CONCURRENCY)
@@ -477,6 +485,7 @@ impl DownloadManager {
             total_bytes,
             progress_receiver,
             adaptive_runtime,
+            Arc::clone(&self.active),
         );
         active.insert(
             task_id.to_owned(),
@@ -497,7 +506,7 @@ impl DownloadManager {
                 "info",
                 DOWNLOAD_LOG_TARGET,
                 format!(
-                    "任务 {task_id} 开始分块下载,共 {total_bytes} 字节,缺 {missing_len} 块;分块 {chunk_size_kib} KiB × 并发 {initial_width}(上限 {max_concurrency})",
+                    "任务 {task_id} 开始分块下载,共 {total_bytes} 字节,缺 {missing_len} 块;分块 {chunk_size_kib} KiB × 并发 {initial_width}(上限 {max_concurrency},设置 {settings_cap})",
                     missing_len = missing.len()
                 ),
             )
@@ -1086,6 +1095,7 @@ fn spawn_progress_watcher(
     total_bytes: u64,
     mut progress_events: broadcast::Receiver<()>,
     mut adaptive: Option<AdaptiveRuntime>,
+    active: Arc<AsyncMutex<HashMap<String, ActiveDownload>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut dirty = false;
@@ -1124,8 +1134,14 @@ fn spawn_progress_watcher(
                                 if rate > 0.0 && active_width > 0 {
                                     peak_per_stream = peak_per_stream.max(rate / active_width as f64);
                                 }
+                                // 增长也要守公平份额:活跃任务多时按人头均分全局预算。
+                                let share = {
+                                    let guard = active.lock().await;
+                                    (GLOBAL_MAX_STREAMS / guard.len().max(1))
+                                        .max(MIN_ADAPTIVE_CONCURRENCY)
+                                };
                                 if let Some(width) = runtime.controller.sample(Instant::now(), rate)
-                                    && let Some(applied) = runtime.apply(width)
+                                    && let Some(applied) = runtime.apply(width.min(share))
                                 {
                                     active_width = applied;
                                     let _ = shared.app.emit(
@@ -1175,7 +1191,18 @@ async fn persist_learned_rate(shared: &Arc<SharedState>, bytes_per_second: u64) 
     let layout = shared.layout.read().await.clone();
     if let Err(error) = storage::save_settings(&layout, &settings) {
         tracing::warn!(target: "desktop::download", "学习速率持久化失败:{error:#}");
+        return;
     }
+    shared
+        .log(
+            "info",
+            DOWNLOAD_LOG_TARGET,
+            format!(
+                "单路峰值速率已更新为 {:.1} MB/s(下一个任务按 BDP 选择分块大小)",
+                bytes_per_second as f64 / 1_048_576.0
+            ),
+        )
+        .await;
 }
 
 async fn publish_progress(shared: &SharedState, task_id: &str, total_bytes: u64) {
@@ -1325,9 +1352,12 @@ async fn join_download_children<T>(
     writer: JoinHandle<Result<T>>,
     watcher: JoinHandle<()>,
 ) -> Result<T> {
-    watcher.abort();
-    let _ = watcher.await;
-    writer.await.context("分块写入线程异常退出")?
+    let result = writer.await.context("分块写入线程异常退出");
+    // writer 退出后,它持有的进度广播发送端随之关闭,watcher 循环会自然结束并执行
+    // 收尾(单路峰值速率落盘、最终进度广播)。此前这里是 watcher.abort() —— 收尾
+    // 永远不执行,学习值因此从未写入,分块大小一直停在设置兜底值。
+    let _ = tokio::time::timeout(Duration::from_secs(2), watcher).await;
+    result?
 }
 
 /// 校验页面提交的文件名:去空白,限制长度,拒绝控制字符。

@@ -138,12 +138,14 @@ impl AdaptiveConcurrency {
             self.withdraw();
         } else if now.duration_since(self.improved_at) >= PROBE_INTERVAL
             && self.failed_probes < MAX_FAILED_PROBES
-            && self.width < self.limit()
+            && self.width < self.max
         {
-            // 平台期低频探测(BBR ProbeBW:不时试着要更多带宽),但不超过 ceiling。
+            // 平台期低频探测(BBR ProbeBW:不时试着要更多带宽)。
+            // 注意上限用 `max` 而不是 ceiling:ceiling 是"退避后不再快速冲回"的
+            // 护栏,不是禁止恢复的死墙 —— 否则在低并发上退避一次就永远卡死。
             self.baseline = rate;
             self.probing = true;
-            self.width = (self.width + 1).min(self.limit());
+            self.width = (self.width + 1).min(self.max);
         }
 
         if self.baseline == 0.0 {
@@ -201,6 +203,27 @@ mod tests {
         tick(&mut controller, t0, 4_000_000.0);
         let width = tick(&mut controller, t0 + Duration::from_secs(2), 1_000_000.0);
         assert_eq!(width, 2);
+    }
+
+    #[test]
+    fn probes_climb_back_after_a_backoff_even_under_the_ceiling() {
+        let mut controller = AdaptiveConcurrency::new(2, 8, 16);
+        let t0 = Instant::now();
+        let mut at = t0;
+        tick(&mut controller, at, 4_000_000.0);
+        // 速率回落 → 退避,ceiling 被压到退避前的宽度
+        at += Duration::from_secs(2);
+        let floor = tick(&mut controller, at, 1_000_000.0);
+        // 之后速率平稳:探针要能一步步爬回去,而不是被 ceiling 永久卡死
+        let mut max_seen = floor;
+        for _ in 0..12 {
+            at += PROBE_INTERVAL;
+            max_seen = max_seen.max(tick(&mut controller, at, 1_000_000.0));
+        }
+        assert!(
+            max_seen > floor,
+            "退避后必须能靠探测恢复:floor={floor} max={max_seen}"
+        );
     }
 
     #[test]

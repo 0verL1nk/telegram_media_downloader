@@ -24,10 +24,6 @@ const URL_STORE_KEY = 'tmd.mediaUrls.v1';
 /// 持久化条目的保留期(天):只用于控制缓存规模,不代表"链接有效期"——
 /// 链接是否失效由服务端决定,页面按 401/403 走既有的"重新打开媒体"提示。
 const URL_STORE_TTL_DAYS = 30;
-/// 启动扫描的最大条目数(避免一次性轰出上百个 IPC 查询)。
-const AUTO_RESUME_SCAN_LIMIT = 25;
-/// 启动扫描同时开跑的任务数上限(其余交给"打开媒体自动续传"和客户端操作)。
-const MAX_PARALLEL_AUTO_RESUME = 2;
 
 /** taskId → AbortController,由 webview-download-abort 事件触发中止。 */
 const controllers = new Map();
@@ -127,17 +123,19 @@ export function maybeAutoResume(fileName, state, cfg) {
   void runPipeline({ ...cached, fileName, cfg: cfg || globalThis.__INJECT_CONFIG__ || {} }).catch(() => undefined);
 }
 
-/** 启动扫描:缓存里对得上、且任务处于排队的文件,直接开跑(上限见常量)。 */
+/** 启动扫描:缓存里对得上、且任务处于排队的文件,全部开跑。
+ * 每个任务的并发受"分块并发上限"限制,Rust 端全局流预算会按活跃任务数自动均分,
+ * 这里的唯一约束是"确实缓存里有 URL"——启动时让所有排队任务都自愈比人为设一个
+ * 数字更符合"任务一旦排队就继续跑"的语义。
+ */
 export async function autoResumeQueued(cfg) {
   const config = cfg || globalThis.__INJECT_CONFIG__ || {};
   const cutoff = Date.now() - URL_STORE_TTL_DAYS * 86400_000;
   const candidates = [...mediaUrls.entries()]
     .filter(([, entry]) => !entry.savedAt || entry.savedAt >= cutoff)
-    .sort((a, b) => (b[1].savedAt ?? 0) - (a[1].savedAt ?? 0))
-    .slice(0, AUTO_RESUME_SCAN_LIMIT);
+    .sort((a, b) => (b[1].savedAt ?? 0) - (a[1].savedAt ?? 0));
   let resumed = 0;
   for (const [fileName, entry] of candidates) {
-    if (resumed >= MAX_PARALLEL_AUTO_RESUME) break;
     const state = await queryTaskState(fileName, config).catch(() => null);
     if (state && state.state === 'queued' && state.taskId && !controllers.has(state.taskId)) {
       diag(`boot auto-resume: ${fileName}`);
