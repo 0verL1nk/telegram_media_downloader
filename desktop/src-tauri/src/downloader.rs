@@ -77,8 +77,12 @@ const AUTO_RETRY_BASE: Duration = Duration::from_secs(5);
 const AUTO_RETRY_MAX: Duration = Duration::from_secs(300);
 /// 自动重试的次数上限(超过后停在失败态,等用户手动处理)。
 const AUTO_RETRY_LIMIT: u32 = 20;
-/// 全局页面抓取流预算:多文件并行时避免 3×16=48 条流触发 CDN 侧限流。
-const GLOBAL_MAX_STREAMS: usize = 24;
+/// 全局页面抓取流预算:不做硬编码上限 —— 直接复用设置里的"同时下载文件数"
+/// (`max_files`)。语义清晰:用户配几个文件并行就允许几条流,且每条流的并发
+/// 仍受每个文件自己的"分块并发上限"约束 —— 两者取较小者给任务。
+fn global_stream_cap(settings: &crate::models::Settings) -> usize {
+    settings.concurrency.max_files.clamp(1, MAX_FILE_SLOTS)
+}
 /// BDP 分块的档位上下限(KiB):下限摊薄请求开销,上限兼顾页面内存、IPC 拷贝
 /// 与末段进度粒度。
 const MIN_ADAPTIVE_CHUNK_KIB: usize = 256;
@@ -237,7 +241,7 @@ impl DownloadManager {
             shared,
             slots: Arc::new(Semaphore::new(limit)),
             active: Arc::new(AsyncMutex::new(HashMap::new())),
-            budget: Arc::new(StreamBudget::new(GLOBAL_MAX_STREAMS)),
+            budget: Arc::new(StreamBudget::new(limit)),
         };
         manager.spawn_watchdog();
         Ok(manager)
@@ -342,10 +346,11 @@ impl DownloadManager {
         let settings_cap = max_concurrency;
         let adaptive_enabled = settings.concurrency.adaptive;
         // 公平份额:多个任务并行时按活跃任务数均分全局流预算 —— 先启动的任务
-        // 不该把 24 条流全占住,让后启动的任务只剩 1 路。任务变少时份额自动放宽。
+        // 不该让先启动的任务把 24 条流全占住,让后启动的任务只剩 1 路。任务变少时份额自动放宽。
         if adaptive_enabled {
             let active_count = self.active.lock().await.len().max(1);
-            let fair_share = (GLOBAL_MAX_STREAMS / active_count).max(MIN_ADAPTIVE_CONCURRENCY);
+            let fair_share =
+                (global_stream_cap(&settings) / active_count).max(MIN_ADAPTIVE_CONCURRENCY);
             max_concurrency = max_concurrency.min(fair_share);
         }
         // 自适应模式从较小并发起步,由控制器按投递率爬升;固定模式直接用设置值。
@@ -1137,8 +1142,9 @@ fn spawn_progress_watcher(
                                 // 增长也要守公平份额:活跃任务多时按人头均分全局预算。
                                 let share = {
                                     let guard = active.lock().await;
-                                    (GLOBAL_MAX_STREAMS / guard.len().max(1))
-                                        .max(MIN_ADAPTIVE_CONCURRENCY)
+                                    let settings = shared.settings.read().await;
+                                    let cap = global_stream_cap(&settings);
+                                    (cap / guard.len().max(1)).max(MIN_ADAPTIVE_CONCURRENCY)
                                 };
                                 if let Some(width) = runtime.controller.sample(Instant::now(), rate)
                                     && let Some(applied) = runtime.apply(width.min(share))

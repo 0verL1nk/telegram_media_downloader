@@ -8,7 +8,7 @@ import { restoreMediaUrls, autoResumeQueued } from './downloader.js';
 
 (function main() {
   'use strict';
-  try { document.documentElement.setAttribute('data-tmd-inject', 'v0.3.7'); } catch (_e) { /* 忽略 */ }
+  try { document.documentElement.setAttribute('data-tmd-inject', 'v0.3.8'); } catch (_e) { /* 忽略 */ }
   diag(`boot: origin=${location.origin} href=${location.pathname} top=${window.top === window} hasTauri=${typeof window.__TAURI__ !== 'undefined'}`);
   if (window.top !== window) { diag('boot: skip — not top frame'); return; }
   const cfg = globalThis.__INJECT_CONFIG__ || {};
