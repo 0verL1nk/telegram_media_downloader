@@ -113,7 +113,10 @@ function App() {
   const pendingUpdateRef = useRef<Update | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const nativeWindow = getCurrentWindow();
+  // 窗口句柄必须跨渲染保持同一身份:它出现在 effect 依赖里,若每次渲染都新建,
+  // 任务进度刷新(350ms 一次)就会反复拆掉/重建 Telegram WebView 的同步 effect,
+  // 表现为 webview 持续闪烁。
+  const nativeWindow = useMemo(() => getCurrentWindow(), []);
   const telegramWebviewRef = useRef<HTMLDivElement | null>(null);
   const splitAreaRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -421,15 +424,15 @@ function App() {
       await webviewReady;
       if (!active || viewRef.current !== "telegram") return;
 
-      const scaleFactor = await nativeWindow.scaleFactor().catch(() => window.devicePixelRatio || 1);
-      if (!active || viewRef.current !== "telegram") return;
-      // DOMRect 是 CSS 像素;换算成 Tauri 逻辑像素。
-      const cssToLogical = (window.devicePixelRatio || scaleFactor) / scaleFactor;
+      // DOMRect 是 CSS 像素;主窗口缩放为 1 时 CSS 像素与 Tauri 逻辑像素一一对应,
+      // 不要按 devicePixelRatio / scaleFactor 再换算一次 —— 二者在多显示器 DPI
+      // 场景下可能不相等,会把 webview 放大出槽位、压在右侧任务面板上。
+      // 同时把 bounds 钳进视口,任何情况下都不越界。
       const bounds = {
-        x: rect.left * cssToLogical,
-        y: rect.top * cssToLogical,
-        width: rect.width * cssToLogical,
-        height: rect.height * cssToLogical,
+        x: Math.max(0, rect.left),
+        y: Math.max(0, rect.top),
+        width: Math.max(1, Math.min(rect.width, viewportWidth - Math.max(0, rect.left))),
+        height: Math.max(1, Math.min(rect.height, viewportHeight - Math.max(0, rect.top))),
       };
       const key = [bounds.x, bounds.y, bounds.width, bounds.height]
         .map((value) => Math.round(value * 100) / 100)
@@ -506,12 +509,16 @@ function App() {
     }).catch((error) => {
       if (active) setWebviewError(friendlyError(error));
     });
+    // 兜底自检:任何来源的错位(漏掉的事件、DPI 变化)最多 2 秒后被纠正;
+    // 矩形没变时只做一次同步测量,不发 IPC。
+    const driftCheck = window.setInterval(scheduleSync, 2000);
     scheduleSync();
 
     return () => {
       active = false;
       requested = false;
       if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      window.clearInterval(driftCheck);
       observer.disconnect();
       window.removeEventListener("resize", scheduleSync);
       window.removeEventListener("scroll", scheduleSync, true);
