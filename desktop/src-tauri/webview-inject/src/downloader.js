@@ -382,7 +382,7 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
   } catch (error) {
     if (stallReason) {
       diag(`pipeline: failed — ${stallReason}`);
-      await window.__TAURI__.core.invoke('fail_download', { taskId, error: stallReason }).catch(() => {});
+      await window.__TAURI__.core.invoke('fail_download', { taskId, error: stallReason, permanent: false }).catch(() => {});
       throw new Error(stallReason);
     }
     if (controller.signal.aborted || error?.name === 'AbortError') {
@@ -393,7 +393,12 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
     controller.abort(); // 停止其余在途 fetch,避免向已失败任务继续推送
     const message = friendlyFetchError(error);
     diag(`pipeline: failed — ${message}`);
-    await window.__TAURI__.core.invoke('fail_download', { taskId, error: message }).catch(() => {});
+    // 永久性失败(URL 过期/文件删除)重试没有意义;其余交给客户端自动重试。
+    await window.__TAURI__.core.invoke('fail_download', {
+      taskId,
+      error: message,
+      permanent: error instanceof PermanentError,
+    }).catch(() => {});
     throw error instanceof Error ? error : new Error(message);
   } finally {
     clearInterval(heartbeat);

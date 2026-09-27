@@ -72,6 +72,11 @@ const INITIAL_CONCURRENCY: usize = 4;
 const MIN_ADAPTIVE_CONCURRENCY: usize = 2;
 /// 自适应并发的投递率采样间隔。
 const ADAPT_SAMPLE: Duration = Duration::from_secs(2);
+/// 自动重试的首次退避与上限(指数增长:5s → 10s → 20s → …封顶 5 分钟)。
+const AUTO_RETRY_BASE: Duration = Duration::from_secs(5);
+const AUTO_RETRY_MAX: Duration = Duration::from_secs(300);
+/// 自动重试的次数上限(超过后停在失败态,等用户手动处理)。
+const AUTO_RETRY_LIMIT: u32 = 20;
 /// 全局页面抓取流预算:多文件并行时避免 3×16=48 条流触发 CDN 侧限流。
 const GLOBAL_MAX_STREAMS: usize = 24;
 /// BDP 分块的档位上下限(KiB):下限摊薄请求开销,上限兼顾页面内存、IPC 拷贝
@@ -653,13 +658,74 @@ impl DownloadManager {
         Ok(record)
     }
 
-    /// 页面侧失败(URL 过期、块级重试耗尽等):保留已校验分块,标记 `failed`。
-    pub async fn fail(&self, task_id: &str, error: &str) -> Result<TaskRecord> {
+    /// 页面侧失败(URL 失效、网络中断、抓取停滞等):保留已校验分块,标记 `failed`。
+    ///
+    /// `permanent` 为真表示重试不会有帮助(URL 过期/文件已删除),此时不做自动重试。
+    pub async fn fail(&self, task_id: &str, error: &str, permanent: bool) -> Result<TaskRecord> {
         if let Some(active) = self.detach(task_id).await {
             // writer 的错误只反映本地收尾细节;页面侧已给出更准确的失败原因。
             let _ = drain_active(active).await;
         }
-        self.mark_failed(task_id, error).await
+        let record = self.mark_failed(task_id, error).await?;
+        self.maybe_schedule_auto_retry(&record, permanent);
+        Ok(record)
+    }
+
+    /// 失败任务按指数退避自动重新排队(网络抖动恢复后无需用户干预)。
+    ///
+    /// 到点前任务若被取消/删除/手动重试,状态不再是 `failed`,本次调度自然作废。
+    fn maybe_schedule_auto_retry(&self, record: &TaskRecord, permanent: bool) {
+        if permanent || record.status != "failed" {
+            return;
+        }
+        let attempt = record.retry_count.saturating_add(1);
+        if attempt > AUTO_RETRY_LIMIT {
+            return;
+        }
+        let shared = Arc::clone(&self.shared);
+        let task_id = record.task_id.clone();
+        let file_name = record.file_name.clone();
+        tokio::spawn(async move {
+            let enabled = shared.settings.read().await.concurrency.auto_retry;
+            if !enabled {
+                return;
+            }
+            let delay = auto_retry_delay(attempt);
+            shared
+                .log(
+                    "info",
+                    DOWNLOAD_LOG_TARGET,
+                    format!(
+                        "任务 {task_id} 将在 {:.0} 秒后自动重试(第 {attempt} 次)",
+                        delay.as_secs_f64()
+                    ),
+                )
+                .await;
+            tokio::time::sleep(delay).await;
+            let Ok(Some(current)) = shared.store.get(&task_id).await else {
+                return;
+            };
+            if current.status != "failed" {
+                return; // 用户已取消/删除/手动重试
+            }
+            if let Err(error) = shared.store.set_status(&task_id, "queued", None).await {
+                shared
+                    .log(
+                        "warn",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("任务 {task_id} 自动重试排队失败:{error:#}"),
+                    )
+                    .await;
+                return;
+            }
+            shared.publish_task(&task_id).await;
+            if let Some(file_name) = file_name.filter(|name| !name.is_empty()) {
+                let _ = shared.app.emit(
+                    "webview-resume-request",
+                    serde_json::json!({ "taskId": task_id, "fileName": file_name }),
+                );
+            }
+        });
     }
 
     /// 删除任务记录:活动任务先按取消路径停住,再清理临时分块,最后删库。
@@ -1376,8 +1442,7 @@ fn supported_chunk_size_kib(requested: usize) -> usize {
         .unwrap_or(512)
 }
 
-/// 由 BDP(单路峰值速率 × 探测 RTT)估算下个任务的分块大小,并就近对齐到受支持档位。
-///
+/// 由 BDP(单路峰值速率 × 探测 RTT)估算下个任务的分块大小,并就近对齐到受支持档位。///
 /// 分块应不小于单路 BDP,否则一条流会在"等下一块"的空档里丢掉带宽;上限 1 MiB
 /// 兼顾页面内存、IPC 拷贝开销与末段进度粒度。返回 0 表示没有学习数据可用。
 fn bdp_chunk_size_kib(per_stream_bytes_per_second: u64, rtt_ms: u64) -> usize {
@@ -1386,6 +1451,12 @@ fn bdp_chunk_size_kib(per_stream_bytes_per_second: u64, rtt_ms: u64) -> usize {
     }
     let bdp_kib = (per_stream_bytes_per_second as f64 * rtt_ms as f64 / 1000.0 / 1024.0) as usize;
     supported_chunk_size_kib(bdp_kib.clamp(MIN_ADAPTIVE_CHUNK_KIB, MAX_ADAPTIVE_CHUNK_KIB))
+}
+
+/// 自动重试的退避时长:5s、10s、20s、40s… 封顶 5 分钟(attempt 从 1 开始)。
+fn auto_retry_delay(attempt: u32) -> Duration {
+    let factor = 1_u32 << attempt.saturating_sub(1).min(16);
+    (AUTO_RETRY_BASE * factor).min(AUTO_RETRY_MAX)
 }
 
 fn safe_error(value: &str) -> String {
@@ -1505,6 +1576,14 @@ mod tests {
         assert_eq!(supported_chunk_size_kib(4096), 1024);
         assert_eq!(supported_chunk_size_kib(300), 256);
         assert_eq!(supported_chunk_size_kib(192), 128);
+    }
+
+    #[test]
+    fn auto_retry_backoff_grows_and_caps() {
+        assert_eq!(auto_retry_delay(1), Duration::from_secs(5));
+        assert_eq!(auto_retry_delay(2), Duration::from_secs(10));
+        assert_eq!(auto_retry_delay(3), Duration::from_secs(20));
+        assert_eq!(auto_retry_delay(20), AUTO_RETRY_MAX);
     }
 
     #[test]

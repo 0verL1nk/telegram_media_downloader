@@ -563,12 +563,13 @@ pub async fn fail_download(
     state: State<'_, AppState>,
     task_id: String,
     error: String,
+    permanent: Option<bool>,
 ) -> Result<TaskRecord, String> {
     ensure_trusted_telegram_webview(&webview)?;
     validate_task_id(&task_id)?;
     state
         .downloads
-        .fail(&task_id, &error)
+        .fail(&task_id, &error, permanent.unwrap_or(false))
         .await
         .map_err(command_error)
 }

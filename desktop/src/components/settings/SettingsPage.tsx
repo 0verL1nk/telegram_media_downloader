@@ -205,6 +205,9 @@ export function SettingsPage({
             <Field label="自适应分块并发" hint="按实时投递率自动加减单文件并发(BBR 式探测 + 乘性退避),通常能跑满链路。">
               <Switch checked={concurrency.adaptive} onCheckedChange={(checked) => onConcurrencyChange({ adaptive: checked })} aria-label="自适应分块并发" />
             </Field>
+            <Field label="失败自动重试" hint="网络中断等情况按指数退避自动重试(5 秒起,最多 5 分钟一次);URL 失效等永久性失败不重试。">
+              <Switch checked={concurrency.autoRetry} onCheckedChange={(checked) => onConcurrencyChange({ autoRetry: checked })} aria-label="失败自动重试" />
+            </Field>
             <Field label="分块并发上限" hint="自适应模式的并发上限(1–16);关掉自适应后即固定并发数。">
               <Stepper value={concurrency.perFileChunks} min={1} max={16} onChange={(value) => onConcurrencyChange({ perFileChunks: value })} />
             </Field>

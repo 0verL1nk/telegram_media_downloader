@@ -10,6 +10,8 @@ export interface ConcurrencySettings {
   maxFiles: number;
   perFileChunks: number;
   adaptive: boolean;
+  /** 任务失败后自动重试(指数退避;永久性失败不重试)。 */
+  autoRetry: boolean;
   chunkSizeKib: number;
   requestTimeoutSeconds: number;
   retries: number;

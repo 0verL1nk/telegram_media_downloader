@@ -68,6 +68,8 @@ pub struct ConcurrencySettings {
     pub per_file_chunks: usize,
     /// 自适应并发(BBR 式投递率探测 + 乘性退避),默认开启。
     pub adaptive: bool,
+    /// 任务失败后自动重试(指数退避;永久性失败不重试),默认开启。
+    pub auto_retry: bool,
     pub chunk_size_kib: usize,
     pub request_timeout_seconds: u64,
     pub retries: u32,
@@ -83,6 +85,7 @@ impl Default for ConcurrencySettings {
             max_files: 3,
             per_file_chunks: 16,
             adaptive: true,
+            auto_retry: true,
             chunk_size_kib: 512,
             request_timeout_seconds: 45,
             retries: 5,
