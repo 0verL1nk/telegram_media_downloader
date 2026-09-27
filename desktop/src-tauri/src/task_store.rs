@@ -49,6 +49,10 @@ pub struct TaskStore {
 
 impl TaskStore {
     pub async fn open(path: &Path) -> Result<Self> {
+        Self::open_with_busy_timeout(path, Duration::from_secs(8)).await
+    }
+
+    async fn open_with_busy_timeout(path: &Path, busy_timeout: Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -67,7 +71,7 @@ impl TaskStore {
             sqlite
                 .foreign_keys(true)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-                .busy_timeout(Duration::from_secs(8))
+                .busy_timeout(busy_timeout)
         });
         let db = Database::connect(options)
             .await
@@ -707,43 +711,34 @@ mod tests {
     #[tokio::test]
     async fn update_progress_survives_an_occasional_busy_retry() {
         let dir = tempdir().unwrap();
-        let store = TaskStore::open(&dir.path().join("db.sqlite"))
+        let db_path = dir.path().join("db.sqlite");
+        let store = TaskStore::open_with_busy_timeout(&db_path, Duration::ZERO)
             .await
             .unwrap();
         store.create(&record("t1")).await.unwrap();
-        // busy_timeout 设到 0,海面立刻撞锁 → 让我们的退避自己吃掉。
-        sqlx::query("PRAGMA busy_timeout = 0")
-            .execute(&store.db)
+        // 用独立 SQLite 连接持有写锁；TaskStore 的写连接立即收到 SQLITE_BUSY，
+        // 然后应在退避后重试成功。
+        use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .busy_timeout(Duration::ZERO);
+        let mut busy_conn = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut busy_conn)
             .await
             .unwrap();
-        // 启动一个长事务,持有 task 表的写锁,等另一线程 update_progress 重试一次。
-        let busy_conn = sqlx::query("BEGIN IMMEDIATE")
-            .execute(&store.db)
-            .await
-            .unwrap();
-        let store2 = store.clone();
-        let updater = tokio::spawn(async move {
-            // 第一次会拿到 SQLITE_BUSY → 退避 → 等我们 COMMIT → 第二次成功。
+        let releaser = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            let store2_cloned = store2.clone();
-            tokio::spawn(async move {
-                sqlx::query("COMMIT")
-                    .execute(&store2_cloned.db)
-                    .await
-                    .unwrap();
-            })
-            .await
-            .unwrap();
+            sqlx::query("COMMIT").execute(&mut busy_conn).await.unwrap();
         });
         let result = store.update_progress("t1", 42, 7).await;
-        updater.await.unwrap();
-        drop(busy_conn);
+        releaser.await.unwrap();
         assert!(
             result.is_ok(),
             "update_progress should retry past a transient busy: {result:?}"
         );
         let row = store.get("t1").await.unwrap().unwrap();
-        assert_eq!(row.completed_bytes, 42);
+        assert_eq!(row.downloaded_bytes, 42);
         assert_eq!(row.speed_bytes_per_second, 7);
     }
 }
