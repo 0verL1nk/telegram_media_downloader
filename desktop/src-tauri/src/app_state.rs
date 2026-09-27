@@ -64,6 +64,7 @@ impl AppState {
             persistent_logs,
         });
         let downloads = DownloadManager::start(Arc::clone(&shared)).await?;
+        crate::task_maintenance::start(Arc::clone(&shared));
         shared
             .log(
                 "info",

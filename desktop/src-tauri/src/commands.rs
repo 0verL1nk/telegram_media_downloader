@@ -132,7 +132,7 @@ pub async fn list_tasks(
         .await
         .map_err(command_error)?;
     let layout = state.shared.layout.read().await.clone();
-    crate::task_cover::attach_cover_paths(&state.shared.app, &layout.root, &mut tasks);
+    crate::task_cover::attach_cover_paths(&layout.root, &mut tasks);
     Ok(tasks)
 }
 

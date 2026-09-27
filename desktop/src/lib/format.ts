@@ -45,7 +45,8 @@ export function statusTone(status: string): "blue" | "muted" | "amber" | "green"
 const VIDEO_EXTENSIONS = new Set(["3g2", "3gp", "asf", "avi", "divx", "f4v", "flv", "m2ts", "m2v", "m4v", "mkv", "mov", "mp4", "mpe", "mpeg", "mpg", "mts", "mxf", "ogv", "ogg", "qt", "rm", "rmvb", "ts", "vob", "webm", "wmv"]);
 
 export function isVideoTask(task: DownloadTask): boolean {
-  if (task.mediaType?.toLowerCase() === "video") return true;
+  const mediaType = task.mediaType?.toLowerCase() ?? "";
+  if (mediaType === "video" || mediaType === "animation" || mediaType.startsWith("video/")) return true;
   const extension = task.fileName?.split(".").pop()?.toLowerCase();
   return Boolean(extension && VIDEO_EXTENSIONS.has(extension));
 }

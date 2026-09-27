@@ -1,6 +1,6 @@
 import { useRef } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { TaskContextMenu, TaskOps } from "./TaskOps";
+import { VideoTaskThumbnail } from "./VideoTaskThumbnail";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Progress } from "../ui/progress";
@@ -24,6 +24,8 @@ export function TaskList({
   counts,
   filter,
   onFilterChange,
+  showCovers,
+  onToggleCovers,
   selectedId,
   selectedIds,
   onSelect,
@@ -43,6 +45,8 @@ export function TaskList({
   counts: Record<TaskFilter, number>;
   filter: TaskFilter;
   onFilterChange: (filter: TaskFilter) => void;
+  showCovers: boolean;
+  onToggleCovers: () => void;
   selectedId?: string | null;
   selectedIds: Set<string>;
   onSelect: (task: DownloadTask | null) => void;
@@ -90,6 +94,14 @@ export function TaskList({
       <div className="full-head">
         <div className="head-row">
           <h1>任务</h1>
+          <Button
+            variant="secondary"
+            aria-pressed={showCovers}
+            onClick={onToggleCovers}
+            title={showCovers ? "隐藏视频封面" : "显示视频封面"}
+          >
+            {showCovers ? "隐藏封面" : "显示封面"}
+          </Button>
           <Button
             variant="secondary"
             onClick={onClearFinished}
@@ -179,9 +191,7 @@ export function TaskList({
                       aria-label={`选择 ${task.fileName || "未命名媒体"}`}
                     />
                   </span>
-                  <span className={"st " + glyph.tone + (task.coverPath ? " st-thumb" : "")}>
-                    {task.coverPath ? <img src={convertFileSrc(task.coverPath)} alt="视频封面" loading="lazy" /> : glyph.glyph}
-                  </span>
+                  <VideoTaskThumbnail task={task} fallback={glyph.glyph} tone={glyph.tone} showCover={showCovers} />
                   <span className="fname">
                     <b title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</b>
                     <span className={subtitle.failed ? "err" : undefined}>{subtitle.text}</span>

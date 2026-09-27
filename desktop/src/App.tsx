@@ -43,20 +43,20 @@ const VIEW_LABELS: Record<AppView, string> = {
   settings: "设置",
 };
 
-type UiPrefs = { view: AppView; panelWidth: number };
+type UiPrefs = { view: AppView; panelWidth: number; showTaskCovers: boolean };
 
 function loadPrefs(): UiPrefs {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
-    if (!raw) return { view: "telegram", panelWidth: 360 };
+    if (!raw) return { view: "telegram", panelWidth: 360, showTaskCovers: true };
     const parsed = JSON.parse(raw) as Partial<UiPrefs>;
     const view: AppView = ["telegram", "tasks", "logs", "settings"].includes(String(parsed.view)) ? (parsed.view as AppView) : "telegram";
     const width = typeof parsed.panelWidth === "number" && Number.isFinite(parsed.panelWidth)
       ? Math.min(PANEL_MAX, Math.max(PANEL_MIN, parsed.panelWidth))
       : 360;
-    return { view, panelWidth: width };
+    return { view, panelWidth: width, showTaskCovers: parsed.showTaskCovers !== false };
   } catch {
-    return { view: "telegram", panelWidth: 360 };
+    return { view: "telegram", panelWidth: 360, showTaskCovers: true };
   }
 }
 
@@ -82,6 +82,7 @@ function App() {
   const [view, setView] = useState<AppView>(initialPrefs.current.view);
   const viewRef = useRef<AppView>(initialPrefs.current.view);
   const [panelWidth, setPanelWidth] = useState(initialPrefs.current.panelWidth);
+  const [showTaskCovers, setShowTaskCovers] = useState(initialPrefs.current.showTaskCovers);
   const [panelFilter, setPanelFilter] = useState<PanelFilter>("active");
   const [theme, setTheme] = useState<ThemePreference>(loadTheme);
   const [appState, setAppState] = useState<AppState | null>(null);
@@ -253,8 +254,12 @@ function App() {
     startTransition(() => {
       setTasks((current) => {
         const existing = current.find((task) => task.taskId === candidate.taskId);
-        const merged = existing && !candidate.coverPath
-          ? { ...candidate, coverPath: existing.coverPath }
+        const merged = existing
+          ? {
+              ...candidate,
+              coverPath: candidate.coverPath || existing.coverPath,
+              previewPath: candidate.previewPath || existing.previewPath,
+            }
           : candidate;
         const next = existing
           ? current.map((task) => (task.taskId === candidate.taskId ? merged : task))
@@ -342,6 +347,21 @@ function App() {
     void (async () => {
       const stopTask = await api.listen<unknown>("task-updated", (payload) => mergeTaskUpdate(payload));
       if (alive) unlisten.push(stopTask); else stopTask();
+      const stopDeleted = await api.listen<{ taskId?: string }>("task-deleted", (payload) => {
+        if (!payload?.taskId) {
+          void refreshTasks();
+          return;
+        }
+        setTasks((current) => current.filter((task) => task.taskId !== payload.taskId));
+        setSelectedIds((current) => {
+          if (!current.has(payload.taskId!)) return current;
+          const next = new Set(current);
+          next.delete(payload.taskId!);
+          return next;
+        });
+        setSelectedId((current) => current === payload.taskId ? null : current);
+      });
+      if (alive) unlisten.push(stopDeleted); else stopDeleted();
       const stopStats = await api.listen<unknown>("stats-updated", (payload) => {
         if (!payload || typeof payload !== "object") return;
         const data = payload as { stats?: AppState["stats"] } & Partial<AppState["stats"]>;
@@ -901,6 +921,14 @@ function App() {
                 counts={counts}
                 filter={taskFilter}
                 onFilterChange={setTaskFilter}
+                showCovers={showTaskCovers}
+                onToggleCovers={() => {
+                  setShowTaskCovers((current) => {
+                    const next = !current;
+                    savePrefs({ showTaskCovers: next });
+                    return next;
+                  });
+                }}
                 selectedId={selectedId}
                 selectedIds={selectedIds}
                 onSelect={(task) => setSelectedId(task?.taskId ?? null)}

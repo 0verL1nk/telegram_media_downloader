@@ -6,6 +6,7 @@ use std::{
     process::Command,
 };
 use tauri::{AppHandle, Manager, State};
+use tokio::sync::Semaphore;
 
 const MAX_COVER_BYTES: usize = 4 * 1024 * 1024;
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -13,6 +14,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mpe", "mpeg", "mpg", "mts", "m2ts", "mxf", "ogv", "ogg", "qt", "rm", "rmvb", "ts", "vob",
     "webm", "wmv",
 ];
+static THUMBNAIL_JOBS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,11 +47,28 @@ fn cover_path(root: &Path, task_id: &str) -> PathBuf {
         .join(format!("{task_id}.jpg"))
 }
 
+fn preview_path(root: &Path, task_id: &str) -> PathBuf {
+    root.join("Cache")
+        .join("video-thumbnails")
+        .join(format!("{task_id}.jpg"))
+}
+
 fn ffmpeg_path(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .resource_dir()
         .map(|directory| directory.join("ffmpeg.exe"))
         .map_err(command_error)
+}
+
+fn ffmpeg_command(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 async fn video_for_task(
@@ -174,6 +193,154 @@ fn embed_cover(ffmpeg: &Path, video: &Path, image: &Path) -> Result<(), String> 
     atomic_file::replace(&output, video).map_err(command_error)
 }
 
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0xd8, 0xff])
+}
+
+fn attached_picture_streams(stderr: &str) -> Vec<usize> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("(attached pic)"))
+        .filter_map(|line| {
+            let (_, tail) = line.split_once("Stream #0:")?;
+            let digits = tail
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            digits.parse().ok()
+        })
+        .collect()
+}
+
+fn image_to_jpeg(ffmpeg: &Path, image_path: &Path) -> Result<Vec<u8>, String> {
+    run_output(
+        ffmpeg,
+        &[
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-i".into(),
+            image_path.to_string_lossy().into_owned(),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            "scale='min(1280,iw)':-2".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-vcodec".into(),
+            "mjpeg".into(),
+            "pipe:1".into(),
+        ],
+    )
+}
+
+fn extract_attached_cover(ffmpeg: &Path, video: &Path) -> Option<Vec<u8>> {
+    let input = ffmpeg_command(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(video)
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&input.stderr);
+    for index in attached_picture_streams(&stderr) {
+        let Ok(bytes) = run_output(
+            ffmpeg,
+            &[
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-i".into(),
+                video.to_string_lossy().into_owned(),
+                "-map".into(),
+                format!("0:{index}"),
+                "-frames:v".into(),
+                "1".into(),
+                "-vf".into(),
+                "scale='min(1280,iw)':-2".into(),
+                "-f".into(),
+                "image2pipe".into(),
+                "-vcodec".into(),
+                "mjpeg".into(),
+                "pipe:1".into(),
+            ],
+        ) else {
+            continue;
+        };
+        if is_jpeg(&bytes) {
+            return Some(bytes);
+        }
+    }
+
+    // Matroska stores cover art as an attachment instead of an attached-picture video stream.
+    let attachment_count = stderr
+        .lines()
+        .filter(|line| line.contains("Attachment:"))
+        .count();
+    for index in 0..attachment_count.min(16) {
+        let temp = std::env::temp_dir().join(format!("tmd-cover-{}.bin", uuid::Uuid::new_v4()));
+        let result = ffmpeg_command(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error"])
+            .arg(format!("-dump_attachment:t:{index}"))
+            .arg(&temp)
+            .arg("-i")
+            .arg(video)
+            .args(["-f", "null", "-"])
+            .output();
+        let Ok(result) = result else {
+            let _ = std::fs::remove_file(&temp);
+            continue;
+        };
+        if result.status.success() && temp.is_file() {
+            let jpeg = image_to_jpeg(ffmpeg, &temp).ok();
+            let _ = std::fs::remove_file(&temp);
+            if let Some(bytes) = jpeg.filter(|bytes| is_jpeg(bytes)) {
+                return Some(bytes);
+            }
+        } else {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+    None
+}
+
+fn extract_video_frame_from_path(
+    ffmpeg: &Path,
+    video: &Path,
+    timestamp_seconds: f64,
+) -> Result<Vec<u8>, String> {
+    let time_arg = format!("{timestamp_seconds:.3}");
+    run_output(
+        ffmpeg,
+        &[
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-ss".into(),
+            time_arg,
+            "-i".into(),
+            video.to_string_lossy().into_owned(),
+            "-map".into(),
+            "0:V:0".into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-vf".into(),
+            "scale='min(1280,iw)':-2".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-vcodec".into(),
+            "mjpeg".into(),
+            "pipe:1".into(),
+        ],
+    )
+}
+
+fn generate_preview_jpeg(ffmpeg: &Path, video: &Path) -> Result<Vec<u8>, String> {
+    if let Some(cover) = extract_attached_cover(ffmpeg, video) {
+        return Ok(cover);
+    }
+    extract_video_frame_from_path(ffmpeg, video, 1.0)
+        .or_else(|_| extract_video_frame_from_path(ffmpeg, video, 0.0))
+}
+
 pub async fn embed_cached_cover(app: &AppHandle, video: &Path, cover: &Path) -> Result<(), String> {
     let ffmpeg = ffmpeg_path(app)?;
     let video = video.to_path_buf();
@@ -198,7 +365,7 @@ pub async fn embed_task_cover_if_selected(
 }
 
 fn run_output(binary: &Path, args: &[String]) -> Result<Vec<u8>, String> {
-    let output = Command::new(binary)
+    let output = ffmpeg_command(binary)
         .args(args)
         .output()
         .map_err(|error| format!("无法启动视频处理工具：{error}"))?;
@@ -227,7 +394,7 @@ pub async fn probe_task_video(
     let ffmpeg = ffmpeg_path(&app)?;
     let path_arg = video_path.to_string_lossy().into_owned();
     let duration_seconds = tokio::task::spawn_blocking(move || {
-        let output = Command::new(ffmpeg)
+        let output = ffmpeg_command(&ffmpeg)
             .args(["-hide_banner", "-i"])
             .arg(path_arg)
             .output()
@@ -285,30 +452,9 @@ pub async fn extract_video_frame(
     }
     let (video, _, _) = video_for_task(&state, &task_id).await?;
     let ffmpeg = ffmpeg_path(&app)?;
-    let path_arg = video.to_string_lossy().into_owned();
-    let time_arg = format!("{timestamp_seconds:.3}");
+    let ffmpeg_for_work = ffmpeg.clone();
     let bytes = tokio::task::spawn_blocking(move || {
-        run_output(
-            &ffmpeg,
-            &[
-                "-hide_banner".into(),
-                "-loglevel".into(),
-                "error".into(),
-                "-ss".into(),
-                time_arg,
-                "-i".into(),
-                path_arg,
-                "-frames:v".into(),
-                "1".into(),
-                "-vf".into(),
-                "scale='min(1280,iw)':-2".into(),
-                "-f".into(),
-                "image2pipe".into(),
-                "-vcodec".into(),
-                "mjpeg".into(),
-                "pipe:1".into(),
-            ],
-        )
+        extract_video_frame_from_path(&ffmpeg_for_work, &video, timestamp_seconds)
     })
     .await
     .map_err(command_error)??;
@@ -316,6 +462,67 @@ pub async fn extract_video_frame(
         return Err("提取的视频帧为空或尺寸过大".into());
     }
     Ok(STANDARD.encode(bytes))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_task_video_thumbnail(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<Option<String>, String> {
+    let (video, _, _) = video_for_task(&state, &task_id).await?;
+    let layout = state.shared.layout.read().await.clone();
+    let custom = cover_path(&layout.root, &task_id);
+    let generated = preview_path(&layout.root, &task_id);
+    let cached = if custom.is_file() {
+        Some(custom)
+    } else if generated.is_file() {
+        Some(generated.clone())
+    } else {
+        None
+    };
+    if let Some(path) = cached {
+        if let Ok(bytes) = tokio::fs::read(&path).await
+            && !bytes.is_empty()
+            && bytes.len() <= MAX_COVER_BYTES
+            && is_jpeg(&bytes)
+        {
+            return Ok(Some(format!(
+                "data:image/jpeg;base64,{}",
+                STANDARD.encode(bytes)
+            )));
+        }
+    }
+
+    let _permit = THUMBNAIL_JOBS.acquire().await.map_err(command_error)?;
+    // Another visible row or list refresh may have generated the same image while this command
+    // waited for the thumbnail worker slot.
+    if generated.is_file() {
+        if let Ok(bytes) = tokio::fs::read(&generated).await
+            && !bytes.is_empty()
+            && bytes.len() <= MAX_COVER_BYTES
+            && is_jpeg(&bytes)
+        {
+            return Ok(Some(format!(
+                "data:image/jpeg;base64,{}",
+                STANDARD.encode(bytes)
+            )));
+        }
+    }
+    let ffmpeg = ffmpeg_path(&app)?;
+    let video_for_work = video.clone();
+    let bytes =
+        tokio::task::spawn_blocking(move || generate_preview_jpeg(&ffmpeg, &video_for_work))
+            .await
+            .map_err(command_error)??;
+    if bytes.is_empty() || bytes.len() > MAX_COVER_BYTES || !is_jpeg(&bytes) {
+        return Ok(None);
+    }
+    atomic_file::write(&generated, &bytes).map_err(command_error)?;
+    Ok(Some(format!(
+        "data:image/jpeg;base64,{}",
+        STANDARD.encode(bytes)
+    )))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -368,15 +575,15 @@ pub async fn set_task_video_cover(
     })
 }
 
-pub fn attach_cover_paths(
-    app: &AppHandle,
-    layout_root: &Path,
-    tasks: &mut [crate::models::TaskRecord],
-) {
+pub fn attach_cover_paths(layout_root: &Path, tasks: &mut [crate::models::TaskRecord]) {
     for task in tasks {
         let cover = cover_path(layout_root, &task.task_id);
-        if cover.is_file() && app.asset_protocol_scope().allow_file(&cover).is_ok() {
+        if cover.is_file() {
             task.cover_path = Some(storage::display_path(&cover));
+        }
+        let preview = preview_path(layout_root, &task.task_id);
+        if preview.is_file() {
+            task.preview_path = Some(storage::display_path(&preview));
         }
     }
 }

@@ -7,6 +7,7 @@ commands.allow = [
   "list_tasks",
   "probe_task_video",
   "extract_video_frame",
+  "get_task_video_thumbnail",
   "set_task_video_cover",
   "task_action",
   "delete_task",

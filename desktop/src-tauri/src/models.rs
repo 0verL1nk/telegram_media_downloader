@@ -117,6 +117,8 @@ pub struct TaskRecord {
     pub output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_path: Option<String>,
     pub error: Option<String>,
     pub retry_count: u32,
     pub group_id: Option<String>,

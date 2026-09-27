@@ -290,6 +290,7 @@ mod tests {
             completed_at: None,
             output_path: Some(path.join("final.bin").to_string_lossy().into()),
             cover_path: None,
+            preview_path: None,
             error: None,
             retry_count: 0,
             group_id: None,

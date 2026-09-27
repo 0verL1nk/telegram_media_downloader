@@ -104,6 +104,7 @@ export interface DownloadTask {
   completedAt?: string | null;
   outputPath?: string | null;
   coverPath?: string | null;
+  previewPath?: string | null;
   error?: string | null;
   retryCount?: number;
   groupId?: string | null;
@@ -169,6 +170,9 @@ export const api = {
 
   extractVideoFrame: (taskId: string, timestampSeconds: number) =>
     call<string>("extract_video_frame", { taskId, timestampSeconds }),
+
+  getTaskVideoThumbnail: (taskId: string) =>
+    call<string | null>("get_task_video_thumbnail", { taskId }),
 
   setTaskVideoCover: (taskId: string, jpegBase64: string) =>
     call<CoverSaveResult>("set_task_video_cover", { taskId, jpegBase64 }),
