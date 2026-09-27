@@ -164,6 +164,8 @@ function App() {
     [logs, logLevel],
   );
   const selectedTask = useMemo(() => tasks.find((task) => task.taskId === selectedId) ?? null, [tasks, selectedId]);
+  // 任何模态弹窗打开时都要把 Telegram WebView 收到角落(原生子视图永远在 HTML 之上)。
+  const modalOpen = storageConfirm || deleteTarget !== null;
 
   function notify(message: string, kind: Toast["kind"] = "success") {
     setToast({ message, kind });
@@ -359,12 +361,13 @@ function App() {
 
   // Telegram 子 WebView 的 bounds 同步:只在 Telegram 视图可见且完全落在内容区内时显示。
   useEffect(() => {
-    if (view !== "telegram") {
+    if (view !== "telegram" || modalOpen) {
       syncTelegramWebviewRef.current = null;
       setWebviewEmbeddedReady(false);
-      // 不隐藏 WebView:WebView2 一旦被隐藏,Chromium 会节流页面定时器与渲染,
-      // 正在进行的页面抓取会跟着停摆(用户只是想边下边看任务列表)。
+      // 离开 Telegram 视图、或打开确认弹窗时,不隐藏 WebView:WebView2 一旦被隐藏,
+      // Chromium 会节流页面定时器与渲染,正在进行的页面抓取会跟着停摆。
       // 收到 1×1 停靠:人眼看不见,但页面仍处于"可见"状态。
+      // (原生子 WebView 永远绘制在 HTML 之上,弹窗只有靠这招才不被盖住。)
       void api
         .setTelegramWebviewBounds({ x: 0, y: 0, width: 1, height: 1 })
         .then(() => api.setTelegramWebviewVisible(true))
@@ -530,7 +533,7 @@ function App() {
       if (syncTelegramWebviewRef.current === synchronize) syncTelegramWebviewRef.current = null;
       void api.setTelegramWebviewVisible(false).catch(() => undefined);
     };
-  }, [view, webviewHostMounted, nativeWindow]);
+  }, [view, webviewHostMounted, nativeWindow, modalOpen]);
 
   // 分隔条拖拽:280–560 调整面板宽度,拖到 240 以下松手 = 折叠(转到任务全览)。
   function startPanelDrag(event: React.MouseEvent<HTMLDivElement>) {

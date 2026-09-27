@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "telegram-media-downloader"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "blake3",
