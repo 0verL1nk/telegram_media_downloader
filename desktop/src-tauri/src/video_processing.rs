@@ -12,7 +12,8 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::{fs, process::Command};
 use uuid::Uuid;
 
@@ -23,6 +24,25 @@ pub struct Replacement {
 }
 
 const SEGMENT_SECONDS: f64 = 30.0;
+const ENCODE_PROGRESS_WEIGHT: f64 = 0.9;
+
+fn emit_progress(app: &AppHandle, task_id: &str, progress: f64) {
+    let _ = app.emit(
+        "video-processing-progress",
+        serde_json::json!({ "taskId": task_id, "progress": progress.clamp(0.0, 1.0) }),
+    );
+}
+
+fn media_tool_command(program: impl AsRef<OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EncodeManifest {
@@ -110,7 +130,11 @@ pub fn recover_interrupted_replace(source: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<Replacement>> {
+pub async fn compress_replace(
+    app: &AppHandle,
+    task_id: &str,
+    source: &Path,
+) -> Result<Option<Replacement>> {
     if !source.is_file() {
         bail!("原视频文件不存在");
     }
@@ -174,6 +198,7 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
     if segment_count == 0 || segment_count > 100_000 {
         bail!("视频时长超出可处理范围");
     }
+    emit_progress(app, task_id, 0.0);
 
     // Encode fixed-size, independently decodable segments. Completed segments survive
     // app exits and are reused; only the segment interrupted in progress is repeated.
@@ -182,18 +207,28 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
         let segment_duration = (duration_seconds - start).min(SEGMENT_SECONDS);
         let segment = work_dir.join(format!("segment-{index:06}.mkv"));
         if segment_is_valid(&ffmpeg, &ffprobe, &segment, width, height, segment_duration).await {
+            emit_progress(
+                app,
+                task_id,
+                (index + 1) as f64 / segment_count as f64 * ENCODE_PROGRESS_WEIGHT,
+            );
             continue;
         }
         let _ = fs::remove_file(&segment).await;
         let start_arg = format!("{start:.3}");
         let duration_arg = format!("{segment_duration:.3}");
-        let encode = Command::new(&ffmpeg)
+        let encode = media_tool_command(&ffmpeg)
             .args([
                 OsStr::new("-hide_banner"),
                 OsStr::new("-loglevel"),
                 OsStr::new("error"),
                 OsStr::new("-nostdin"),
                 OsStr::new("-y"),
+                OsStr::new("-nostats"),
+                OsStr::new("-stats_period"),
+                OsStr::new("0.5"),
+                OsStr::new("-progress"),
+                OsStr::new("pipe:1"),
                 OsStr::new("-ss"),
                 OsStr::new(&start_arg),
                 OsStr::new("-i"),
@@ -221,14 +256,39 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
             ])
             .arg(&segment)
             .kill_on_drop(true)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .spawn()
             .context("无法启动 FFmpeg 分段编码")?;
-        if !encode.status.success() {
+        let mut encode = encode;
+        let stdout = encode.stdout.take().context("无法读取 FFmpeg 编码进度")?;
+        let mut stderr = encode.stderr.take().context("无法读取 FFmpeg 错误输出")?;
+        let stderr_reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes).await;
+            bytes
+        });
+        let mut progress_reader = BufReader::new(stdout).lines();
+        while let Some(line) = progress_reader.next_line().await? {
+            let Some(value) = line.strip_prefix("out_time_us=") else {
+                continue;
+            };
+            let Ok(encoded_seconds) = value.parse::<f64>() else {
+                continue;
+            };
+            let segment_progress =
+                (encoded_seconds / 1_000_000.0 / segment_duration).clamp(0.0, 1.0);
+            emit_progress(
+                app,
+                task_id,
+                (index as f64 + segment_progress) / segment_count as f64 * ENCODE_PROGRESS_WEIGHT,
+            );
+        }
+        let status = encode.wait().await.context("等待 FFmpeg 编码结束失败")?;
+        let stderr = stderr_reader.await.context("读取 FFmpeg 错误输出失败")?;
+        if !status.success() {
             let _ = fs::remove_file(&segment).await;
-            let detail = String::from_utf8_lossy(&encode.stderr)
+            let detail = String::from_utf8_lossy(&stderr)
                 .trim()
                 .chars()
                 .take(500)
@@ -246,6 +306,11 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
             let _ = fs::remove_file(&segment).await;
             bail!("编码片段校验失败，原视频已保留");
         }
+        emit_progress(
+            app,
+            task_id,
+            (index + 1) as f64 / segment_count as f64 * ENCODE_PROGRESS_WEIGHT,
+        );
     }
 
     let candidate = temporary_candidate_path(source)?;
@@ -255,7 +320,8 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
         concat.push_str(&format!("file 'segment-{index:06}.mkv'\n"));
     }
     fs::write(&concat_path, concat).await?;
-    let mux = Command::new(&ffmpeg)
+    emit_progress(app, task_id, 0.92);
+    let mux = media_tool_command(&ffmpeg)
         .args([
             OsStr::new("-hide_banner"),
             OsStr::new("-loglevel"),
@@ -312,6 +378,7 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
             }
         );
     }
+    emit_progress(app, task_id, 0.96);
 
     let new_size = match fs::metadata(&candidate).await {
         Ok(metadata) if metadata.len() > 0 => metadata.len(),
@@ -352,12 +419,17 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
     }
 
     // Decode the complete candidate before changing the original path.
-    let validation = Command::new(&ffmpeg)
+    let validation = media_tool_command(&ffmpeg)
         .args([
             OsStr::new("-v"),
             OsStr::new("error"),
             OsStr::new("-xerror"),
             OsStr::new("-nostdin"),
+            OsStr::new("-nostats"),
+            OsStr::new("-stats_period"),
+            OsStr::new("0.5"),
+            OsStr::new("-progress"),
+            OsStr::new("pipe:1"),
             OsStr::new("-i"),
         ])
         .arg(&candidate)
@@ -369,20 +441,40 @@ pub async fn compress_replace(app: &AppHandle, source: &Path) -> Result<Option<R
             OsStr::new(if cfg!(windows) { "NUL" } else { "/dev/null" }),
         ])
         .kill_on_drop(true)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .context("无法校验转码结果")?;
-    if !validation.status.success() {
+    let mut validation = validation;
+    let stdout = validation.stdout.take().context("无法读取转码校验进度")?;
+    let mut progress_reader = BufReader::new(stdout).lines();
+    while let Some(line) = progress_reader.next_line().await? {
+        let Some(value) = line.strip_prefix("out_time_us=") else {
+            continue;
+        };
+        let Ok(decoded_seconds) = value.parse::<f64>() else {
+            continue;
+        };
+        let validation_progress =
+            (decoded_seconds / 1_000_000.0 / duration_seconds).clamp(0.0, 1.0);
+        emit_progress(app, task_id, 0.96 + validation_progress * 0.03);
+    }
+    if !validation
+        .wait()
+        .await
+        .context("等待转码结果校验失败")?
+        .success()
+    {
         let _ = fs::remove_file(&candidate).await;
         bail!("转码结果无法完整解码，原视频已保留");
     }
 
+    emit_progress(app, task_id, 0.99);
     replace_with_rollback(source, &candidate).await?;
     fs::remove_dir_all(&work_dir)
         .await
         .context("视频已替换，但无法清理临时分段")?;
+    emit_progress(app, task_id, 1.0);
     Ok(Some(Replacement { old_size, new_size }))
 }
 
@@ -418,7 +510,7 @@ async fn segment_is_valid(
     if !metadata_valid {
         return false;
     }
-    Command::new(ffmpeg)
+    media_tool_command(ffmpeg)
         .args([
             OsStr::new("-v"),
             OsStr::new("error"),
@@ -452,7 +544,7 @@ fn work_directory(source: &Path) -> Result<PathBuf> {
 }
 
 async fn probe(ffprobe: &Path, path: &Path) -> Result<Probe> {
-    let output = Command::new(ffprobe)
+    let output = media_tool_command(ffprobe)
         .args([
             OsStr::new("-v"),
             OsStr::new("error"),

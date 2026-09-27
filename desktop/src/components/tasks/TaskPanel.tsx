@@ -9,6 +9,7 @@ export type PanelFilter = "active" | "completed" | "failed";
 /** 分栏右侧任务面板 360px(DESIGN.md §1/§3):图标 + 文件名 + 行内操作 + 进度行。 */
 export function TaskPanel({
   tasks,
+  videoProgress,
   filter,
   onFilterChange,
   onSelect,
@@ -25,6 +26,7 @@ export function TaskPanel({
   ref,
 }: {
   tasks: DownloadTask[];
+  videoProgress: Record<string, number>;
   filter: PanelFilter;
   onFilterChange: (filter: PanelFilter) => void;
   onSelect: (task: DownloadTask) => void;
@@ -96,7 +98,9 @@ export function TaskPanel({
                   <Progress
                     size="sm"
                     tone={glyph.tone === "ok" ? "success" : glyph.tone === "bad" ? "danger" : "default"}
-                    value={Math.round(getPercent(task))}
+                    value={Math.round(task.status.toLowerCase() === "processing"
+                      ? (videoProgress[task.taskId] ?? 0) * 100
+                      : getPercent(task))}
                   />
                   <span className={"pr-sub" + (subtitle.failed ? " fail" : "")}>{subtitle.text}</span>
                 </span>

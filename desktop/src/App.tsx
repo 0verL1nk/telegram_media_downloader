@@ -25,7 +25,7 @@ import { TaskList, type TaskFilter } from "./components/tasks/TaskList";
 import { VideoCoverDialog } from "./components/tasks/VideoCoverDialog";
 import { LogsPage } from "./components/logs/LogsPage";
 import { SettingsPage, type ThemePreference, type UpdateUiState } from "./components/settings/SettingsPage";
-import { actionLabel, getTaskActions } from "./lib/format";
+import { actionLabel, canProcessVideo, getTaskActions } from "./lib/format";
 
 type Toast = { kind: "success" | "error" | "info"; message: string };
 type UpdatePhase = "idle" | "checking" | "current" | "available" | "installing" | "ready";
@@ -88,6 +88,8 @@ function App() {
   const [appState, setAppState] = useState<AppState | null>(null);
   const [editableSettings, setEditableSettings] = useState<Settings | null>(null);
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
+  const [videoProgress, setVideoProgress] = useState<Record<string, number>>({});
+  const [videoBatch, setVideoBatch] = useState<{ completed: number; total: number; fileName: string } | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -252,6 +254,14 @@ function App() {
       void refreshTasks();
       return;
     }
+    if (candidate.status.toLowerCase() !== "processing") {
+      setVideoProgress((current) => {
+        if (!(candidate.taskId in current)) return current;
+        const next = { ...current };
+        delete next[candidate.taskId];
+        return next;
+      });
+    }
     startTransition(() => {
       setTasks((current) => {
         const existing = current.find((task) => task.taskId === candidate.taskId);
@@ -348,6 +358,12 @@ function App() {
     void (async () => {
       const stopTask = await api.listen<unknown>("task-updated", (payload) => mergeTaskUpdate(payload));
       if (alive) unlisten.push(stopTask); else stopTask();
+      const stopVideoProgress = await api.listen<{ taskId?: string; progress?: number }>("video-processing-progress", (payload) => {
+        if (!payload?.taskId || typeof payload.progress !== "number") return;
+        const progress = Math.max(0, Math.min(1, payload.progress));
+        setVideoProgress((current) => ({ ...current, [payload.taskId!]: progress }));
+      });
+      if (alive) unlisten.push(stopVideoProgress); else stopVideoProgress();
       const stopDeleted = await api.listen<{ taskId?: string }>("task-deleted", (payload) => {
         if (!payload?.taskId) {
           void refreshTasks();
@@ -654,6 +670,33 @@ function App() {
     });
   }
 
+  async function bulkProcessTaskVideos() {
+    const targets = tasks.filter((task) => selectedIds.has(task.taskId) && canProcessVideo(task));
+    if (targets.length === 0 || videoBatch) return;
+    await runBusy("bulk-video", async () => {
+      let completed = 0;
+      let compressed = 0;
+      let unchanged = 0;
+      let failed = 0;
+      for (const task of targets) {
+        setVideoBatch({ completed, total: targets.length, fileName: task.fileName || "未命名视频" });
+        try {
+          const updated = await api.processVideo(task.taskId);
+          mergeTaskUpdate(updated);
+          if (updated.error) unchanged++;
+          else compressed++;
+        } catch {
+          failed++;
+        }
+        completed++;
+      }
+      await refreshTasks();
+      setVideoBatch(null);
+      const summary = `批量转码完成：压缩 ${compressed} 项，原样保留 ${unchanged} 项，失败 ${failed} 项。`;
+      notify(summary, failed > 0 ? "info" : "success");
+    }).finally(() => setVideoBatch(null));
+  }
+
   async function copyTaskName(task: DownloadTask) {
     const name = task.fileName ?? "";
     if (!name) return;
@@ -916,6 +959,7 @@ function App() {
                     ref={panelRef}
                     width={panelWidth}
                     tasks={panelTasks}
+                    videoProgress={videoProgress}
                     filter={panelFilter}
                     onFilterChange={setPanelFilter}
                     onSelect={(task) => setSelectedId(task.taskId)}
@@ -960,6 +1004,9 @@ function App() {
                 onDelete={requestDelete}
                 onClearFinished={requestClearFinished}
                 onBulkAction={(action) => void bulkAction(action)}
+                onBulkProcessVideos={() => void bulkProcessTaskVideos()}
+                videoProgress={videoProgress}
+                videoBatch={videoBatch}
                 onBulkDelete={requestBulkDelete}
                 onClearSelection={clearSelection}
               />

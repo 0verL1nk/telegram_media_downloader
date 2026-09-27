@@ -664,7 +664,7 @@ impl DownloadManager {
                 .acquire()
                 .await
                 .context("视频编码队列已关闭")?;
-            match video_processing::compress_replace(&self.shared.app, &output).await {
+            match video_processing::compress_replace(&self.shared.app, task_id, &output).await {
                 Ok(Some(replacement)) => {
                     self.shared
                         .log(
@@ -824,7 +824,7 @@ impl DownloadManager {
             .await
             .context("视频编码队列已关闭")?;
 
-        let result = video_processing::compress_replace(&self.shared.app, output).await;
+        let result = video_processing::compress_replace(&self.shared.app, task_id, output).await;
         let (message, failure) = match result {
             Ok(Some(replacement)) => {
                 self.shared

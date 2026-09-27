@@ -5,7 +5,7 @@ import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Progress } from "../ui/progress";
 import type { DownloadTask, TaskAction } from "../../lib/api";
-import { formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph } from "../../lib/format";
+import { canProcessVideo, formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph } from "../../lib/format";
 
 export type TaskFilter = "all" | "downloading" | "processing" | "queued" | "paused" | "completed" | "failed";
 
@@ -40,8 +40,11 @@ export function TaskList({
   onDelete,
   onClearFinished,
   onBulkAction,
+  onBulkProcessVideos,
   onBulkDelete,
   onClearSelection,
+  videoProgress,
+  videoBatch,
 }: {
   tasks: DownloadTask[];
   counts: Record<TaskFilter, number>;
@@ -62,8 +65,11 @@ export function TaskList({
   onDelete: (task: DownloadTask) => void;
   onClearFinished: () => void;
   onBulkAction: (action: "pause" | "resume" | "retry") => void;
+  onBulkProcessVideos: () => void;
   onBulkDelete: () => void;
   onClearSelection: () => void;
+  videoProgress: Record<string, number>;
+  videoBatch: { completed: number; total: number; fileName: string } | null;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const allSelected = tasks.length > 0 && tasks.every((task) => selectedIds.has(task.taskId));
@@ -132,8 +138,15 @@ export function TaskList({
 
       {selectedIds.size > 0 ? (
         <div className="bulk-bar">
-          <span className="bulk-count">已选 {selectedIds.size} 项</span>
+          <span className="bulk-count">
+            {videoBatch ? `批量转码 ${videoBatch.completed}/${videoBatch.total}：${videoBatch.fileName}` : `已选 ${selectedIds.size} 项`}
+          </span>
           <span className="bulk-actions">
+            {selectedVisible.some(canProcessVideo) ? (
+              <Button variant="secondary" disabled={videoBatch !== null} onClick={onBulkProcessVideos}>
+                {videoBatch ? "转码中…" : `批量转码 (${selectedVisible.filter(canProcessVideo).length})`}
+              </Button>
+            ) : null}
             {selectedVisible.some((task) => ["downloading", "queued"].includes(task.status.toLowerCase())) ? (
               <Button variant="secondary" onClick={() => onBulkAction("pause")}>暂停</Button>
             ) : null}
@@ -178,6 +191,10 @@ export function TaskList({
             const percent = Math.round(getPercent(task));
             const remaining = remainingLabel(task);
             const checked = selectedIds.has(task.taskId);
+            const processing = status === "processing";
+            const displayedProgress = processing
+              ? Math.round((videoProgress[task.taskId] ?? 0) * 100)
+              : percent;
             return (
               <TaskContextMenu key={task.taskId} task={task} onAction={onAction} onOpenFolder={onOpenFolder} onSetCover={onSetCover} onProcessVideo={onProcessVideo} onCopyName={onCopyName} onDelete={onDelete}>
                 <div
@@ -200,9 +217,9 @@ export function TaskList({
                     <span className={subtitle.failed ? "err" : undefined}>{subtitle.text}</span>
                   </span>
                   <span className="prog-cell">
-                    <Progress value={percent} tone={glyph.tone === "ok" ? "success" : glyph.tone === "bad" ? "danger" : "default"} />
+                    <Progress value={displayedProgress} tone={glyph.tone === "ok" ? "success" : glyph.tone === "bad" ? "danger" : "default"} />
                     <span className={"pct" + (glyph.tone === "bad" ? " bad" : "") + (status === "completed" ? " ok" : "")}>
-                      {status === "completed" ? "完成" : status === "processing" ? "转码中" : `${percent}%`}
+                      {status === "completed" ? "完成" : `${displayedProgress}%`}
                     </span>
                   </span>
                   <span className="size">{task.totalBytes ? formatBytes(task.totalBytes) : formatBytes(task.downloadedBytes)}</span>
