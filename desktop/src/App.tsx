@@ -25,7 +25,7 @@ import { TaskList, type TaskFilter } from "./components/tasks/TaskList";
 import { VideoCoverDialog } from "./components/tasks/VideoCoverDialog";
 import { LogsPage } from "./components/logs/LogsPage";
 import { SettingsPage, type ThemePreference, type UpdateUiState } from "./components/settings/SettingsPage";
-import { actionLabel, canProcessVideo, getTaskActions } from "./lib/format";
+import { actionLabel, canProcessVideo, getTaskActions, videoProcessingBadge } from "./lib/format";
 
 type Toast = { kind: "success" | "error" | "info"; message: string };
 type UpdatePhase = "idle" | "checking" | "current" | "available" | "installing" | "ready";
@@ -89,7 +89,7 @@ function App() {
   const [editableSettings, setEditableSettings] = useState<Settings | null>(null);
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
   const [videoProgress, setVideoProgress] = useState<Record<string, number>>({});
-  const [videoBatch, setVideoBatch] = useState<{ completed: number; total: number; fileName: string } | null>(null);
+  const [videoBatch, setVideoBatch] = useState<{ completed: number; total: number; concurrency: number; fileNames: string[] } | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -674,25 +674,41 @@ function App() {
     const targets = tasks.filter((task) => selectedIds.has(task.taskId) && canProcessVideo(task));
     if (targets.length === 0 || videoBatch) return;
     await runBusy("bulk-video", async () => {
+      const concurrency = typeof navigator !== "undefined" && navigator.hardwareConcurrency >= 12 ? 2 : 1;
+      let nextIndex = 0;
       let completed = 0;
       let compressed = 0;
       let unchanged = 0;
       let failed = 0;
-      for (const task of targets) {
-        setVideoBatch({ completed, total: targets.length, fileName: task.fileName || "未命名视频" });
-        try {
-          const updated = await api.processVideo(task.taskId);
-          mergeTaskUpdate(updated);
-          if (updated.error) unchanged++;
-          else compressed++;
-        } catch {
-          failed++;
+      const activeFiles = new Map<number, string>();
+      const publishBatch = () => {
+        setVideoBatch({ completed, total: targets.length, concurrency, fileNames: [...activeFiles.values()] });
+      };
+      const worker = async (workerId: number) => {
+        while (true) {
+          const index = nextIndex++;
+          if (index >= targets.length) return;
+          const task = targets[index];
+          activeFiles.set(workerId, task.fileName || "未命名视频");
+          publishBatch();
+          try {
+            const updated = await api.processVideo(task.taskId);
+            mergeTaskUpdate(updated);
+            if (videoProcessingBadge(updated)?.tone === "success") compressed++;
+            else unchanged++;
+          } catch {
+            failed++;
+          } finally {
+            completed++;
+            activeFiles.delete(workerId);
+            publishBatch();
+          }
         }
-        completed++;
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, (_, index) => worker(index)));
       await refreshTasks();
       setVideoBatch(null);
-      const summary = `批量转码完成：压缩 ${compressed} 项，原样保留 ${unchanged} 项，失败 ${failed} 项。`;
+      const summary = `批量处理完成：转码替换 ${compressed} 项，保留原片 ${unchanged} 项，失败 ${failed} 项。`;
       notify(summary, failed > 0 ? "info" : "success");
     }).finally(() => setVideoBatch(null));
   }

@@ -58,6 +58,29 @@ export function isVideoProcessed(task: DownloadTask): boolean {
   return videoProcessedNote(task) !== null;
 }
 
+export function videoProcessingBadge(task: DownloadTask): {
+  label: string;
+  title: string;
+  tone: "success" | "accent" | "warning" | "muted";
+} | null {
+  const note = task.error?.trim();
+  const detail = videoProcessedNote(task);
+  if (!note || !detail) return null;
+  if (note === LEGACY_VIDEO_PROCESSED_NOTE) {
+    return { label: "已处理", title: detail, tone: "muted" };
+  }
+  if (detail.startsWith("已转码为 AV1 并替换原文件")) {
+    return { label: "AV1 已转码", title: detail, tone: "success" };
+  }
+  if (detail.startsWith("视频已是 AV1")) {
+    return { label: "原片 AV1", title: detail, tone: "accent" };
+  }
+  if (detail.startsWith("已尝试转码为 AV1")) {
+    return { label: "未缩小", title: detail, tone: "warning" };
+  }
+  return { label: "已处理", title: detail, tone: "muted" };
+}
+
 export function isVideoTask(task: DownloadTask): boolean {
   const mediaType = task.mediaType?.toLowerCase() ?? "";
   if (mediaType === "video" || mediaType === "animation" || mediaType.startsWith("video/")) return true;
@@ -134,9 +157,13 @@ export function tableSubtitle(task: DownloadTask): { text: string; failed: boole
   }
   if (status === "completed" && task.error) {
     const processingNote = videoProcessedNote(task);
+    if (processingNote) {
+      const size = task.totalBytes ? formatBytes(task.totalBytes) : formatBytes(task.downloadedBytes);
+      return { text: size, failed: false };
+    }
     return {
-      text: `已完成 · ${processingNote ?? task.error}`,
-      failed: processingNote === null,
+      text: `已完成 · ${task.error}`,
+      failed: true,
     };
   }
   const size = task.totalBytes ? formatBytes(task.totalBytes) : formatBytes(task.downloadedBytes);

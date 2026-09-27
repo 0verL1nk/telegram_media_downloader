@@ -5,7 +5,7 @@ import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Progress } from "../ui/progress";
 import type { DownloadTask, TaskAction } from "../../lib/api";
-import { canProcessVideo, formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph } from "../../lib/format";
+import { canProcessVideo, formatBytes, formatDate, formatSpeed, getPercent, remainingLabel, statusLabel, tableSubtitle, taskGlyph, videoProcessingBadge } from "../../lib/format";
 
 export type TaskFilter = "all" | "downloading" | "processing" | "queued" | "paused" | "completed" | "failed";
 
@@ -69,7 +69,7 @@ export function TaskList({
   onBulkDelete: () => void;
   onClearSelection: () => void;
   videoProgress: Record<string, number>;
-  videoBatch: { completed: number; total: number; fileName: string } | null;
+  videoBatch: { completed: number; total: number; concurrency: number; fileNames: string[] } | null;
 }) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const allSelected = tasks.length > 0 && tasks.every((task) => selectedIds.has(task.taskId));
@@ -139,7 +139,9 @@ export function TaskList({
       {selectedIds.size > 0 ? (
         <div className="bulk-bar">
           <span className="bulk-count">
-            {videoBatch ? `批量转码 ${videoBatch.completed}/${videoBatch.total}：${videoBatch.fileName}` : `已选 ${selectedIds.size} 项`}
+            {videoBatch
+              ? `批量转码 ${videoBatch.completed}/${videoBatch.total} · ${videoBatch.concurrency} 路并发${videoBatch.fileNames.length ? ` · ${videoBatch.fileNames.join("、")}` : ""}`
+              : `已选 ${selectedIds.size} 项`}
           </span>
           <span className="bulk-actions">
             {selectedVisible.some(canProcessVideo) ? (
@@ -188,6 +190,7 @@ export function TaskList({
             const status = task.status.toLowerCase();
             const glyph = taskGlyph(task);
             const subtitle = tableSubtitle(task);
+            const processingBadge = videoProcessingBadge(task);
             const percent = Math.round(getPercent(task));
             const remaining = remainingLabel(task);
             const checked = selectedIds.has(task.taskId);
@@ -213,8 +216,15 @@ export function TaskList({
                   </span>
                   <VideoTaskThumbnail task={task} fallback={glyph.glyph} tone={glyph.tone} showCover={showCovers} />
                   <span className="fname">
-                    <b title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</b>
-                    <span className={subtitle.failed ? "err" : undefined}>{subtitle.text}</span>
+                    <span className="fname-title">
+                      <b title={task.fileName ?? ""}>{task.fileName || "未命名媒体"}</b>
+                      {processingBadge ? (
+                        <span className={`video-result-badge ${processingBadge.tone}`} title={processingBadge.title}>
+                          {processingBadge.label}
+                        </span>
+                      ) : null}
+                    </span>
+                    {!processingBadge ? <span className={subtitle.failed ? "err" : undefined}>{subtitle.text}</span> : null}
                   </span>
                   <span className="prog-cell">
                     <Progress value={displayedProgress} tone={glyph.tone === "ok" ? "success" : glyph.tone === "bad" ? "danger" : "default"} />

@@ -240,12 +240,15 @@ impl DownloadManager {
             let settings = shared.settings.read().await;
             settings.concurrency.max_files.clamp(1, MAX_FILE_SLOTS)
         };
+        let video_limit = std::thread::available_parallelism()
+            .map(|count| if count.get() >= 12 { 2 } else { 1 })
+            .unwrap_or(1);
         let manager = Self {
             shared,
             slots: Arc::new(Semaphore::new(limit)),
             active: Arc::new(AsyncMutex::new(HashMap::new())),
             processing: Arc::new(AsyncMutex::new(HashSet::new())),
-            video_encode_slot: Arc::new(Semaphore::new(1)),
+            video_encode_slot: Arc::new(Semaphore::new(video_limit)),
             budget: Arc::new(StreamBudget::new(limit)),
         };
         manager.spawn_watchdog();
