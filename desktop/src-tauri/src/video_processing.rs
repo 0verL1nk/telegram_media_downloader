@@ -103,6 +103,7 @@ struct ProbeStream {
     codec_name: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
+    duration: Option<String>,
     r_frame_rate: Option<String>,
     avg_frame_rate: Option<String>,
 }
@@ -192,10 +193,13 @@ pub async fn compress_replace(
     }
     let width = video.width.context("无法读取原视频宽度")?;
     let height = video.height.context("无法读取原视频高度")?;
-    let duration_seconds = before
-        .format
+    // The container duration can be slightly longer than the video track when its
+    // audio ends later. We only encode video, so segment boundaries must follow the
+    // video stream or a tiny audio-only tail becomes an invalid empty segment.
+    let duration_seconds = video
         .duration
         .as_deref()
+        .or(before.format.duration.as_deref())
         .and_then(|duration| duration.parse::<f64>().ok())
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .context("无法读取原视频时长，不能创建可恢复的编码分段")?;
@@ -625,7 +629,7 @@ async fn probe(ffprobe: &Path, path: &Path) -> Result<Probe> {
             OsStr::new("-select_streams"),
             OsStr::new("v:0"),
             OsStr::new("-show_entries"),
-            OsStr::new("stream=codec_name,width,height"),
+            OsStr::new("stream=codec_name,width,height,duration"),
             OsStr::new("-show_entries"),
             OsStr::new("format=duration"),
             OsStr::new("-of"),
