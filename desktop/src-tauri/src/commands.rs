@@ -524,6 +524,22 @@ pub async fn push_chunk(
         .map_err(command_error)
 }
 
+/// 页面侧心跳:抓取在途但暂无完整分块时调用,避免看门狗把慢连接误判成页面消失。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn webview_download_heartbeat(
+    webview: Webview<Wry>,
+    state: State<'_, AppState>,
+    task_id: String,
+) -> Result<(), String> {
+    ensure_trusted_telegram_webview(&webview)?;
+    validate_task_id(&task_id)?;
+    state
+        .downloads
+        .heartbeat(&task_id)
+        .await
+        .map_err(command_error)
+}
+
 /// 全部分块接收完成:校验分块完整并原子提交。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn finish_download(

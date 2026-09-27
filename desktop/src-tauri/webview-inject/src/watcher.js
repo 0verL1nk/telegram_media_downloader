@@ -8,7 +8,7 @@ import { getMediaUrl, resolveFileName } from './extract.js';
 import { ensureButton, setButtonState, injectButtonStyles } from './button.js';
 import { registerTask, releaseButton } from './state.js';
 import { queryTaskState } from './task-state.js';
-import { runPipeline } from './downloader.js';
+import { runPipeline, rememberMedia } from './downloader.js';
 
 const TICK_INTERVAL_MS = 10000;
 
@@ -96,6 +96,8 @@ export function startWatcher(cfg) {
       const url = getMediaUrl(detected.element, detected.kind);
       if (!url) return;
       const fileName = resolveFileName(url, detected.kind);
+      // 记住当前媒体的 URL:客户端"继续/重试"时,只要媒体还开着就能自动续传。
+      rememberMedia(fileName, url, detected.kind, detected.source);
 
       // 媒体切换:文件名变化 → 解绑旧任务,重置为 ready 重新查询
       if (btn.dataset.telFileName && btn.dataset.telFileName !== fileName) {

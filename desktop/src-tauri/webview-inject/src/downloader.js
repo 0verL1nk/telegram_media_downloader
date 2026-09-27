@@ -8,9 +8,49 @@ import { queryTaskState } from './task-state.js';
 const RETRY_BASE_MS = 300;
 const RETRY_MAX_MS = 3000;
 const PROBE_TIMEOUT_SECONDS = 15;
+/// 页面侧心跳间隔:抓取在途但暂无完整分块时,告诉 Rust"页面还活着",
+/// 避免 30 秒无字节的看门狗把慢连接误判成页面消失。
+const HEARTBEAT_MS = 10000;
+/// 停滞判定:超过该时长既无分块入账,即认为抓取已经卡死(媒体切换/连接中断)。
+/// 必须长于单次 fetch 超时(45s),否则慢而健康的连接会被误判;心跳已保证
+/// Rust 侧不会因为"字节来得慢"而误暂停,这里的职责是把真正的死局变成明确失败。
+const STALL_LIMIT_MS = 60000;
+const STALL_CHECK_MS = 5000;
+const STALL_MESSAGE = '下载停滞(媒体可能已切换或网络中断)。重新打开该媒体后再点下载即可从断点继续。';
+/// URL 会话缓存上限:文件名 → { url, fileType, source },供"继续/重试"自动续传。
+const URL_CACHE_LIMIT = 200;
 
 /** taskId → AbortController,由 webview-download-abort 事件触发中止。 */
 const controllers = new Map();
+
+/** 文件名 → 媒体 URL(仅本页会话内有效;URL 过期后重新打开媒体即可)。 */
+const mediaUrls = new Map();
+
+/** 记住当前/最近一次解析到的媒体 URL(查看器打开时每个 tick 都会刷新)。 */
+export function rememberMedia(fileName, url, fileType, source) {
+  if (!fileName || !url) return;
+  if (mediaUrls.size >= URL_CACHE_LIMIT && !mediaUrls.has(fileName)) {
+    const oldest = mediaUrls.keys().next().value;
+    if (oldest !== undefined) mediaUrls.delete(oldest);
+  }
+  mediaUrls.set(fileName, { url, fileType: fileType || 'file', source: source || 'viewer' });
+}
+
+/** 客户端"继续/重试"通知:媒体仍打开(或本会话缓存过 URL)时直接续传。 */
+export async function resumeFromCache(taskId, fileName) {
+  if (!taskId || !fileName || controllers.has(taskId)) return;
+  const cached = mediaUrls.get(fileName);
+  if (!cached) {
+    diag(`resume: no cached url for ${fileName}`);
+    return;
+  }
+  diag(`resume: starting pipeline for ${fileName}`);
+  try {
+    await runPipeline({ ...cached, fileName, cfg: globalThis.__INJECT_CONFIG__ || {} });
+  } catch (error) {
+    diag(`resume: failed — ${error && error.message ? error.message : String(error)}`);
+  }
+}
 
 /** 永久性失败(URL 过期/文件消失),不重试。 */
 class PermanentError extends Error {}
@@ -180,9 +220,23 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
     diag(`pipeline: created task=${taskId}`);
   }
   onTaskId?.(taskId);
+  rememberMedia(fileName, url, fileType, source);
 
   const controller = new AbortController();
   controllers.set(taskId, controller);
+  let stallReason = null;
+  let lastProgressAt = Date.now();
+  const heartbeat = setInterval(() => {
+    void window.__TAURI__.core.invoke('webview_download_heartbeat', { taskId }).catch(() => {});
+  }, HEARTBEAT_MS);
+  // 停滞自检:媒体切换/连接中断时,宁可给出明确的失败原因,也不要无声挂死
+  // (无声挂死的代价是 30 秒后被看门狗暂停,用户只看到"卡住")。
+  const stallWatchdog = setInterval(() => {
+    if (!controller.signal.aborted && Date.now() - lastProgressAt >= STALL_LIMIT_MS) {
+      stallReason = STALL_MESSAGE;
+      controller.abort();
+    }
+  }, STALL_CHECK_MS);
   try {
     const { totalBytes, probeRttMs } = await probeTotal(url, controller.signal);
     diag(`pipeline: total=${totalBytes} rtt=${probeRttMs}ms`);
@@ -218,6 +272,7 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
         await window.__TAURI__.core.invoke('push_chunk', new Uint8Array(buffer), {
           headers: { 'x-task-id': taskId, 'x-offset': String(offset) },
         });
+        lastProgressAt = Date.now();
       } catch (pushError) {
         diag(`pipeline: push failed offset=${offset} — ${pushError && pushError.message ? pushError.message : String(pushError)}`);
         throw pushError;
@@ -228,6 +283,11 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
     diag(`pipeline: finished task=${taskId}`);
     return taskId;
   } catch (error) {
+    if (stallReason) {
+      diag(`pipeline: failed — ${stallReason}`);
+      await window.__TAURI__.core.invoke('fail_download', { taskId, error: stallReason }).catch(() => {});
+      throw new Error(stallReason);
+    }
     if (controller.signal.aborted || error?.name === 'AbortError') {
       // Rust 侧已暂停/取消(收到 abort 事件);不要覆盖它的状态
       diag(`pipeline: aborted task=${taskId}`);
@@ -239,6 +299,8 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
     await window.__TAURI__.core.invoke('fail_download', { taskId, error: message }).catch(() => {});
     throw error;
   } finally {
+    clearInterval(heartbeat);
+    clearInterval(stallWatchdog);
     controllers.delete(taskId);
     widthControllers.delete(taskId);
   }

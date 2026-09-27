@@ -349,7 +349,13 @@ function App() {
     if (view !== "telegram") {
       syncTelegramWebviewRef.current = null;
       setWebviewEmbeddedReady(false);
-      void api.setTelegramWebviewVisible(false).catch(() => undefined);
+      // 不隐藏 WebView:WebView2 一旦被隐藏,Chromium 会节流页面定时器与渲染,
+      // 正在进行的页面抓取会跟着停摆(用户只是想边下边看任务列表)。
+      // 收到 1×1 停靠:人眼看不见,但页面仍处于"可见"状态。
+      void api
+        .setTelegramWebviewBounds({ x: 0, y: 0, width: 1, height: 1 })
+        .then(() => api.setTelegramWebviewVisible(true))
+        .catch(() => undefined);
       return;
     }
 
@@ -567,7 +573,13 @@ function App() {
       const updated = await api.taskAction(task.taskId, action);
       mergeTaskUpdate(updated);
       await refreshTasks();
-      notify(({ pause: "已暂停任务。", resume: "已继续任务。", cancel: "任务已取消。", retry: "任务已重新排队。" })[action]);
+      notify(
+        action === "resume"
+          ? "已继续:媒体仍打开时会自动续传;否则重新打开该媒体再点下载即可续传。"
+          : action === "retry"
+            ? "已重新排队:媒体仍打开时会自动续传;否则重新打开该媒体再点下载。"
+            : ({ pause: "已暂停任务。", cancel: "任务已取消。" })[action],
+      );
     });
   }
 

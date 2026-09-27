@@ -11,6 +11,7 @@
     "allow-start-webview-download",
     "allow-plan-chunks",
     "allow-push-chunk",
+    "allow-webview-download-heartbeat",
     "allow-finish-download",
     "allow-fail-download",
     "allow-webview-query-task-state",

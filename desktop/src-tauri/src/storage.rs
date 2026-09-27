@@ -7,7 +7,11 @@ use std::{
 };
 
 pub const APP_FOLDER: &str = "TelegramMediaDownloader";
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
+/// v1 时代的并发默认值(固定并发);v2 起该字段是"自适应上限"。
+const LEGACY_PER_FILE_CHUNKS: usize = 2;
+/// v2 起自适应模式的默认上限。
+const ADAPTIVE_PER_FILE_CHUNKS_CAP: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct StorageLayout {
@@ -170,10 +174,10 @@ pub fn load_settings(layout: &StorageLayout) -> Result<Settings> {
     }
     let data = fs::read(&layout.settings_file)?;
     let value: serde_json::Value = serde_json::from_slice(&data).context("设置文件格式无法读取")?;
-    let mut settings: Settings = if let Some(version) = value
+    let version = value
         .get("schemaVersion")
-        .and_then(serde_json::Value::as_u64)
-    {
+        .and_then(serde_json::Value::as_u64);
+    let mut settings: Settings = if let Some(version) = version {
         if version > u64::from(SETTINGS_SCHEMA_VERSION) {
             bail!("设置文件来自更新版本的客户端，当前版本不会覆盖它");
         }
@@ -188,6 +192,11 @@ pub fn load_settings(layout: &StorageLayout) -> Result<Settings> {
         // Desktop versions before schemaVersion stored Settings as a flat JSON object.
         serde_json::from_value(value).context("旧版设置格式无法读取")?
     };
+    // v1 → v2:per_file_chunks 从"固定并发"变成"自适应上限"。旧默认值 2 会让自适应
+    // 完全没有爬升空间(实测吞吐被锁死在两路),迁移到新默认 16;用户显式改过的值不动。
+    if version.unwrap_or(1) < 2 && settings.concurrency.per_file_chunks == LEGACY_PER_FILE_CHUNKS {
+        settings.concurrency.per_file_chunks = ADAPTIVE_PER_FILE_CHUNKS_CAP;
+    }
     settings.data_root = display_path(&layout.root);
     if settings.download_root.trim().is_empty() {
         settings.download_root = display_path(&layout.downloads);
@@ -297,6 +306,43 @@ mod tests {
         )
         .unwrap();
         assert!(load_settings(&layout).is_err());
+    }
+
+    #[test]
+    fn schema_v1_migrates_the_legacy_concurrency_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::under(temp.path().join("data"));
+        layout.ensure().unwrap();
+        // 旧默认值 2(用户没改过)→ 迁移到自适应上限默认 16。
+        fs::write(
+            &layout.settings_file,
+            br#"{"schemaVersion":1,"settings":{"concurrency":{"perFileChunks":2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings(&layout).unwrap().concurrency.per_file_chunks,
+            ADAPTIVE_PER_FILE_CHUNKS_CAP
+        );
+        // 用户显式改过的值保持不变。
+        fs::write(
+            &layout.settings_file,
+            br#"{"schemaVersion":1,"settings":{"concurrency":{"perFileChunks":6}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings(&layout).unwrap().concurrency.per_file_chunks,
+            6
+        );
+        // v2 里写 2 是用户的明确选择,不再迁移。
+        fs::write(
+            &layout.settings_file,
+            br#"{"schemaVersion":2,"settings":{"concurrency":{"perFileChunks":2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings(&layout).unwrap().concurrency.per_file_chunks,
+            2
+        );
     }
 
     #[test]

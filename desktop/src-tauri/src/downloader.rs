@@ -41,6 +41,8 @@ use tokio::{
 
 /// 进度事件节流间隔。
 const PROGRESS_TICK: Duration = Duration::from_millis(350);
+/// 分块入队等待超过该时长即告警(写入端停滞的早期信号)。
+const SLOW_PUSH_WARN: Duration = Duration::from_secs(5);
 /// 看门狗巡检间隔。
 const WATCHDOG_TICK: Duration = Duration::from_secs(10);
 /// 活动任务超过此间隔既无 push 也无 finish,即判定页面侧已消失。
@@ -528,6 +530,7 @@ impl DownloadManager {
         *last_activity
             .lock()
             .map_err(|_| anyhow!("任务活动时间读取失败"))? = Instant::now();
+        let queued_at = Instant::now();
         sender
             .send(IncomingChunk {
                 offset,
@@ -535,6 +538,35 @@ impl DownloadManager {
             })
             .await
             .map_err(|_| anyhow!("下载已结束或中断"))?;
+        let waited = queued_at.elapsed();
+        if waited >= SLOW_PUSH_WARN {
+            self.shared
+                .log(
+                    "warn",
+                    DOWNLOAD_LOG_TARGET,
+                    format!(
+                        "任务 {task_id} 分块入队等待 {:.1}s:写入端疑似停滞",
+                        waited.as_secs_f64()
+                    ),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
+    /// 页面侧心跳:抓取在途(可能长时间收不到完整分块)时由页面定期调用。
+    ///
+    /// 看门狗把"30 秒无 push"当作页面已消失;慢而健康的连接会因此被误暂停,
+    /// 心跳把"页面仍在工作"这一事实补充给它。任务已结束时不报错(心跳是尽力而为)。
+    pub async fn heartbeat(&self, task_id: &str) -> Result<()> {
+        let active = self.active.lock().await;
+        let Some(entry) = active.get(task_id) else {
+            return Ok(());
+        };
+        *entry
+            .last_activity
+            .lock()
+            .map_err(|_| anyhow!("任务活动时间读取失败"))? = Instant::now();
         Ok(())
     }
 
@@ -638,7 +670,15 @@ impl DownloadManager {
         let record = self.require_record(task_id).await?;
         if let Some(active) = self.detach(task_id).await {
             announce_abort(&self.shared, task_id);
-            let _ = drain_active(active).await;
+            if let Err(error) = drain_active(active).await {
+                self.shared
+                    .log(
+                        "warn",
+                        DOWNLOAD_LOG_TARGET,
+                        format!("任务 {task_id} 写出器退出:{error:#}"),
+                    )
+                    .await;
+            }
         }
         if let Some(output) = record.output_path.as_deref().map(PathBuf::from) {
             let temp = temporary_output_path(&output, task_id);
@@ -722,6 +762,7 @@ impl DownloadManager {
                         format!("任务 {task_id} 已排队;重新打开媒体后按缺块续传"),
                     )
                     .await;
+                self.request_page_resume(task_id, record.file_name.as_deref());
                 self.require_record(task_id).await
             }
             "cancel" => cancel_task(&self.shared, &self.active, task_id).await,
@@ -742,6 +783,7 @@ impl DownloadManager {
                         format!("任务 {task_id} 已重新排队"),
                     )
                     .await;
+                self.request_page_resume(task_id, record.file_name.as_deref());
                 self.require_record(task_id).await
             }
             _ => bail!("不支持的任务操作"),
@@ -840,6 +882,18 @@ impl DownloadManager {
     fn emit(&self, event: &str, payload: serde_json::Value) {
         let _ = self.shared.app.emit(event, payload);
     }
+
+    /// 通知页面"这个文件可以继续抓了":媒体仍打开、或本会话还缓存着该文件的 URL 时,
+    /// 页面会直接续传;两者都不满足则页面保持安静(客户端提示用户重新打开媒体)。
+    fn request_page_resume(&self, task_id: &str, file_name: Option<&str>) {
+        let Some(file_name) = file_name.filter(|name| !name.is_empty()) else {
+            return;
+        };
+        self.emit(
+            "webview-resume-request",
+            serde_json::json!({ "taskId": task_id, "fileName": file_name }),
+        );
+    }
 }
 
 /// 在活动表上执行暂停:停止 writer/进度监视,状态置 `paused`,并通知页面中止抓取。
@@ -851,7 +905,16 @@ async fn pause_task(
 ) -> Result<TaskRecord> {
     let detached = active.lock().await.remove(task_id);
     if let Some(entry) = detached {
-        let _ = drain_active(entry).await;
+        // 写出器的错误以前在这里被丢弃;它是"任务为何停住"的关键证据,必须留痕。
+        if let Err(error) = drain_active(entry).await {
+            shared
+                .log(
+                    "warn",
+                    DOWNLOAD_LOG_TARGET,
+                    format!("任务 {task_id} 写出器退出:{error:#}"),
+                )
+                .await;
+        }
     }
     let record = require_record(shared, task_id).await?;
     match record.status.as_str() {
@@ -884,8 +947,16 @@ async fn cancel_task(
         bail!("该任务当前状态不能取消:{}", record.status);
     }
     let detached = active.lock().await.remove(task_id);
-    if let Some(entry) = detached {
-        let _ = drain_active(entry).await;
+    if let Some(entry) = detached
+        && let Err(error) = drain_active(entry).await
+    {
+        shared
+            .log(
+                "warn",
+                DOWNLOAD_LOG_TARGET,
+                format!("任务 {task_id} 写出器退出:{error:#}"),
+            )
+            .await;
     }
     shared.store.set_status(task_id, "cancelled", None).await?;
     announce_abort(shared, task_id);

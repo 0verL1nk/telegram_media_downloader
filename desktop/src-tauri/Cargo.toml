@@ -1,6 +1,6 @@
 [package]
 name = "telegram-media-downloader"
-version = "0.3.1"
+version = "0.3.2"
 description = "Lightweight Telegram media download desktop client"
 authors = ["0verL1nk"]
 license = "MIT"

@@ -1,7 +1,7 @@
 // desktop/src-tauri/webview-inject/src/state.js
 // Tauri 任务事件订阅:taskId → 按钮映射,事件驱动按钮状态。
 import { setButtonState } from './button.js';
-import { abortTask, setTaskConcurrency } from './downloader.js';
+import { abortTask, resumeFromCache, setTaskConcurrency } from './downloader.js';
 
 const byTask = new Map();
 const activeTaskByButton = new WeakMap();
@@ -54,6 +54,12 @@ export function bindEvents() {
       const taskId = event.payload?.taskId;
       const width = event.payload?.concurrency;
       if (taskId && width) setTaskConcurrency(taskId, width);
+    }),
+    // 客户端"继续/重试":媒体仍打开(或本会话缓存过 URL)时自动续传。
+    listen('webview-resume-request', (event) => {
+      const taskId = event.payload?.taskId;
+      const fileName = event.payload?.fileName;
+      if (taskId && fileName) void resumeFromCache(taskId, fileName);
     }),
   ]);
 }

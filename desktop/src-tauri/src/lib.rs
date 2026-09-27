@@ -54,6 +54,7 @@ pub fn run() {
             commands::start_webview_download,
             commands::plan_chunks,
             commands::push_chunk,
+            commands::webview_download_heartbeat,
             commands::finish_download,
             commands::fail_download,
             commands::webview_query_task_state,
