@@ -117,6 +117,7 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState(0);
   const pendingUpdateRef = useRef<Update | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoResumeWebviewStarted = useRef(false);
 
   // 窗口句柄必须跨渲染保持同一身份:它出现在 effect 依赖里,若每次渲染都新建,
   // 任务进度刷新(350ms 一次)就会反复拆掉/重建 Telegram WebView 的同步 effect,
@@ -401,6 +402,20 @@ function App() {
     // Tauri 事件监听只注册一次。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const hasQueuedDownloads = tasks.some((task) => task.status.toLowerCase() === "queued");
+    if (!hasQueuedDownloads || view === "telegram" || autoResumeWebviewStarted.current) return;
+    autoResumeWebviewStarted.current = true;
+    void (async () => {
+      await api.ensureTelegramWebview();
+      await api.setTelegramWebviewBounds({ x: 0, y: 0, width: 1, height: 1 });
+      await api.setTelegramWebviewVisible(true);
+    })().catch((error) => {
+      autoResumeWebviewStarted.current = false;
+      notify(`后台恢复下载失败:${friendlyError(error)}`, "error");
+    });
+  }, [tasks, view]);
 
   // Telegram 子 WebView 的 bounds 同步:只在 Telegram 视图可见且完全落在内容区内时显示。
   useEffect(() => {
