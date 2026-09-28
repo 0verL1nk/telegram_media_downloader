@@ -53,7 +53,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_main_window(tray.app_handle());
+                schedule_show_main_window(tray.app_handle(), "托盘左键");
             }
         });
 
@@ -74,7 +74,7 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
     let id: &str = event.id().as_ref();
     match id {
-        MENU_SHOW_MAIN => show_main_window(app),
+        MENU_SHOW_MAIN => schedule_show_main_window(app, "显示主窗口菜单"),
         MENU_OPEN_DOWNLOADS => open_downloads_dir(app),
         MENU_PROBE_INJECT => probe_telegram_inject(app),
         MENU_QUIT => app.exit(0),
@@ -82,22 +82,70 @@ fn handle_menu_event(app: &AppHandle, event: MenuEvent) {
     }
 }
 
+/// 菜单关闭后再显示窗口，避免 Windows 原生托盘菜单收尾时抢回前台焦点。
+fn schedule_show_main_window(app: &AppHandle, source: &'static str) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        app.state::<AppState>()
+            .shared
+            .log("info", "tray", format!("收到{source}请求，稍后恢复主窗口"))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        show_main_window(&app, source).await;
+    });
+}
+
 /// 显示、还原并聚焦主窗口；托盘左键与「显示主窗口」共用。
-fn show_main_window(app: &AppHandle) {
+async fn show_main_window(app: &AppHandle, source: &'static str) {
+    let shared = app.state::<AppState>().shared.clone();
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        tracing::error!(target: "desktop::tray", "未找到主窗口，无法显示");
+        shared
+            .log("error", "tray", format!("{source}执行失败：未找到主窗口"))
+            .await;
         return;
     };
+    let was_visible = window.is_visible().unwrap_or(false);
+    let was_minimized = window.is_minimized().unwrap_or(false);
+    shared
+        .log(
+            "info",
+            "tray",
+            format!("开始执行{source}：visible={was_visible}, minimized={was_minimized}"),
+        )
+        .await;
     if let Err(error) = window.unminimize() {
-        tracing::warn!(target: "desktop::tray", "取消最小化主窗口失败：{error}");
+        shared
+            .log(
+                "warn",
+                "tray",
+                format!("{source}：取消最小化主窗口失败：{error}"),
+            )
+            .await;
     }
     if let Err(error) = window.show() {
-        tracing::error!(target: "desktop::tray", "显示主窗口失败：{error}");
+        shared
+            .log(
+                "error",
+                "tray",
+                format!("{source}：显示主窗口失败：{error}"),
+            )
+            .await;
         return;
     }
     if let Err(error) = window.set_focus() {
-        tracing::warn!(target: "desktop::tray", "聚焦主窗口失败：{error}");
+        shared
+            .log("warn", "tray", format!("{source}：聚焦主窗口失败：{error}"))
+            .await;
     }
+    let is_visible = window.is_visible().unwrap_or(false);
+    let is_minimized = window.is_minimized().unwrap_or(false);
+    shared
+        .log(
+            "info",
+            "tray",
+            format!("{source}执行完成：visible={is_visible}, minimized={is_minimized}"),
+        )
+        .await;
 }
 
 /// 在系统文件管理器中打开配置的下载目录。
