@@ -9,7 +9,7 @@ const RETRY_BASE_MS = 300;
 const RETRY_MAX_MS = 3000;
 const PROBE_TIMEOUT_SECONDS = 15;
 /// 页面侧心跳间隔:抓取在途但暂无完整分块时,告诉 Rust"页面还活着",
-/// 避免 30 秒无字节的看门狗把慢连接误判成页面消失。
+/// 避免 Rust 看门狗把慢连接误判成页面消失。
 const HEARTBEAT_MS = 10000;
 /// 停滞判定:超过该时长既无分块入账,即认为抓取已经卡死(媒体切换/连接中断)。
 /// 必须长于单次 fetch 超时(45s),否则慢而健康的连接会被误判;心跳已保证
@@ -321,11 +321,25 @@ export async function runPipeline({ url, fileName, fileType, source, cfg, onTask
   controllers.set(taskId, controller);
   let stallReason = null;
   let lastProgressAt = Date.now();
+  let heartbeatFailures = 0;
   const heartbeat = setInterval(() => {
-    void window.__TAURI__.core.invoke('webview_download_heartbeat', { taskId }).catch(() => {});
+    void window.__TAURI__.core.invoke('webview_download_heartbeat', { taskId })
+      .then(() => {
+        if (heartbeatFailures > 0) {
+          diag(`pipeline: heartbeat recovered after ${heartbeatFailures} failure(s) task=${taskId}`);
+          heartbeatFailures = 0;
+        }
+      })
+      .catch((error) => {
+        heartbeatFailures += 1;
+        if (heartbeatFailures === 1 || heartbeatFailures % 6 === 0) {
+          const message = error && error.message ? error.message : String(error);
+          diag(`pipeline: heartbeat failed count=${heartbeatFailures} task=${taskId} — ${message}`);
+        }
+      });
   }, HEARTBEAT_MS);
   // 停滞自检:媒体切换/连接中断时,宁可给出明确的失败原因,也不要无声挂死
-  // (无声挂死的代价是 30 秒后被看门狗暂停,用户只看到"卡住")。
+  // (无声挂死时由停滞检测显式失败,不依赖 Rust 看门狗超时)。
   const stallWatchdog = setInterval(() => {
     if (!controller.signal.aborted && Date.now() - lastProgressAt >= STALL_LIMIT_MS) {
       stallReason = STALL_MESSAGE;

@@ -9,7 +9,7 @@
 //! `push`(页面 fetch 到的分块经 IPC 入队,mpsc 满时自然背压) →
 //! `finish`(全块校验 + 原子提交)/ `fail`(保留已校验分块以便续传)。
 //!
-//! 看门狗每 10 秒巡检一次:下载中且 30 秒既无 push 也无 finish 的任务会被暂停并发出
+//! 看门狗每 10 秒巡检一次:下载中且 90 秒既无 push 也无 heartbeat 的任务会被暂停并发出
 //! `webview-download-abort`(覆盖 WebView 关闭/刷新/网络掉线等 JS 侧消失的情形)。
 
 use crate::{
@@ -47,8 +47,9 @@ const PROGRESS_TICK: Duration = Duration::from_millis(350);
 const SLOW_PUSH_WARN: Duration = Duration::from_secs(5);
 /// 看门狗巡检间隔。
 const WATCHDOG_TICK: Duration = Duration::from_secs(10);
-/// 活动任务超过此间隔既无 push 也无 finish,即判定页面侧已消失。
-const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+/// 页面心跳可能受 WebView 后台定时器节流；给单次 45 秒分块请求和页面 60 秒停滞自检留出余量。
+/// 超过此间隔仍没有 push/heartbeat,再判定页面侧已消失并安全暂停。
+const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(90);
 /// 单个 IPC 分块字节数硬上限。分块设置上界是 1 MiB,这里留出余量以拒绝异常调用方。
 const CHUNK_HARD_CAP: usize = 4 * 1024 * 1024;
 /// 分块映射允许的单块最大字节数(与设置页 1 MiB 上界一致)。
@@ -583,7 +584,7 @@ impl DownloadManager {
 
     /// 页面侧心跳:抓取在途(可能长时间收不到完整分块)时由页面定期调用。
     ///
-    /// 看门狗把"30 秒无 push"当作页面已消失;慢而健康的连接会因此被误暂停,
+    /// 看门狗把长时间无 push/heartbeat 当作页面已消失;慢而健康的连接不应被误暂停,
     /// 心跳把"页面仍在工作"这一事实补充给它。任务已结束时不报错(心跳是尽力而为)。
     pub async fn heartbeat(&self, task_id: &str) -> Result<()> {
         let active = self.active.lock().await;
@@ -1085,7 +1086,7 @@ impl DownloadManager {
         }
     }
 
-    /// 每 10 秒巡检:下载中且长时间无 push/finish 的任务按“暂停”处理。
+    /// 每 10 秒巡检:下载中且长时间无 push/heartbeat 的任务按“暂停”处理。
     fn spawn_watchdog(&self) {
         let shared = Arc::clone(&self.shared);
         let active = Arc::clone(&self.active);
@@ -1109,7 +1110,7 @@ impl DownloadManager {
                 };
                 for task_id in stale {
                     if let Err(error) =
-                        pause_task(&shared, &active, &task_id, "超过 30 秒无下载活动").await
+                        pause_task(&shared, &active, &task_id, "超过 90 秒无下载活动").await
                     {
                         shared
                             .log(
